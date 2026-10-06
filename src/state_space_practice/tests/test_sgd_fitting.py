@@ -107,15 +107,10 @@ class _ToyModel(SGDFittableMixin):
 
     def __init__(self, scale: float = 1.0):
         self.scale = scale
-        self._initialized = True
 
     @property
     def _n_timesteps(self):
         return 100
-
-    def _check_sgd_initialized(self):
-        if not self._initialized:
-            raise RuntimeError("Not initialized")
 
     def _build_param_spec(self):
         params = {"scale": jnp.array(self.scale)}
@@ -131,6 +126,14 @@ class _ToyModel(SGDFittableMixin):
 
     def _finalize_sgd(self, target):
         self.is_fitted = True
+        return -((self.scale - target) ** 2) * self._n_timesteps
+
+
+class _PenalizedToyModel(_ToyModel):
+    """Toy whose training loss adds a penalty to the negative log-likelihood."""
+
+    def _sgd_loss_fn(self, params, target):
+        return super()._sgd_loss_fn(params, target) + 50.0 * params["scale"] ** 2
 
 
 class _UnconstrainedToyModel(_ToyModel):
@@ -145,6 +148,36 @@ class _UnconstrainedToyModel(_ToyModel):
 
 
 class TestSGDFittableMixin:
+    def test_instance_timesteps_attribute(self) -> None:
+        import optax
+
+        class _InstanceTimestepsModel(SGDFittableMixin):
+            _sgd_param_attrs = {"scale": "scale"}
+
+            def __init__(self) -> None:
+                self._n_timesteps = 10
+                self.scale = jnp.array(0.0)
+                self.is_fitted = False
+
+            def _build_param_spec(self):
+                return {"scale": self.scale}, {"scale": UNCONSTRAINED}
+
+            def _sgd_loss_fn(self, params, target):
+                return (params["scale"] - target) ** 2 * self._n_timesteps
+
+            def _finalize_sgd(self, target):
+                self.is_fitted = True
+                return 0.0
+
+        model = _InstanceTimestepsModel()
+        lls = model.fit_sgd(
+            jnp.array(1.0), optimizer=optax.sgd(learning_rate=0.1), num_steps=1
+        )
+
+        assert model.is_fitted
+        np.testing.assert_allclose(model.scale, 0.2, atol=1e-7)
+        np.testing.assert_allclose(lls, [-6.4], rtol=1e-6)
+
     def test_basic_optimization(self) -> None:
         import optax
 
@@ -164,9 +197,7 @@ class TestSGDFittableMixin:
 
     def test_convergence_tol(self) -> None:
         model = _ToyModel(scale=4.9)
-        lls = model.fit_sgd(
-            jnp.array(5.0), num_steps=500, convergence_tol=1e-8
-        )
+        lls = model.fit_sgd(jnp.array(5.0), num_steps=500, convergence_tol=1e-8)
         # Should converge early
         assert len(lls) < 500
         assert model.converged_ is True
@@ -179,7 +210,7 @@ class TestSGDFittableMixin:
     def test_stores_log_likelihood_history(self) -> None:
         model = _ToyModel(scale=0.1)
         lls = model.fit_sgd(jnp.array(5.0), num_steps=20)
-        assert hasattr(model, "log_likelihood_history_")
+        assert model.log_likelihood_history_ is not None
         assert model.log_likelihood_history_ == lls
 
     def test_history_final_entry_matches_stored_final_params(self) -> None:
@@ -200,9 +231,6 @@ class TestSGDFittableMixin:
         class _EmptyModel(SGDFittableMixin):
             _n_timesteps = 10
 
-            def _check_sgd_initialized(self):
-                pass
-
             def _build_param_spec(self):
                 return {}, {}
 
@@ -213,16 +241,25 @@ class TestSGDFittableMixin:
                 pass
 
             def _finalize_sgd(self):
-                pass
+                return 0.0
 
         with pytest.raises(ValueError, match="No learnable parameters"):
             _EmptyModel().fit_sgd(num_steps=10)
 
-    def test_not_initialized_raises(self) -> None:
-        model = _ToyModel(scale=1.0)
-        model._initialized = False
-        with pytest.raises(RuntimeError, match="Not initialized"):
-            model.fit_sgd(jnp.array(5.0))
+    def test_log_likelihood_comes_from_final_inference(self) -> None:
+        """log_likelihood_ is _finalize_sgd's log-likelihood at the stored
+        parameters; the history keeps the (penalized) training objective."""
+        model = _PenalizedToyModel(scale=1.0)
+        objective = model.fit_sgd(jnp.array(5.0), num_steps=5)
+        expected = -((model.scale - 5.0) ** 2) * model._n_timesteps
+        assert model.log_likelihood_ == pytest.approx(expected)
+        assert model.log_likelihood_history_ == objective
+        assert objective[-1] != pytest.approx(expected)  # guard: penalty differs
+
+        # A zero-step fit still records the log-likelihood of the stored params.
+        model = _ToyModel(scale=2.0)
+        assert model.fit_sgd(jnp.array(5.0), num_steps=0) == []
+        assert model.log_likelihood_ == pytest.approx(-9.0 * model._n_timesteps)
 
     def test_invalid_optimizer_raises(self) -> None:
         model = _ToyModel(scale=1.0)
@@ -322,20 +359,14 @@ class TestSGDFittableMixin:
         class _BadGradientAtInit(SGDFittableMixin):
             def __init__(self):
                 self.scale = 0.0
-                self._initialized = True
                 self.is_fitted = False
 
             @property
             def _n_timesteps(self):
                 return 1
 
-            def _check_sgd_initialized(self):
-                pass
-
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params):
                 return jnp.sqrt(params["scale"])
@@ -345,6 +376,7 @@ class TestSGDFittableMixin:
 
             def _finalize_sgd(self):
                 self.is_fitted = True
+                return 0.0
 
         import optax
 
@@ -387,19 +419,13 @@ class TestSGDFittableMixin:
 
             def __init__(self):
                 self.scale = 0.0
-                self._initialized = True
 
             @property
             def _n_timesteps(self):
                 return 100
 
-            def _check_sgd_initialized(self):
-                pass
-
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params, _target):
                 # Loss = -scale (maximize scale). NaN once scale > 1.4.
@@ -413,7 +439,7 @@ class TestSGDFittableMixin:
                 self.scale = float(params["scale"])
 
             def _finalize_sgd(self, _target):
-                pass
+                return 0.0
 
         import optax
 
@@ -439,9 +465,7 @@ class TestSGDFittableMixin:
         model = _NanAboveThreshold()
         optimizer = optax.sgd(learning_rate=0.5)
 
-        lls = model.fit_sgd(
-            jnp.array(0.0), optimizer=optimizer, num_steps=10
-        )
+        lls = model.fit_sgd(jnp.array(0.0), optimizer=optimizer, num_steps=10)
 
         # Finite LL for steps 0, 1, 2 (loss = 0, -0.5, -1.0 → LL = 0, 50, 100)
         assert len(lls) == 3, f"expected 3 finite steps, got {len(lls)}"
@@ -458,19 +482,13 @@ class TestSGDFittableMixin:
         class _NanAboveThreshold(SGDFittableMixin):
             def __init__(self):
                 self.scale = 0.0
-                self._initialized = True
 
             @property
             def _n_timesteps(self):
                 return 100
 
-            def _check_sgd_initialized(self):
-                pass
-
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params):
                 return jnp.where(
@@ -483,7 +501,7 @@ class TestSGDFittableMixin:
                 self.scale = float(params["scale"])
 
             def _finalize_sgd(self):
-                pass
+                return 0.0
 
         import optax
 
@@ -507,19 +525,13 @@ class TestSGDFittableMixin:
         class _AlwaysNan(SGDFittableMixin):
             def __init__(self):
                 self.scale = 2.0  # already above the NaN threshold
-                self._initialized = True
 
             @property
             def _n_timesteps(self):
                 return 100
 
-            def _check_sgd_initialized(self):
-                pass
-
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params, _target):
                 return jnp.where(
@@ -532,9 +544,329 @@ class TestSGDFittableMixin:
                 self.scale = float(params["scale"])
 
             def _finalize_sgd(self, _target):
-                pass
+                return 0.0
 
         model = _AlwaysNan()
         lls = model.fit_sgd(jnp.array(0.0), num_steps=10)
         assert lls == []
         np.testing.assert_allclose(model.scale, 2.0, atol=1e-6)
+
+
+class TestSGDParamAttrsDefaultStore:
+    """``SGDFittableMixin._store_sgd_params`` driven by ``_sgd_param_attrs``."""
+
+    def test_mapped_keys_are_stored_and_absent_keys_skipped(self) -> None:
+        class _Mapped(SGDFittableMixin):
+            _sgd_param_attrs = {"scale": "scale", "shift": "offset"}
+
+            def __init__(self):
+                self.scale = 1.0
+                self.offset = 0.0
+
+        model = _Mapped()
+        model._store_sgd_params({"scale": jnp.array(3.0), "other": jnp.array(9.0)})
+        assert float(model.scale) == 3.0
+        assert model.offset == 0.0  # "shift" absent from params: left alone
+        assert not hasattr(model, "other")  # unmapped keys are ignored
+
+        model._store_sgd_params({"shift": jnp.array(-2.0)})
+        assert float(model.offset) == -2.0
+        assert float(model.scale) == 3.0
+
+    def test_empty_mapping_without_override_raises(self) -> None:
+        class _Unmapped(SGDFittableMixin):
+            pass
+
+        with pytest.raises(NotImplementedError, match="_sgd_param_attrs"):
+            _Unmapped()._store_sgd_params({"scale": jnp.array(1.0)})
+
+    def test_subclass_mapping_replaces_parent_mapping(self) -> None:
+        class _Parent(SGDFittableMixin):
+            _sgd_param_attrs = {"a": "a"}
+
+        class _Extending(_Parent):
+            _sgd_param_attrs = {**_Parent._sgd_param_attrs, "b": "b"}
+
+        class _Replacing(_Parent):
+            _sgd_param_attrs = {"b": "b"}
+
+        extending = _Extending()
+        extending._store_sgd_params({"a": 1, "b": 2})
+        assert (extending.a, extending.b) == (1, 2)
+
+        replacing = _Replacing()
+        replacing._store_sgd_params({"a": 1, "b": 2})
+        assert replacing.b == 2
+        assert not hasattr(replacing, "a")
+
+    def test_fit_sgd_stores_through_the_mapping(self) -> None:
+        """A model with only the mapping (no override) keeps its optimized value."""
+        import optax
+
+        class _MappedToy(SGDFittableMixin):
+            _sgd_param_attrs = {"scale": "scale"}
+            _n_timesteps = 100
+
+            def __init__(self):
+                self.scale = 0.1
+
+            def _build_param_spec(self):
+                return {"scale": jnp.array(self.scale)}, {"scale": POSITIVE}
+
+            def _sgd_loss_fn(self, params, target):
+                return ((params["scale"] - target) ** 2) * self._n_timesteps
+
+            def _finalize_sgd(self, target):
+                self.is_fitted = True
+                return 0.0
+
+        model = _MappedToy()
+        model.fit_sgd(jnp.array(5.0), optimizer=optax.adam(1e-1), num_steps=200)
+        assert abs(float(model.scale) - 5.0) < 0.5
+        assert model.is_fitted
+
+
+class TestPrepareSGDDataHook:
+    def test_default_hook_is_the_identity(self) -> None:
+        args, kwargs = _ToyModel()._prepare_sgd_data(1, 2, key="v")
+        assert args == (1, 2)
+        assert kwargs == {"key": "v"}
+
+    def test_hook_runs_before_param_spec_and_feeds_loss_and_finalize(self) -> None:
+        import optax
+
+        calls: list[str] = []
+
+        class _Prepared(_ToyModel):
+            def _prepare_sgd_data(self, target, *, target_scale=1.0):
+                calls.append("prepare")
+                return (jnp.asarray(target) * target_scale,), {}
+
+            def _build_param_spec(self):
+                calls.append("spec")
+                return super()._build_param_spec()
+
+            def _finalize_sgd(self, target):
+                self.finalized_with = target
+                return 0.0
+
+        model = _Prepared(scale=1.0)
+        model.fit_sgd(
+            jnp.array(2.0),
+            target_scale=2.0,
+            optimizer=optax.adam(1e-1),
+            num_steps=200,
+        )
+        assert calls[:2] == ["prepare", "spec"]
+        # The loss and the finalizer both saw the *prepared* target (4.0), not
+        # the raw 2.0, and the hook consumed its own keyword.
+        np.testing.assert_allclose(model.finalized_with, 4.0)
+        assert abs(model.scale - 4.0) < 0.5
+
+    def test_hook_with_concrete_signature_rejects_unknown_keywords(self) -> None:
+        class _Strict(_ToyModel):
+            def _prepare_sgd_data(self, target):
+                return (target,), {}
+
+        with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
+            _Strict().fit_sgd(jnp.array(1.0), key=1, num_steps=0)
+
+    def test_invalid_settings_are_rejected_before_the_hook_runs(self) -> None:
+        """``_prepare_sgd_data`` may have side effects (e.g. recording the
+        sequence length); an invalid ``num_steps`` or optimizer must fail
+        before it runs."""
+        calls: list[str] = []
+
+        class _Recording(_ToyModel):
+            def _prepare_sgd_data(self, target):
+                calls.append("prepare")
+                return (target,), {}
+
+        _Recording().fit_sgd(jnp.array(1.0), num_steps=0)
+        assert calls == ["prepare"]  # guard: the hook is reached when valid
+
+        calls.clear()
+        with pytest.raises(ValueError, match="num_steps"):
+            _Recording().fit_sgd(jnp.array(1.0), num_steps=-1)
+        assert calls == []
+
+        with pytest.raises(ValueError, match="optimizer"):
+            _Recording().fit_sgd(jnp.array(1.0), optimizer=object(), num_steps=1)
+        assert calls == []
+
+        for bad_tol in (-1e-4, float("nan"), "tight"):
+            with pytest.raises(ValueError):
+                _Recording().fit_sgd(
+                    jnp.array(1.0), num_steps=1, convergence_tol=bad_tol
+                )
+        assert calls == []
+
+
+class _CallCounter:
+    """Mutable counter; the model holds one object, so reading the attribute
+    returns the same (identity-fingerprinted) value however often it counts."""
+
+    def __init__(self) -> None:
+        self.n = 0
+
+
+class _CountingToyModel(SGDFittableMixin):
+    """Toy model whose loss reads a model attribute and counts its calls.
+
+    ``_sgd_loss_fn`` runs once per trace of the compiled step plus once for
+    the (eager) final-loss evaluation of every ``fit_sgd`` call, so a call
+    that reuses the compiled step adds exactly one to ``loss_calls``.
+    """
+
+    def __init__(self, scale: float = 1.0, offset: float = 0.0):
+        self.scale = scale
+        self.offset = offset
+        self.counter = _CallCounter()
+
+    _n_timesteps = 10
+
+    @property
+    def loss_calls(self) -> int:
+        return self.counter.n
+
+    @loss_calls.setter
+    def loss_calls(self, value: int) -> None:
+        self.counter.n = value
+
+    def _build_param_spec(self):
+        return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
+
+    def _sgd_loss_fn(self, params, target):
+        self.counter.n += 1
+        return jnp.sum((params["scale"] - target - self.offset) ** 2)
+
+    def _store_sgd_params(self, params):
+        self.scale = float(params["scale"])
+
+    def _finalize_sgd(self, target):
+        return 0.0
+
+
+class TestCompiledStepCache:
+    """fit_sgd reuses its compiled step across calls on the same model."""
+
+    def test_second_call_with_same_shapes_does_not_retrace(self) -> None:
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0, 2.0]), num_steps=3)
+        first_calls = model.loss_calls
+        assert first_calls >= 2  # guard: at least one trace + the final loss
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([3.0, 4.0]), num_steps=3)
+        assert model.loss_calls == 1  # final loss only: no new trace
+
+    def test_no_recompile_logged_on_second_call(self, caplog) -> None:
+        import logging
+
+        model = _CountingToyModel()
+
+        def compiles(target):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="jax"):
+                with jax.log_compiles():
+                    model.fit_sgd(target, num_steps=3)
+            return [
+                r
+                for r in caplog.records
+                if "Compiling" in r.getMessage() and "_sgd_train_step" in r.getMessage()
+            ]
+
+        assert compiles(jnp.array([1.0, 2.0]))  # guard: the log is observed
+        assert compiles(jnp.array([5.0, 6.0])) == []
+
+    def test_cached_step_gives_identical_results(self) -> None:
+        """Reusing the compiled step is bit-identical to compiling afresh, and
+        the data are arguments (a new target is honoured without retracing)."""
+        from state_space_practice import sgd_fitting
+
+        data = [jnp.array([1.0, 2.0]), jnp.array([-3.0, 0.5])]
+        cached = _CountingToyModel(scale=0.5)
+        fresh = _CountingToyModel(scale=0.5)
+        cached_lls, fresh_lls = [], []
+        for target in data:
+            cached_lls.append(cached.fit_sgd(target, num_steps=5))
+            sgd_fitting._SGD_STEP_CACHE.pop(id(fresh), None)
+            fresh_lls.append(fresh.fit_sgd(target, num_steps=5))
+        assert cached_lls == fresh_lls
+        assert cached.scale == fresh.scale
+        # guard: the second fit really optimized toward the new target
+        assert cached_lls[1] != cached_lls[0]
+
+    def test_changed_model_attribute_read_by_loss_retraces(self) -> None:
+        """jit bakes attributes the loss reads; a cached step must not be
+        reused once such an attribute changes."""
+        import optax
+
+        # loss = (scale - offset)^2 / 10: lr 2.5 halves the error each step
+        optimizer = optax.sgd(2.5)
+        model = _CountingToyModel(scale=0.0, offset=0.0)
+        model.fit_sgd(jnp.array([0.0]), optimizer=optimizer, num_steps=40)
+        np.testing.assert_allclose(model.scale, 0.0, atol=1e-6)
+
+        model.offset = 2.0
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([0.0]), optimizer=optimizer, num_steps=40)
+        assert model.loss_calls > 1  # retraced
+        np.testing.assert_allclose(model.scale, 2.0, atol=1e-3)
+
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([0.0]), optimizer=optimizer, num_steps=1)
+        assert model.loss_calls == 1  # unchanged attribute: reused again
+
+    def test_new_optimizer_or_shape_compiles_new_step(self) -> None:
+        import optax
+
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0]), num_steps=2)
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([1.0]), optimizer=optax.adam(1e-2), num_steps=2)
+        assert model.loss_calls > 1
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([1.0, 2.0, 3.0]), num_steps=2)
+        assert model.loss_calls > 1
+
+    def test_cache_entry_released_with_model(self) -> None:
+        import gc
+
+        from state_space_practice import sgd_fitting
+
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0]), num_steps=2)
+        model_id = id(model)
+        assert model_id in sgd_fitting._SGD_STEP_CACHE
+        del model
+        gc.collect()
+        assert model_id not in sgd_fitting._SGD_STEP_CACHE
+
+    def test_models_remain_deep_copyable_after_fit(self) -> None:
+        import copy
+
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0]), num_steps=2)
+        clone = copy.deepcopy(model)
+        clone.loss_calls = 0
+        clone.fit_sgd(jnp.array([1.0]), num_steps=2)
+        assert clone.loss_calls > 1  # own cache, compiled for the clone
+
+    def test_loss_needing_concrete_data_falls_back_to_baked_data(self) -> None:
+        """A loss that inspects its data on the host (here ``np.asarray``)
+        cannot take the data as a traced argument; fit_sgd falls back to
+        baking it in as constants, as before the cache existed."""
+        import optax
+
+        class _HostValidating(_CountingToyModel):
+            def _sgd_loss_fn(self, params, target):
+                if np.any(np.asarray(target) < -100):  # host-side check
+                    raise ValueError("bad target")
+                return super()._sgd_loss_fn(params, target)
+
+        model = _HostValidating(scale=0.0)
+        model.fit_sgd(jnp.array([2.0]), optimizer=optax.sgd(2.5), num_steps=40)
+        np.testing.assert_allclose(model.scale, 2.0, atol=1e-6)
+        # a second call with new data is honoured (the fallback is uncached)
+        model.fit_sgd(jnp.array([-1.0]), optimizer=optax.sgd(2.5), num_steps=40)
+        np.testing.assert_allclose(model.scale, -1.0, atol=1e-6)

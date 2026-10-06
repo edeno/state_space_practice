@@ -47,7 +47,9 @@ def _kalman_filter_predict(
         Predicted state covariance, P_{t|t-1}
     """
     pred_mean = transition_matrix @ mean_prev
-    pred_cov = symmetrize(transition_matrix @ cov_prev @ transition_matrix.T + process_cov)
+    pred_cov = symmetrize(
+        transition_matrix @ cov_prev @ transition_matrix.T + process_cov
+    )
     return pred_mean, pred_cov
 
 
@@ -84,7 +86,9 @@ def _kalman_filter_update(
     """
     # Innovation
     obs_mean = measurement_matrix @ pred_mean
-    obs_cov = symmetrize(measurement_matrix @ pred_cov @ measurement_matrix.T + measurement_cov)
+    obs_cov = symmetrize(
+        measurement_matrix @ pred_cov @ measurement_matrix.T + measurement_cov
+    )
 
     residual = obs - obs_mean
 
@@ -200,7 +204,9 @@ def switching_kalman_filter_reference(
 
         # Step 1: For each pair (i, j), compute predict and update
         # pair_cond_mean[i, j] = E[x_t | y_{1:t}, S_{t-1}=i, S_t=j]
-        pair_cond_mean = jnp.zeros((n_cont_states, n_discrete_states, n_discrete_states))
+        pair_cond_mean = jnp.zeros(
+            (n_cont_states, n_discrete_states, n_discrete_states)
+        )
         pair_cond_cov = jnp.zeros(
             (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         )
@@ -329,7 +335,9 @@ def _kalman_smoother_update(
     """
     # Predicted mean and covariance m_{t+1|t}, P_{t+1|t}
     pred_mean = transition_matrix @ filter_mean
-    pred_cov = symmetrize(transition_matrix @ filter_cov @ transition_matrix.T + process_cov)
+    pred_cov = symmetrize(
+        transition_matrix @ filter_cov @ transition_matrix.T + process_cov
+    )
 
     # Smoother gain J_t
     smoother_gain = psd_solve(pred_cov, transition_matrix @ filter_cov).T
@@ -430,7 +438,9 @@ def switching_kalman_smoother_reference(
     next_smoother_mean = filter_mean[-1]  # shape (n_cont, n_disc)
     next_smoother_cov = filter_cov[-1]  # shape (n_cont, n_cont, n_disc)
     next_smoother_discrete_prob = filter_discrete_state_prob[-1]
-    next_pair_cond_mean = last_filter_conditional_cont_mean  # shape (n_cont, n_disc, n_disc)
+    next_pair_cond_mean = (
+        last_filter_conditional_cont_mean  # shape (n_cont, n_disc, n_disc)
+    )
 
     # Collapse last time step to overall mean/cov
     last_overall_mean = next_smoother_mean @ next_smoother_discrete_prob
@@ -476,8 +486,12 @@ def switching_kalman_smoother_reference(
                     process_cov[:, :, k],
                     continuous_transition_matrix[:, :, k],
                 )
-                pair_cond_smoother_mean = pair_cond_smoother_mean.at[:, j, k].set(sm_mean)
-                pair_cond_smoother_cov = pair_cond_smoother_cov.at[:, :, j, k].set(sm_cov)
+                pair_cond_smoother_mean = pair_cond_smoother_mean.at[:, j, k].set(
+                    sm_mean
+                )
+                pair_cond_smoother_cov = pair_cond_smoother_cov.at[:, :, j, k].set(
+                    sm_cov
+                )
                 # sm_cross is Cov[x_t, x_{t+1}] matching the optimized implementation
                 pair_cond_cross_cov = pair_cond_cross_cov.at[:, :, j, k].set(sm_cross)
 
@@ -493,7 +507,9 @@ def switching_kalman_smoother_reference(
         smoother_discrete_prob_t = jnp.sum(joint_discrete_prob, axis=1)
 
         # P(S_{t+1}=k | S_t=j, y_{1:T})
-        forward_cond = _divide_safe(joint_discrete_prob, smoother_discrete_prob_t[:, None])
+        forward_cond = _divide_safe(
+            joint_discrete_prob, smoother_discrete_prob_t[:, None]
+        )
 
         # Step 3: Collapse over next state k to get state-conditional smoothed estimates
         state_cond_mean_t = jnp.zeros((n_cont_states, n_discrete_states))
@@ -502,7 +518,9 @@ def switching_kalman_smoother_reference(
         for j in range(n_discrete_states):
             weights = forward_cond[j, :]  # P(S_{t+1}=k | S_t=j, y_{1:T})
             cond_means = pair_cond_smoother_mean[:, j, :]  # shape (n_cont, n_disc)
-            cond_covs = pair_cond_smoother_cov[:, :, j, :]  # shape (n_cont, n_cont, n_disc)
+            cond_covs = pair_cond_smoother_cov[
+                :, :, j, :
+            ]  # shape (n_cont, n_cont, n_disc)
 
             marg_mean = cond_means @ weights
             diff = cond_means - marg_mean[:, None]
@@ -522,16 +540,24 @@ def switching_kalman_smoother_reference(
         # Step 5: Compute overall cross-covariance
         # First collapse over S_t for each S_{t+1}
         # U^{j|k} = P(S_t=j | S_{t+1}=k, y_{1:T})
-        smoother_backward_cond = _divide_safe(joint_discrete_prob, next_smoother_discrete_prob)
+        smoother_backward_cond = _divide_safe(
+            joint_discrete_prob, next_smoother_discrete_prob
+        )
 
         state_cond_mean_tplus1 = jnp.zeros((n_cont_states, n_discrete_states))
         smoother_mean_t_cond_Stplus1 = jnp.zeros((n_cont_states, n_discrete_states))
-        state_cond_cross_cov = jnp.zeros((n_cont_states, n_cont_states, n_discrete_states))
+        state_cond_cross_cov = jnp.zeros(
+            (n_cont_states, n_cont_states, n_discrete_states)
+        )
 
         for k in range(n_discrete_states):
             weights = smoother_backward_cond[:, k]  # P(S_t=j | S_{t+1}=k, y_{1:T})
-            cond_means_t = pair_cond_smoother_mean[:, :, k]  # E[x_t | ..., S_t=j, S_{t+1}=k]
-            cond_means_tplus1 = next_pair_cond_mean[:, :, k]  # E[x_{t+1} | ..., S_t=j, S_{t+1}=k]
+            cond_means_t = pair_cond_smoother_mean[
+                :, :, k
+            ]  # E[x_t | ..., S_t=j, S_{t+1}=k]
+            cond_means_tplus1 = next_pair_cond_mean[
+                :, :, k
+            ]  # E[x_{t+1} | ..., S_t=j, S_{t+1}=k]
             # cond_cross_covs[:,:,j] = Cov[x_t, x_{t+1} | S_t=j, S_{t+1}=k] where [a,b] = Cov[x_t[a], x_{t+1}[b]]
             cond_cross_covs = pair_cond_cross_cov[:, :, :, k]
 
@@ -546,15 +572,24 @@ def switching_kalman_smoother_reference(
             # einsum "abj,j->ab" gives result[a,b] = sum_j cond_cross_covs[a,b,j] * w[j]
             # But we need result[a,b] = sum_j cond_cross_covs[b,a,j] * w[j] for the transpose
             # This is einsum "baj,j->ab"
-            marg_cross_cov = jnp.einsum("baj,j->ab", cond_cross_covs, weights) + (diff_tplus1 * weights) @ diff_t.T
+            marg_cross_cov = (
+                jnp.einsum("baj,j->ab", cond_cross_covs, weights)
+                + (diff_tplus1 * weights) @ diff_t.T
+            )
 
-            state_cond_mean_tplus1 = state_cond_mean_tplus1.at[:, k].set(marg_mean_tplus1)
-            smoother_mean_t_cond_Stplus1 = smoother_mean_t_cond_Stplus1.at[:, k].set(marg_mean_t)
+            state_cond_mean_tplus1 = state_cond_mean_tplus1.at[:, k].set(
+                marg_mean_tplus1
+            )
+            smoother_mean_t_cond_Stplus1 = smoother_mean_t_cond_Stplus1.at[:, k].set(
+                marg_mean_t
+            )
             state_cond_cross_cov = state_cond_cross_cov.at[:, :, k].set(marg_cross_cov)
 
         # Final collapse over S_{t+1}
         overall_mean_tplus1 = state_cond_mean_tplus1 @ next_smoother_discrete_prob
-        overall_mean_t_from_cross = smoother_mean_t_cond_Stplus1 @ next_smoother_discrete_prob
+        overall_mean_t_from_cross = (
+            smoother_mean_t_cond_Stplus1 @ next_smoother_discrete_prob
+        )
         diff_tplus1 = state_cond_mean_tplus1 - overall_mean_tplus1[:, None]
         diff_t = smoother_mean_t_cond_Stplus1 - overall_mean_t_from_cross[:, None]
         # Sum state_cond_cross_cov[:,:,k] * prob[k] over k
@@ -569,11 +604,15 @@ def switching_kalman_smoother_reference(
         smoother_discrete_state_prob = smoother_discrete_state_prob.at[t].set(
             smoother_discrete_prob_t
         )
-        smoother_joint_discrete_state_prob = smoother_joint_discrete_state_prob.at[t].set(
-            joint_discrete_prob
+        smoother_joint_discrete_state_prob = smoother_joint_discrete_state_prob.at[
+            t
+        ].set(joint_discrete_prob)
+        overall_smoother_cross_cov = overall_smoother_cross_cov.at[t].set(
+            overall_cross_cov
         )
-        overall_smoother_cross_cov = overall_smoother_cross_cov.at[t].set(overall_cross_cov)
-        state_cond_smoother_means = state_cond_smoother_means.at[t].set(state_cond_mean_t)
+        state_cond_smoother_means = state_cond_smoother_means.at[t].set(
+            state_cond_mean_t
+        )
         state_cond_smoother_covs = state_cond_smoother_covs.at[t].set(state_cond_cov_t)
         pair_cond_smoother_cross_covs = pair_cond_smoother_cross_covs.at[t].set(
             pair_cond_cross_cov
@@ -695,7 +734,10 @@ def switching_kalman_maximization_step_reference(
             for i in range(n_discrete_states):
                 weight = smoother_joint_discrete_state_prob[t, i, j]
                 outer = (
-                    jnp.outer(state_cond_smoother_means[t, :, i], state_cond_smoother_means[t, :, i])
+                    jnp.outer(
+                        state_cond_smoother_means[t, :, i],
+                        state_cond_smoother_means[t, :, i],
+                    )
                     + state_cond_smoother_covs[t, :, :, i]
                 )
                 gamma1 = gamma1 + weight * outer

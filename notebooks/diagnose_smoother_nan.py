@@ -20,9 +20,9 @@ jax.config.update("jax_enable_x64", True)
 from scipy.linalg import solve_discrete_are
 
 from state_space_practice.kalman import (
-    _kalman_smoother_update,
     kalman_filter,
     kalman_smoother,
+    kalman_smoother_update,
     psd_solve,
     symmetrize,
 )
@@ -79,9 +79,11 @@ for q_var in Q_vars:
     max_steps = []
 
     for r in dampings:
-        A = np.array(construct_common_oscillator_transition_matrix(
-            jnp.array([theta_freq_hz]), jnp.array([r]), sampling_freq
-        ))
+        A = np.array(
+            construct_common_oscillator_transition_matrix(
+                jnp.array([theta_freq_hz]), jnp.array([r]), sampling_freq
+            )
+        )
         Q = np.array(construct_common_oscillator_process_covariance(jnp.array([q_var])))
 
         # Steady-state filter covariance via DARE
@@ -116,8 +118,8 @@ for q_var in Q_vars:
         max_steps.append(max_n)
 
     results[q_var] = {
-        'gain_norms': np.array(gain_norms),
-        'max_steps': np.array(max_steps),
+        "gain_norms": np.array(gain_norms),
+        "max_steps": np.array(max_steps),
     }
 
 # %%
@@ -125,24 +127,29 @@ fig, axes = plt.subplots(2, 1, figsize=(12, 8))
 
 ax = axes[0]
 for q_var in Q_vars:
-    ax.plot(dampings, results[q_var]['gain_norms'], label=f'Q_var={q_var}')
-ax.axhline(1.0, color='red', linestyle='--', alpha=0.5, label='Gain = 1 (stable)')
-ax.set_xlabel('Damping coefficient (r)')
-ax.set_ylabel('Spectral radius of G_inf')
-ax.set_title('Steady-state smoother gain vs damping (prediction-only approximation)')
+    ax.plot(dampings, results[q_var]["gain_norms"], label=f"Q_var={q_var}")
+ax.axhline(1.0, color="red", linestyle="--", alpha=0.5, label="Gain = 1 (stable)")
+ax.set_xlabel("Damping coefficient (r)")
+ax.set_ylabel("Spectral radius of G_inf")
+ax.set_title("Steady-state smoother gain vs damping (prediction-only approximation)")
 ax.legend()
 ax.set_ylim(0.8, 1.2)
 
 ax = axes[1]
 for q_var in Q_vars:
-    ms = results[q_var]['max_steps']
-    ax.semilogy(dampings, ms, label=f'Q_var={q_var}')
-ax.axhline(n_time_full, color='black', linestyle='--', alpha=0.5,
-           label=f'Full data ({n_time_full} steps)')
-ax.axhline(75000, color='gray', linestyle='--', alpha=0.5, label='5-min subset (75k)')
-ax.set_xlabel('Damping coefficient (r)')
-ax.set_ylabel('Max backward steps before overflow')
-ax.set_title('Predicted max sequence length before smoother NaN')
+    ms = results[q_var]["max_steps"]
+    ax.semilogy(dampings, ms, label=f"Q_var={q_var}")
+ax.axhline(
+    n_time_full,
+    color="black",
+    linestyle="--",
+    alpha=0.5,
+    label=f"Full data ({n_time_full} steps)",
+)
+ax.axhline(75000, color="gray", linestyle="--", alpha=0.5, label="5-min subset (75k)")
+ax.set_xlabel("Damping coefficient (r)")
+ax.set_ylabel("Max backward steps before overflow")
+ax.set_title("Predicted max sequence length before smoother NaN")
 ax.legend()
 ax.set_ylim(1e3, 1e8)
 
@@ -153,15 +160,17 @@ plt.show()
 # Print critical damping values
 print("\nCritical damping (where max_steps < n_time_full):")
 for q_var in Q_vars:
-    ms = results[q_var]['max_steps']
+    ms = results[q_var]["max_steps"]
     # Find where max_steps drops below n_time_full
     critical_idx = np.where(ms < n_time_full)[0]
     if len(critical_idx) > 0:
         # Find the boundary from both sides
         safe = dampings[ms >= n_time_full]
         unsafe = dampings[ms < n_time_full]
-        print(f"  Q_var={q_var}: safe range = [{safe.min():.3f}, {safe.max():.3f}], "
-              f"unsafe starts at r={unsafe.min():.3f}")
+        print(
+            f"  Q_var={q_var}: safe range = [{safe.min():.3f}, {safe.max():.3f}], "
+            f"unsafe starts at r={unsafe.min():.3f}"
+        )
     else:
         print(f"  Q_var={q_var}: all damping values are safe")
 
@@ -194,8 +203,10 @@ typical_weight = 0.01
 # Fisher info ≈ n_neurons * lambda*dt * weight^2 * I
 fisher_approx = n_neurons * typical_lambda_dt * typical_weight**2
 print(f"Typical Fisher info per latent dim: {fisher_approx:.6f}")
-print(f"This is {'negligible' if fisher_approx < 0.001 else 'significant'} "
-      f"compared to prior precision 1/P_filt")
+print(
+    f"This is {'negligible' if fisher_approx < 0.001 else 'significant'} "
+    f"compared to prior precision 1/P_filt"
+)
 
 # With small Fisher info, observations barely reduce filter covariance
 # So the prediction-only approximation is accurate for this problem.
@@ -203,9 +214,11 @@ print(f"This is {'negligible' if fisher_approx < 0.001 else 'significant'} "
 # Better: use DARE with a Gaussian observation model H=I, R=1/fisher as proxy
 for q_var in [0.01, 0.02]:
     for r in [0.90, 0.95, 0.99, 0.999]:
-        A = np.array(construct_common_oscillator_transition_matrix(
-            jnp.array([theta_freq_hz]), jnp.array([r]), sampling_freq
-        ))
+        A = np.array(
+            construct_common_oscillator_transition_matrix(
+                jnp.array([theta_freq_hz]), jnp.array([r]), sampling_freq
+            )
+        )
         Q = np.array(construct_common_oscillator_process_covariance(jnp.array([q_var])))
 
         # Effective observation: H = I, R = I / fisher
@@ -224,8 +237,10 @@ for q_var in [0.01, 0.02]:
                 max_n = np.inf
 
             safe = "SAFE" if max_n > n_time_full else f"NaN after ~{max_n:.0f} steps"
-            print(f"  r={r:.3f}, Q={q_var}: ||G||={gain_norm:.6f}, "
-                  f"max_steps={max_n:.0f}, {safe}")
+            print(
+                f"  r={r:.3f}, Q={q_var}: ||G||={gain_norm:.6f}, "
+                f"max_steps={max_n:.0f}, {safe}"
+            )
         except Exception as e:
             print(f"  r={r:.3f}, Q={q_var}: DARE failed ({e})")
 
@@ -248,6 +263,7 @@ obs_test = jax.random.normal(jax.random.PRNGKey(0), (n_test, 2)) * 0.1
 init_mean_k = jnp.zeros(2)
 init_cov_k = jnp.eye(2)
 
+
 def test_kalman_smoother(r, q_var):
     """Test non-switching Kalman smoother for NaN."""
     A = construct_common_oscillator_transition_matrix(
@@ -255,13 +271,34 @@ def test_kalman_smoother(r, q_var):
     )
     Q = construct_common_oscillator_process_covariance(jnp.array([q_var]))
     sm_mean, sm_cov, _, _ = kalman_smoother(
-        init_mean_k, init_cov_k, obs_test, A, Q, H_test, R_test,
+        init_mean_k,
+        init_cov_k,
+        obs_test,
+        A,
+        Q,
+        H_test,
+        R_test,
     )
     return bool(jnp.all(jnp.isfinite(sm_mean)))
 
+
 # Sweep damping with Q=0.02
 print("\nSweep damping (Q=0.02, N=354660):")
-for r in [0.50, 0.70, 0.80, 0.85, 0.90, 0.93, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 0.999]:
+for r in [
+    0.50,
+    0.70,
+    0.80,
+    0.85,
+    0.90,
+    0.93,
+    0.95,
+    0.96,
+    0.97,
+    0.98,
+    0.99,
+    0.995,
+    0.999,
+]:
     ok = test_kalman_smoother(r, 0.02)
     print(f"  r={r:.3f}: {'OK' if ok else 'NaN'}")
 
@@ -304,15 +341,22 @@ print("=" * 70)
 
 # Run Kalman filter for a NaN case (fast with Gaussian observations)
 r_test_nan = 0.999
-A_nan = np.array(construct_common_oscillator_transition_matrix(
-    jnp.array([theta_freq_hz]), jnp.array([r_test_nan]), sampling_freq
-))
+A_nan = np.array(
+    construct_common_oscillator_transition_matrix(
+        jnp.array([theta_freq_hz]), jnp.array([r_test_nan]), sampling_freq
+    )
+)
 Q_nan = np.array(construct_common_oscillator_process_covariance(jnp.array([0.02])))
 
 print(f"Running Kalman filter (r={r_test_nan}, Q=0.02, N={n_test})...")
 fm_nan, fc_nan, _ = kalman_filter(
-    init_mean_k, init_cov_k, obs_test,
-    jnp.array(A_nan), jnp.array(Q_nan), H_test, R_test,
+    init_mean_k,
+    init_cov_k,
+    obs_test,
+    jnp.array(A_nan),
+    jnp.array(Q_nan),
+    H_test,
+    R_test,
 )
 print(f"Filter finite: {bool(jnp.all(jnp.isfinite(fm_nan)))}")
 print(f"Filter cov trace at end: {float(jnp.trace(fc_nan[-1])):.4f}")
@@ -373,8 +417,10 @@ cov_traces = np.array(cov_traces)
 mean_norms = np.array(mean_norms)
 
 print(f"  Ran {len(gain_norms)} backward steps")
-print(f"  Gain norm: min={gain_norms.min():.6f}, max={gain_norms.max():.6f}, "
-      f"mean={gain_norms.mean():.6f}")
+print(
+    f"  Gain norm: min={gain_norms.min():.6f}, max={gain_norms.max():.6f}, "
+    f"mean={gain_norms.mean():.6f}"
+)
 print(f"  Cov trace: min={cov_traces.min():.6f}, max={cov_traces.max():.6f}")
 
 # %%
@@ -384,23 +430,25 @@ backward_steps = np.arange(len(gain_norms))
 
 ax = axes[0]
 ax.plot(backward_steps, gain_norms, linewidth=0.5)
-ax.axhline(1.0, color='red', linestyle='--', alpha=0.5)
-ax.set_ylabel('||G|| (spectral radius)')
-ax.set_title(f'Smoother gain norm during backward pass (r={r_test_nan})')
+ax.axhline(1.0, color="red", linestyle="--", alpha=0.5)
+ax.set_ylabel("||G|| (spectral radius)")
+ax.set_title(f"Smoother gain norm during backward pass (r={r_test_nan})")
 
 ax = axes[1]
 ax.semilogy(backward_steps, cov_traces, linewidth=0.5)
-ax.set_ylabel('trace(smoother_cov)')
-ax.set_title('Smoother covariance trace')
+ax.set_ylabel("trace(smoother_cov)")
+ax.set_title("Smoother covariance trace")
 
 ax = axes[2]
 ax.semilogy(backward_steps, mean_norms, linewidth=0.5)
-ax.set_ylabel('||smoother_mean||')
-ax.set_xlabel('Backward steps from end')
-ax.set_title('Smoother mean norm')
+ax.set_ylabel("||smoother_mean||")
+ax.set_xlabel("Backward steps from end")
+ax.set_title("Smoother mean norm")
 
 plt.tight_layout()
-plt.savefig(output_dir / "smoother_backward_diagnostics.png", dpi=150, bbox_inches="tight")
+plt.savefig(
+    output_dir / "smoother_backward_diagnostics.png", dpi=150, bbox_inches="tight"
+)
 plt.show()
 
 # %% [markdown]
@@ -437,35 +485,49 @@ for r_off_sw, r_on_sw, q_var_sw in [
         jnp.array([theta_freq_hz]), jnp.array([r_on_sw]), sampling_freq
     )
     A_sw = jnp.stack([A_off_sw, A_on_sw], axis=-1)
-    Q_sw = jnp.stack([
-        construct_common_oscillator_process_covariance(jnp.array([q_var_sw])),
-    ] * 2, axis=-1)
+    Q_sw = jnp.stack(
+        [
+            construct_common_oscillator_process_covariance(jnp.array([q_var_sw])),
+        ]
+        * 2,
+        axis=-1,
+    )
 
     init_mean_sw = jnp.zeros((2, 2))
     init_cov_sw = jnp.stack([jnp.eye(2)] * 2, axis=-1)
     init_prob_sw = jnp.array([0.5, 0.5])
 
     # Switching filter (Gaussian observations — fast)
-    fm_sw, fc_sw, fp_sw, lpm_sw, mll_sw = switching_kalman_filter(
-        init_mean_sw, init_cov_sw, init_prob_sw, obs_sw,
-        Z_sw, A_sw, Q_sw, H_sw, R_sw,
+    fm_sw, fc_sw, fp_sw, _, _, _, mll_sw = switching_kalman_filter(
+        init_mean_sw,
+        init_cov_sw,
+        init_prob_sw,
+        obs_sw,
+        Z_sw,
+        A_sw,
+        Q_sw,
+        H_sw,
+        R_sw,
     )
     filter_ok = bool(jnp.all(jnp.isfinite(fm_sw)))
 
     # Switching smoother
     result_sw = switching_kalman_smoother(
-        filter_mean=fm_sw, filter_cov=fc_sw,
+        filter_mean=fm_sw,
+        filter_cov=fc_sw,
         filter_discrete_state_prob=fp_sw,
-        last_filter_conditional_cont_mean=lpm_sw,
-        process_cov=Q_sw, continuous_transition_matrix=A_sw,
+        process_cov=Q_sw,
+        continuous_transition_matrix=A_sw,
         discrete_state_transition_matrix=Z_sw,
     )
     sm_sw = result_sw[5]
     smoother_ok = bool(jnp.all(jnp.isfinite(sm_sw)))
 
-    print(f"  r=[{r_off_sw:.2f},{r_on_sw:.3f}] Q={q_var_sw}: "
-          f"filter={'OK' if filter_ok else 'NaN'}, "
-          f"smoother={'OK' if smoother_ok else 'NaN'}")
+    print(
+        f"  r=[{r_off_sw:.2f},{r_on_sw:.3f}] Q={q_var_sw}: "
+        f"filter={'OK' if filter_ok else 'NaN'}, "
+        f"smoother={'OK' if smoother_ok else 'NaN'}"
+    )
 
 # %%
 print("\n" + "=" * 70)

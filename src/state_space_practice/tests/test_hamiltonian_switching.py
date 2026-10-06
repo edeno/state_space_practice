@@ -1,8 +1,11 @@
 """Tests for SwitchingHamiltonianJointModel."""
 
+import copy
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from state_space_practice.nonlinear_dynamics import apply_mlp, leapfrog_step
@@ -49,6 +52,59 @@ def synthetic_data(switching_model):
 def params(switching_model):
     params, _ = switching_model._build_param_spec()
     return params
+
+
+class TestSwitchingHamiltonianKeys:
+    """Per-state MLP initialization draws fresh randomness."""
+
+    @pytest.mark.parametrize("n_discrete_states", [2, 4])
+    def test_per_state_mlp_keys_differ_from_parent_keys(self, n_discrete_states):
+        """The parent consumes ``split(PRNGKey(seed), 4)`` for its MLP, C_lfp,
+        C_spikes and init keys. Under JAX's partitionable threefry
+        ``split(key, n)[i]`` does not depend on ``n``, so re-splitting the same
+        key handed state i the parent's key i (state 0's MLP was the parent's
+        MLP, state 1's was drawn from C_lfp's key)."""
+        from state_space_practice.hamiltonian_joint import JointHamiltonianModel
+        from state_space_practice.hamiltonian_switching import (
+            SwitchingHamiltonianJointModel,
+        )
+        from state_space_practice.nonlinear_dynamics import init_mlp_params
+
+        kwargs = dict(
+            n_oscillators=1,
+            n_lfp_sources=2,
+            n_spike_sources=3,
+            sampling_freq=100.0,
+            hidden_dims=[8, 8],
+            seed=0,
+        )
+        model = SwitchingHamiltonianJointModel(
+            n_discrete_states=n_discrete_states, **kwargs
+        )
+        parent_keys = jax.random.split(jax.random.PRNGKey(0), 4)
+        parent_mlps = [init_mlp_params(1, [8, 8], k) for k in parent_keys]
+
+        def first_layer(mlp):
+            return np.asarray(mlp["w0"])  # the biases start at zero
+
+        state_layers = [
+            np.asarray(model.mlp_params["w0"][s]) for s in range(n_discrete_states)
+        ]
+        for layer in state_layers:
+            for parent in parent_mlps:
+                assert not np.allclose(layer, first_layer(parent))
+        # states are initialized differently from one another
+        for a in range(n_discrete_states):
+            for b in range(a + 1, n_discrete_states):
+                assert not np.allclose(state_layers[a], state_layers[b])
+        # guard: the parent's own draws are unchanged by advancing the key
+        joint = JointHamiltonianModel(**kwargs)
+        np.testing.assert_array_equal(model.C_lfp, joint.C_lfp)
+        np.testing.assert_array_equal(model.C_spikes, joint.C_spikes)
+        # guard: the comparison would catch a collision
+        np.testing.assert_array_equal(
+            first_layer(joint.mlp_params), first_layer(parent_mlps[0])
+        )
 
 
 class TestSwitchingHamiltonianSmooth:
@@ -210,6 +266,7 @@ class TestSwitchingHamiltonianSmooth:
             "transition matrices — Jacobian weighting may be ignoring probabilities"
         )
 
+    @pytest.mark.slow  # full switching filter + smoother vs a reference (~7 s)
     def test_smoother_matches_pairwise_rts_reference(self):
         """The continuous smoother must update all (S_t, S_{t+1}) pairs."""
         from state_space_practice.hamiltonian_core import (
@@ -218,6 +275,7 @@ class TestSwitchingHamiltonianSmooth:
         )
         from state_space_practice.hamiltonian_switching import (
             SwitchingHamiltonianJointModel,
+            switching_predict_collapse,
         )
         from state_space_practice.nonlinear_dynamics import ekf_smooth_step
         from state_space_practice.switching_kalman import collapse_gaussian_mixture
@@ -272,7 +330,7 @@ class TestSwitchingHamiltonianSmooth:
                     pi_pred,
                     m_pred_pair,
                     P_pred_pair,
-                ) = model._per_state_pred_collapse(
+                ) = switching_predict_collapse(
                     m_prev,
                     P_prev,
                     pi_prev,
@@ -280,7 +338,7 @@ class TestSwitchingHamiltonianSmooth:
                     params["mlp"],
                     params["omega"],
                     model.process_cov,
-                    K,
+                    model.dt,
                     with_jacobian=True,
                 )
                 m_posts = []
@@ -396,6 +454,50 @@ class TestSwitchingHamiltonianSmooth:
         assert jnp.allclose(pi_s[0], pi_s_t0, atol=1e-8)
 
 
+class TestSwitchingHamiltonianFailLoud:
+    """Malformed discrete predictions and impossible observations must surface
+    as non-finite outputs, so a divergent SGD step stops ``fit_sgd`` instead of
+    being sanitized into a finite loss."""
+
+    def test_nan_transition_entry_gives_non_finite_step(
+        self, switching_model, synthetic_data, params
+    ):
+        """A NaN in Z poisons the predicted discrete distribution at the very
+        first step; it must not be zeroed out and renormalized away."""
+        from state_space_practice.hamiltonian_switching import (
+            switching_hamiltonian_filter,
+        )
+
+        lfp, spikes = synthetic_data
+        complete = switching_model._complete_filter_params(params)
+        good = switching_hamiltonian_filter(
+            (lfp, spikes), complete, dt=switching_model.dt
+        )
+        assert jnp.all(jnp.isfinite(good[2])) and jnp.all(jnp.isfinite(good[3]))
+
+        bad_Z = complete["Z"].at[0, 1].set(jnp.nan)
+        _, _, probs, lls = switching_hamiltonian_filter(
+            (lfp, spikes), {**complete, "Z": bad_Z}, dt=switching_model.dt
+        )
+        assert not jnp.isfinite(lls[0])
+        assert not jnp.all(jnp.isfinite(probs[0]))
+
+    def test_impossible_observation_gives_non_finite_sgd_loss(
+        self, switching_model, synthetic_data, params
+    ):
+        """A step that every discrete state rules out (log-likelihood -inf in
+        each state) must make the SGD loss non-finite, not floor that step's
+        contribution to a finite constant. A negative spike count has zero
+        Poisson probability; it bypasses the public filter's validation here
+        because ``_sgd_loss_fn`` calls the jitted core directly."""
+        lfp, spikes = synthetic_data
+        assert jnp.isfinite(switching_model._sgd_loss_fn(params, lfp, spikes))
+
+        impossible_spikes = spikes.at[5].set(-1.0)
+        loss = switching_model._sgd_loss_fn(params, lfp, impossible_spikes)
+        assert not jnp.isfinite(loss)
+
+
 class TestSwitchingHamiltonianBehavioral:
     """Behavioral test: smoother should discriminate modes from observations."""
 
@@ -494,7 +596,8 @@ class TestSwitchingHamiltonianSGDRecovery:
     """Verify fit_sgd learns distinguishable omegas and recovers state structure."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         from state_space_practice.hamiltonian_switching import (
             SwitchingHamiltonianJointModel,
         )
@@ -600,6 +703,69 @@ class TestSwitchingHamiltonianSGDRecovery:
         )
 
 
+def test_switching_cores_are_shared_across_model_instances(monkeypatch):
+    """A second instance with the same shapes and dt reuses the compilation.
+
+    The switching filter/smoother are module-level ``jax.jit`` functions with
+    only ``dt`` static (the state count follows from the array shapes); a
+    never-seen ``dt`` traces again, keeping the reuse check non-vacuous.
+
+    Compilations are observed as traces (``switching_predict_collapse`` runs
+    only while a core is traced), not as absolute ``_cache_size()`` counts:
+    those depend on what earlier tests compiled, and JAX's jit cache is a
+    global LRU whose evictions can hide a new entry in a long run.
+    """
+    from state_space_practice import hamiltonian_switching
+    from state_space_practice.hamiltonian_switching import (
+        SwitchingHamiltonianJointModel,
+        switching_hamiltonian_filter,
+        switching_hamiltonian_smoother,
+    )
+
+    traces: list = []
+    original = hamiltonian_switching.switching_predict_collapse
+
+    def counting(*args, **kwargs):
+        traces.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hamiltonian_switching, "switching_predict_collapse", counting)
+    # Sampling rates no other test uses, so the first run must compile.
+    sampling_freq, other_sampling_freq = 7907.0, 7909.0
+
+    k1, k2 = jax.random.split(jax.random.PRNGKey(5))
+    lfp = jax.random.normal(k1, (6, 2))
+    spikes = jax.random.poisson(k2, 0.5, (6, 3))
+
+    def run(seed, sampling_freq):
+        model = SwitchingHamiltonianJointModel(
+            n_oscillators=1,
+            n_discrete_states=2,
+            n_lfp_sources=2,
+            n_spike_sources=3,
+            sampling_freq=sampling_freq,
+            hidden_dims=[4],
+            seed=seed,
+        )
+        params = model._build_param_spec()[0]
+        model.filter(lfp, spikes, params)
+        model.smooth(lfp, spikes, params)
+
+    run(seed=0, sampling_freq=sampling_freq)
+    n_filter = switching_hamiltonian_filter._cache_size()
+    n_smooth = switching_hamiltonian_smoother._cache_size()
+    assert traces  # guard: this dt really was compiled here
+
+    traces.clear()
+    run(seed=1, sampling_freq=sampling_freq)
+    assert traces == []
+    assert switching_hamiltonian_filter._cache_size() == n_filter
+    assert switching_hamiltonian_smoother._cache_size() == n_smooth
+
+    run(seed=0, sampling_freq=other_sampling_freq)
+    assert traces
+
+
 class TestSwitchingHamiltonianUseFilterGuard:
     """The switching model has no deterministic-rollout surrogate, so
     use_filter=False must fail loud rather than silently run the filter."""
@@ -621,3 +787,69 @@ class TestSwitchingHamiltonianUseFilterGuard:
         lfp, spikes = synthetic_data
         with pytest.raises(NotImplementedError, match="use_filter=True"):
             switching_model.fit_sgd(lfp, spikes, num_steps=1, use_filter=False)
+
+
+@pytest.mark.slow
+def test_fit_sgd_accepts_named_data_and_positional_optimizer(
+    switching_model, synthetic_data
+):
+    """The switching model inherits the joint signature ``fit_sgd(lfp_obs,
+    spike_obs, optimizer, num_steps, ...)``: naming the data and passing the
+    optimizer positionally must fit exactly like the positional-data /
+    keyword-optimizer call."""
+    lfp, spikes = synthetic_data
+    optimizer = optax.adam(1e-2)
+    ref, named, positional = (copy.deepcopy(switching_model) for _ in range(3))
+
+    lls_ref = ref.fit_sgd(lfp, spikes, optimizer=optimizer, num_steps=2)
+    assert len(lls_ref) == 2
+
+    lls_named = named.fit_sgd(
+        lfp_obs=lfp, spike_obs=spikes, optimizer=optimizer, num_steps=2
+    )
+    assert lls_named == lls_ref
+    assert positional.fit_sgd(lfp, spikes, optimizer, 2) == lls_ref
+    assert jnp.array_equal(named.omega, ref.omega)
+    assert jnp.array_equal(positional.omega, ref.omega)
+
+
+@pytest.mark.slow
+def test_store_sgd_params_after_fit_covers_the_switching_spec(
+    switching_model, synthetic_data
+):
+    """The switching model stores optimized params through the mapping-driven
+    default, bypassing the single-regime overrides. Every optimized key must
+    therefore be mapped, the per-state containers must keep their
+    discrete-state axis, and the fixed covariances must stay untouched."""
+    model = switching_model
+    lfp, spikes = synthetic_data
+    n, k = model.n_cont_states, model.n_discrete_states
+    _, spec = model._build_param_spec()
+    unmapped = set(spec) - set(model._sgd_param_attrs)
+    assert not unmapped, f"optimized keys without storage: {unmapped}"
+    fixed = {
+        name: getattr(model, name) for name in ("process_cov", "init_cov", "R_lfp")
+    }
+    omega_before = model.omega
+
+    model.fit_sgd(lfp, spikes, num_steps=3)
+
+    # Guard: the fit moved the parameters, so the checks below see stored values.
+    assert not jnp.allclose(model.omega, omega_before)
+    assert model.omega.shape == (k,)
+    assert model.init_mean.shape == (n, k)
+    assert model.discrete_transition_matrix.shape == (k, k)
+    np.testing.assert_allclose(model.discrete_transition_matrix.sum(axis=1), 1.0)
+    assert model.init_discrete_state_prob.shape == (k,)
+    np.testing.assert_allclose(model.init_discrete_state_prob.sum(), 1.0)
+    for leaf in jax.tree_util.tree_leaves(model.mlp_params):
+        assert leaf.shape[0] == k
+    # The combined readout is resynced with the fitted heads in every state.
+    assert model.measurement_matrix.shape == (model.n_sources, n, k)
+    for j in range(k):
+        np.testing.assert_array_equal(
+            model.measurement_matrix[:, :, j],
+            jnp.concatenate([model.C_lfp, model.C_spikes], axis=0),
+        )
+    for name, value in fixed.items():
+        np.testing.assert_array_equal(getattr(model, name), value)

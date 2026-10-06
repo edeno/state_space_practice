@@ -4,16 +4,25 @@ This module tests point process filters and smoothers for neural encoding,
 including stochastic filters, smoothers, and steepest descent methods.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice import point_process_kalman
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import is_set
 from state_space_practice.point_process_kalman import (
+    BlockDiagonalCovariance,
     BlockDiagonalStructure,
     PointProcessModel,
-    _detect_block_diagonal_problem,
-    _is_block_diagonal,
+    _block_diagonal_forward_core,
+    _block_diagonal_parameters_ok,
+    _block_diagonal_smoother_core,
+    _build_block_structure_from_traced,
+    _fisher_scoring_line_search,
     _logdet_psd,
     _point_process_laplace_update,
     _safe_expected_count,
@@ -21,9 +30,12 @@ from state_space_practice.point_process_kalman import (
     _stochastic_point_process_filter_block_diagonal,
     _stochastic_point_process_smoother_block_diagonal,
     _validate_filter_numerics,
-    get_confidence_interval,
+    _warn_line_search_failures,
     dynamics_only_m_step,
+    get_confidence_interval,
+    glm_laplace_update,
     log_conditional_intensity,
+    poisson_family,
     steepest_descent_point_process_filter,
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
@@ -532,6 +544,12 @@ class TestStochasticPointProcessSmoother:
         )
 
 
+def _legacy_dynamics_only_m_step(*args, **kwargs):
+    """The deprecated ``initial_state_prior=None`` path, which must warn."""
+    with pytest.warns(DeprecationWarning, match="initial_state_prior=None"):
+        return dynamics_only_m_step(*args, **kwargs)
+
+
 class TestKalmanMaximizationStep:
     """Tests for the dynamics_only_m_step function."""
 
@@ -564,10 +582,12 @@ class TestKalmanMaximizationStep:
         """M-step outputs should have correct shapes."""
         s = smoother_outputs
 
-        transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
-            s["smoother_mean"],
-            s["smoother_cov"],
-            s["smoother_cross_cov"],
+        transition_matrix, process_cov, init_mean, init_cov = (
+            _legacy_dynamics_only_m_step(
+                s["smoother_mean"],
+                s["smoother_cov"],
+                s["smoother_cross_cov"],
+            )
         )
 
         n_params = s["n_params"]
@@ -580,10 +600,12 @@ class TestKalmanMaximizationStep:
         """M-step should not produce NaN values."""
         s = smoother_outputs
 
-        transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
-            s["smoother_mean"],
-            s["smoother_cov"],
-            s["smoother_cross_cov"],
+        transition_matrix, process_cov, init_mean, init_cov = (
+            _legacy_dynamics_only_m_step(
+                s["smoother_mean"],
+                s["smoother_cov"],
+                s["smoother_cross_cov"],
+            )
         )
 
         assert not jnp.any(jnp.isnan(transition_matrix))
@@ -598,7 +620,7 @@ class TestKalmanMaximizationStep:
         smoother_cross_cov = jnp.zeros((0, 2, 2))
 
         with pytest.raises(ValueError, match="at least 2 time steps"):
-            dynamics_only_m_step(
+            _legacy_dynamics_only_m_step(
                 smoother_mean,
                 smoother_cov,
                 smoother_cross_cov,
@@ -608,7 +630,7 @@ class TestKalmanMaximizationStep:
         """Process covariance should be symmetric."""
         s = smoother_outputs
 
-        _, process_cov, _, _ = dynamics_only_m_step(
+        _, process_cov, _, _ = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -620,7 +642,7 @@ class TestKalmanMaximizationStep:
         """Initial covariance should be symmetric."""
         s = smoother_outputs
 
-        _, _, _, init_cov = dynamics_only_m_step(
+        _, _, _, init_cov = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -632,7 +654,7 @@ class TestKalmanMaximizationStep:
         """Initial mean should equal first smoother mean."""
         s = smoother_outputs
 
-        _, _, init_mean, _ = dynamics_only_m_step(
+        _, _, init_mean, _ = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -644,13 +666,31 @@ class TestKalmanMaximizationStep:
         """Initial covariance should equal first smoother covariance."""
         s = smoother_outputs
 
-        _, _, _, init_cov = dynamics_only_m_step(
+        _, _, _, init_cov = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
         )
 
         np.testing.assert_allclose(init_cov, s["smoother_cov"][0], rtol=1e-10)
+
+    def test_prior_path_does_not_warn(self, smoother_outputs) -> None:
+        """Only the legacy ``initial_state_prior=None`` path is deprecated."""
+        from state_space_practice.kalman import InitialStatePrior
+
+        s = smoother_outputs
+        n = s["n_params"]
+        prior = InitialStatePrior(
+            jnp.zeros(n), jnp.eye(n), 0.9 * jnp.eye(n), 0.1 * jnp.eye(n)
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            dynamics_only_m_step(
+                s["smoother_mean"],
+                s["smoother_cov"],
+                s["smoother_cross_cov"],
+                initial_state_prior=prior,
+            )
 
     def test_recovers_nonsymmetric_transition_from_exact_sufficient_stats(self) -> None:
         """M-step should recover A orientation for a noiseless 2D trajectory."""
@@ -666,10 +706,12 @@ class TestKalmanMaximizationStep:
         smoother_cov = jnp.zeros((n_time, n_state, n_state))
         smoother_cross_cov = jnp.zeros((n_time - 1, n_state, n_state))
 
-        estimated_transition_matrix, estimated_process_cov, _, _ = dynamics_only_m_step(
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
+        estimated_transition_matrix, estimated_process_cov, _, _ = (
+            _legacy_dynamics_only_m_step(
+                smoother_mean,
+                smoother_cov,
+                smoother_cross_cov,
+            )
         )
 
         np.testing.assert_allclose(
@@ -678,12 +720,10 @@ class TestKalmanMaximizationStep:
             rtol=1e-8,
             atol=1e-8,
         )
-        np.testing.assert_allclose(
-            estimated_process_cov,
-            jnp.eye(n_state) * 1e-8,
-            rtol=1e-8,
-            atol=1e-10,
-        )
+        # Noiseless dynamics: Q is ~0. The eigenvalue floor is relative to
+        # the matrix scale (no absolute 1e-8 clamp), so it stays ~0 but PSD.
+        np.testing.assert_allclose(estimated_process_cov, 0.0, atol=1e-12)
+        assert np.linalg.eigvalsh(np.asarray(estimated_process_cov)).min() > 0.0
 
 
 class TestSteepestDescentPointProcessFilter:
@@ -975,9 +1015,11 @@ class TestPointProcessModel:
         d = simple_model_data
         model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
 
-        # Before fit, results are None
-        assert model.smoother_mean is None
-        assert model.smoother_cov is None
+        # Before fit, results are unset: reading one raises NotFittedError.
+        for attr in ("smoother_mean", "smoother_cov"):
+            with pytest.raises(NotFittedError, match=attr):
+                getattr(model, attr)
+            assert not hasattr(model, attr)
 
         model.fit(d["design_matrix"], d["spike_indicator"], max_iter=3)
 
@@ -1107,7 +1149,7 @@ class TestPointProcessModel:
         d = simple_model_data
         model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.get_rate_estimate(d["design_matrix"])
 
     def test_get_rate_estimate_after_fit(self, simple_model_data) -> None:
@@ -1130,7 +1172,7 @@ class TestPointProcessModel:
         d = simple_model_data
         model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.get_confidence_interval()
 
     def test_get_confidence_interval_after_fit(self, simple_model_data) -> None:
@@ -1165,29 +1207,6 @@ class TestPointProcessModel:
         assert ci_smoothed.shape == ci_filtered.shape
         # Last time point should be the same
         np.testing.assert_allclose(ci_smoothed[-1], ci_filtered[-1], rtol=1e-5)
-
-    def test_random_walk_recovery(self) -> None:
-        """Model should recover A ≈ I for random walk data."""
-        np.random.seed(123)
-        n_time = 500
-        n_basis = 3
-        dt = 0.02
-
-        design_matrix = np.eye(n_basis)[np.arange(n_time) % n_basis]
-        spike_indicator = np.random.poisson(0.2, size=n_time).astype(float)
-
-        model = PointProcessModel(
-            n_state_dims=n_basis,
-            dt=dt,
-            transition_matrix=jnp.eye(n_basis) * 0.8,  # Start away from I
-            process_cov=jnp.eye(n_basis) * 1e-3,
-        )
-
-        model.fit(design_matrix, spike_indicator, max_iter=20)
-
-        # A should be close to identity for random walk (allow 0.25 tolerance)
-        # Note: with limited data, exact recovery is difficult
-        np.testing.assert_allclose(model.transition_matrix, jnp.eye(n_basis), atol=0.25)
 
 
 class TestKalmanMaximizationStepMStepRegression:
@@ -1226,7 +1245,7 @@ class TestKalmanMaximizationStepMStepRegression:
         smoother_cross_cov = jnp.stack([jnp.eye(n_params) * 0.0005] * (n_time - 1))
 
         # Run M-step
-        A_est, Q_est, _, _ = dynamics_only_m_step(
+        A_est, Q_est, _, _ = _legacy_dynamics_only_m_step(
             smoother_mean, smoother_cov, smoother_cross_cov
         )
 
@@ -1259,14 +1278,14 @@ class TestKalmanMaximizationStepMStepRegression:
         smoother_cov = jnp.stack([jnp.eye(n_params) * 0.01] * n_time)
         smoother_cross_cov = jnp.stack([jnp.eye(n_params) * 0.005] * (n_time - 1))
 
-        A_increasing, _, _, _ = dynamics_only_m_step(
+        A_increasing, _, _, _ = _legacy_dynamics_only_m_step(
             smoother_mean_increasing, smoother_cov, smoother_cross_cov
         )
 
         # Case 2: States that are constant (all zeros)
         smoother_mean_constant = jnp.zeros((n_time, n_params))
 
-        A_constant, _, _, _ = dynamics_only_m_step(
+        A_constant, _, _, _ = _legacy_dynamics_only_m_step(
             smoother_mean_constant, smoother_cov, smoother_cross_cov
         )
 
@@ -1884,7 +1903,7 @@ class TestGetRateEstimateMultiNeuron:
             spike_indicator_t=spike_counts,
             dt=dt,
             log_intensity_func=nonlinear_log_intensity,
-            diagonal_boost=1e-9,  # production default
+            # production default (scale-relative Cholesky shift only)
             include_laplace_normalization=True,
         )
 
@@ -2146,6 +2165,7 @@ class TestPointProcessMathCorrectness:
                 dt,
                 log_intensity,
                 include_laplace_normalization=False,
+                max_newton_iter=1,  # the hand-derived solution is one step
             )
 
             np.testing.assert_allclose(
@@ -2527,55 +2547,6 @@ class TestPointProcessEMCorrectness:
         for i, ll in enumerate(log_likelihoods):
             assert np.isfinite(ll), f"LL should be finite at iteration {i}"
 
-    def test_em_recovers_stationary_params(self) -> None:
-        """With A=I and small Q, EM should recover the true GLM parameters.
-
-        The state is the parameter vector. With identity dynamics and small
-        process noise, the smoother mean at steady state should approximate
-        the true parameters.
-        """
-        n_time = 2000
-        n_params = 3  # intercept + 2 features
-        dt = 0.01
-
-        true_params = jnp.array([1.5, 0.8, -0.5])
-
-        key = jax.random.PRNGKey(99)
-        k1, k2 = jax.random.split(key)
-        features = jax.random.normal(k1, (n_time, 2)) * 0.3
-        design_matrix = jnp.concatenate([jnp.ones((n_time, 1)), features], axis=1)
-
-        log_rate = log_conditional_intensity(design_matrix, true_params)
-        rate = jnp.exp(log_rate) * dt
-        spikes = jax.random.poisson(k2, rate).astype(float)
-
-        model = PointProcessModel(
-            n_state_dims=n_params,
-            dt=dt,
-            transition_matrix=jnp.eye(n_params),
-            process_cov=jnp.eye(n_params) * 0.0001,
-            init_mean=jnp.zeros(n_params),
-            init_cov=jnp.eye(n_params) * 1.0,
-            update_process_cov=True,
-            update_transition_matrix=False,
-        )
-
-        model.fit(design_matrix, spikes, max_iter=30, tolerance=1e-6)
-
-        # Smoother mean averaged over the middle portion should approximate
-        # true params. The smoother state drifts slightly due to process noise,
-        # so we average over the central 50% of time to reduce variance.
-        mid_start = n_time // 4
-        mid_end = 3 * n_time // 4
-        recovered_params = jnp.mean(model.smoother_mean[mid_start:mid_end], axis=0)
-
-        np.testing.assert_allclose(
-            recovered_params,
-            true_params,
-            atol=0.5,
-            err_msg="Smoother should recover approximately true parameters",
-        )
-
     def test_em_monotonic_per_iteration(self) -> None:
         """With well-conditioned data, EM should be nearly monotonic.
 
@@ -2906,9 +2877,10 @@ class TestValidateFilterNumerics:
 
         init_cov = jnp.eye(36) * 0.5  # cond=1, min_eig=0.5
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")  # any warning would raise
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _validate_filter_numerics(init_cov, n_time=10_000)
+        assert [str(w.message) for w in caught] == []
 
     def test_no_warning_in_f64_on_long_ill_conditioned(self) -> None:
         """f64 mode: even Problem B conditioning does NOT trigger a warning.
@@ -2930,10 +2902,14 @@ class TestValidateFilterNumerics:
         )
         U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(2), (n, n)))
         init_cov = (U * eigs) @ U.T
+        # Guard: this really exercises the f64 path (the same matrix in f32
+        # warns, see test_warns_on_f32_long_ill_conditioned).
+        assert init_cov.dtype == jnp.float64
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _validate_filter_numerics(init_cov, n_time=28_373)
+        assert [str(w.message) for w in caught] == []
 
     def test_warns_on_f32_long_ill_conditioned(self) -> None:
         """f32 init_cov on a long / ill-conditioned problem must warn.
@@ -2969,9 +2945,11 @@ class TestValidateFilterNumerics:
         import warnings
 
         init_cov_f32 = (jnp.eye(10) * 0.5).astype(jnp.float32)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
+        assert init_cov_f32.dtype == jnp.float32  # guard: the f32 branch runs
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _validate_filter_numerics(init_cov_f32, n_time=100)
+        assert [str(w.message) for w in caught] == []
 
     def test_validate_inputs_false_skips_check(self) -> None:
         """``validate_inputs=False`` bypasses the validation layer.
@@ -2979,9 +2957,9 @@ class TestValidateFilterNumerics:
         We construct a tiny problem with an init_cov that:
           - has a tiny (-1e-12) negative eigenvalue, so the validation
             layer would raise with "not positive definite"
-          - is close enough to PSD that ``psd_solve``'s internal
-            ``diagonal_boost=1e-9`` rescues the Cholesky, so the
-            downstream scan completes without NaN
+          - is close enough to PSD that the first prediction
+            (``A P0 A' + Q`` with ``Q = 1e-6 I``) is positive definite, so
+            the downstream scan completes without NaN
 
         With validate_inputs=True (default), this raises ValueError
         from the validator. With validate_inputs=False, the filter
@@ -3007,8 +2985,9 @@ class TestValidateFilterNumerics:
                 log_conditional_intensity,
             )
 
-        # Opt-out path: validation is skipped, psd_solve's diagonal_boost
-        # rescues the Cholesky, and the filter produces finite output.
+        # Opt-out path: validation is skipped, the process noise makes the
+        # first prediction positive definite, and the filter produces finite
+        # output.
         # (We don't assert output correctness — only that the validation
         # layer was bypassed cleanly.)
         filtered_mean, filtered_cov, mll = stochastic_point_process_filter(
@@ -3027,58 +3006,56 @@ class TestValidateFilterNumerics:
         assert jnp.isfinite(mll)
 
 
-class TestIsBlockDiagonal:
-    """Tests for the ``_is_block_diagonal`` low-level predicate."""
+def _block_structure(init_mean, init_cov, A, Q, Z) -> BlockDiagonalStructure:
+    """Per-neuron factors of a block-diagonal test problem.
 
-    def test_identity_is_block_diagonal(self) -> None:
-        assert _is_block_diagonal(jnp.eye(12), n_blocks=3, block_size=4)
-
-    def test_diag_matrix_is_block_diagonal(self) -> None:
-        assert _is_block_diagonal(jnp.diag(jnp.arange(8.0)), n_blocks=4, block_size=2)
-
-    def test_wrong_total_size_returns_false(self) -> None:
-        # 10 != 3 * 4 = 12
-        assert not _is_block_diagonal(jnp.eye(10), n_blocks=3, block_size=4)
-
-    def test_non_square_returns_false(self) -> None:
-        assert not _is_block_diagonal(jnp.zeros((4, 8)), n_blocks=2, block_size=4)
-
-    def test_non_block_diagonal_returns_false(self) -> None:
-        # Dense symmetric matrix with random cross-block entries.
-        A = jax.random.normal(jax.random.PRNGKey(0), (6, 6))
-        A = A @ A.T + jnp.eye(6)
-        assert not _is_block_diagonal(A, n_blocks=2, block_size=3)
-
-    def test_n_blocks_one_is_trivially_block_diagonal(self) -> None:
-        """A single block IS the whole matrix — trivially block-diagonal."""
-        A = jax.random.normal(jax.random.PRNGKey(1), (4, 4))
-        A = A @ A.T
-        assert _is_block_diagonal(A, n_blocks=1, block_size=4)
-
-    def test_genuine_block_diagonal_detected(self) -> None:
-        # Construct a (2-block, 3-per-block) block-diagonal matrix.
-        b0 = jnp.array([[2.0, 0.5, 0.1], [0.5, 1.0, 0.2], [0.1, 0.2, 3.0]])
-        b1 = jnp.array([[1.5, 0.3, 0.0], [0.3, 2.0, 0.4], [0.0, 0.4, 1.0]])
-        A = jnp.zeros((6, 6)).at[:3, :3].set(b0).at[3:, 3:].set(b1)
-        assert _is_block_diagonal(A, n_blocks=2, block_size=3)
-
-    def test_tolerance_allows_small_off_block_noise(self) -> None:
-        """Off-block entries within ``atol`` should be treated as zero."""
-        A = jnp.eye(6)
-        A = A.at[0, 3].set(1e-12)  # tiny cross-block entry
-        A = A.at[3, 0].set(1e-12)
-        assert _is_block_diagonal(A, n_blocks=2, block_size=3, atol=1e-10)
-        assert not _is_block_diagonal(A, n_blocks=2, block_size=3, atol=1e-14)
-
-
-class TestDetectBlockDiagonalProblem:
-    """Tests for the ``_detect_block_diagonal_problem`` dispatch helper.
-
-    Regression test class for the block-diagonal filter specialization.
-    Detection must only return non-None for genuinely block-diagonal
-    problems — a false positive would dispatch to the block filter on a
-    dense problem and produce wrong results.
+    ``Z`` is the block-expanded ``(n_time, n_neurons, n_state)`` design built
+    from one shared basis; the parameter half of the contract is asserted
+    with the live check before the factors are sliced out.
     """
+    _, n_neurons, n_state = Z.shape
+    block_size = n_state // n_neurons
+    assert bool(
+        _block_diagonal_parameters_ok(
+            init_cov, A, Q, n_neurons=n_neurons, block_size=block_size
+        )
+    ), "test problem must satisfy the block-diagonal parameter contract"
+    return _build_block_structure_from_traced(
+        init_mean, init_cov, A, Q, Z, n_neurons, block_size
+    )
+
+
+def _count_traces(monkeypatch, helper_name: str) -> list:
+    """Record each call of a ``point_process_kalman`` helper that the jitted
+    block cores invoke only while being traced.
+
+    A cached compilation never calls it, so an empty list after a call means
+    no retrace. This observes compilations directly instead of through
+    ``_cache_size()``, whose counts depend on what earlier tests compiled and
+    on evictions from JAX's global jit cache in a long run.
+    """
+    traces: list = []
+    original = getattr(point_process_kalman, helper_name)
+
+    def counting(*args, **kwargs):
+        traces.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(point_process_kalman, helper_name, counting)
+    return traces
+
+
+class TestBlockDiagonalParametersOk:
+    """Tests for ``_block_diagonal_parameters_ok``, the live dispatch check.
+
+    ``PlaceFieldModel`` runs it at fit entry and after every EM M-step to
+    decide whether the block-diagonal filter applies. A false positive would
+    dispatch a problem the block filter cannot represent and silently produce
+    wrong results, so every way the parameter contract can break must be
+    rejected.
+    """
+
+    N_NEURONS, NB = 3, 4
 
     def _make_block_problem(self, n_neurons: int, block_size: int, T: int = 20):
         """Construct a well-formed block-diagonal filter problem."""
@@ -3123,153 +3100,112 @@ class TestDetectBlockDiagonalProblem:
 
         return init_mean, init_cov, A, Q, Z, Z_base
 
-    def test_detects_genuine_block_diagonal_3_neurons(self) -> None:
-        m, P, A, Q, Z, Z_base_ref = self._make_block_problem(n_neurons=3, block_size=4)
-        result = _detect_block_diagonal_problem(m, P, A, Q, Z)
-        assert isinstance(result, BlockDiagonalStructure)
+    def _ok(self, P, A, Q, **kwargs) -> bool:
+        return bool(
+            _block_diagonal_parameters_ok(
+                P, A, Q, n_neurons=self.N_NEURONS, block_size=self.NB, **kwargs
+            )
+        )
+
+    @pytest.fixture
+    def problem(self):
+        return self._make_block_problem(n_neurons=self.N_NEURONS, block_size=self.NB)
+
+    def test_accepts_genuine_block_diagonal_and_extracts_factors(self, problem) -> None:
+        m, P, A, Q, Z, Z_base_ref = problem
+        assert self._ok(P, A, Q)
+        result = _block_structure(m, P, A, Q, Z)
         assert result.n_neurons == 3
         assert result.block_size == 4
-        # A_block and Q_block extracted from the (0, 0) slice
-        np.testing.assert_allclose(np.asarray(result.A_block), np.asarray(jnp.eye(4)))
-        # Z_base should match the first neuron's slice
+        np.testing.assert_allclose(
+            np.asarray(result.A_blocks), np.broadcast_to(np.eye(4), (3, 4, 4))
+        )
+        np.testing.assert_allclose(
+            np.asarray(result.Q_blocks), np.broadcast_to(1e-4 * np.eye(4), (3, 4, 4))
+        )
+        # Z_base is neuron 0's own slice of the expanded design.
         np.testing.assert_allclose(np.asarray(result.Z_base), np.asarray(Z_base_ref))
-        # init_means_per_neuron shape (n_neurons, block_size)
-        assert result.init_means_per_neuron.shape == (3, 4)
-        # init_covs_per_neuron shape (n_neurons, block_size, block_size)
-        assert result.init_covs_per_neuron.shape == (3, 4, 4)
-        # Verify the per-neuron init_covs are the diagonal blocks
         np.testing.assert_allclose(
-            np.asarray(result.init_covs_per_neuron[0]),
-            np.asarray(jnp.eye(4) * 0.1),
+            np.asarray(result.init_means_per_neuron), np.asarray(m).reshape(3, 4)
         )
-        np.testing.assert_allclose(
-            np.asarray(result.init_covs_per_neuron[2]),
-            np.asarray(jnp.eye(4) * 0.2),
-        )
-
-    def test_rejects_dense_design_matrix(self) -> None:
-        """Dense multi-neuron design matrix (non-block-diagonal) → None."""
-        m, P, A, Q, _Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
-        # Replace design matrix with a dense random version
-        T = 20
-        n_state = 12
-        Z_dense = jnp.zeros((T, 3, n_state))
-        for j in range(3):
-            # Every neuron depends on every state entry — not block-diagonal
-            Z_dense = Z_dense.at[:, j, :].set(
-                jax.random.normal(jax.random.PRNGKey(j + 100), (T, n_state))
+        # init_cov keeps its per-neuron-distinct diagonal blocks.
+        for j, scale in enumerate((0.1, 0.15, 0.2)):
+            np.testing.assert_allclose(
+                np.asarray(result.init_covs_per_neuron[j]), scale * np.eye(4)
             )
-        assert _detect_block_diagonal_problem(m, P, A, Q, Z_dense) is None
 
-    def test_rejects_dense_init_cov(self) -> None:
-        m, _P_block, A, Q, Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
-        # Replace init_cov with a dense random PD matrix
-        rng_key = jax.random.PRNGKey(42)
-        L = jax.random.normal(rng_key, (12, 12))
+    def test_rejects_dense_init_cov(self, problem) -> None:
+        _m, _P, A, Q, _Z, _ = problem
+        L = jax.random.normal(jax.random.PRNGKey(42), (12, 12))
         P_dense = L @ L.T + jnp.eye(12) * 0.1
-        assert _detect_block_diagonal_problem(m, P_dense, A, Q, Z) is None
+        assert not self._ok(P_dense, A, Q)
 
-    def test_rejects_dense_transition_matrix(self) -> None:
-        m, P, _A_block, Q, Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
+    def test_rejects_dense_transition_matrix(self, problem) -> None:
+        _m, P, _A, Q, _Z, _ = problem
         A_dense = jnp.eye(12) + 0.01 * jax.random.normal(
             jax.random.PRNGKey(7), (12, 12)
         )
-        assert _detect_block_diagonal_problem(m, P, A_dense, Q, Z) is None
+        assert not self._ok(P, A_dense, Q)
 
-    def test_single_neuron_returns_none(self) -> None:
-        """Single-neuron (2D) design matrix → dense filter is optimal."""
-        m = jnp.zeros(4)
-        P = jnp.eye(4) * 0.1
-        A = jnp.eye(4)
-        Q = jnp.eye(4) * 1e-4
-        Z = jax.random.normal(jax.random.PRNGKey(0), (20, 4))
-        assert _detect_block_diagonal_problem(m, P, A, Q, Z) is None
+    def test_rejects_dense_process_cov(self, problem) -> None:
+        _m, P, A, Q, _Z, _ = problem
+        assert not self._ok(P, A, Q.at[0, 5].set(1e-5).at[5, 0].set(1e-5))
 
-    def test_wrong_shape_returns_none(self) -> None:
-        """n_state not divisible by n_neurons → None."""
-        T, n_neurons = 20, 3
-        Z_bad = jax.random.normal(
-            jax.random.PRNGKey(0), (T, n_neurons, 10)
-        )  # 10 not divisible by 3
-        assert (
-            _detect_block_diagonal_problem(
-                jnp.zeros(10), jnp.eye(10), jnp.eye(10), jnp.eye(10) * 1e-4, Z_bad
-            )
-            is None
-        )
-
-    def test_heterogeneous_per_neuron_basis_returns_none(self) -> None:
-        """If per-neuron Z slices differ across neurons, detection fails."""
-        m, P, A, Q, Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
-        # Perturb neuron 1's slice so it differs from neuron 0's
-        Z_het = Z.at[:, 1, 4:8].set(Z[:, 1, 4:8] + 0.5)
-        assert _detect_block_diagonal_problem(m, P, A, Q, Z_het) is None
-
-    def test_heterogeneous_a_blocks_returns_none(self) -> None:
-        """Per-neuron A-block mismatch must reject detection.
-
-        CRITICAL regression test: if A has block-diagonal structure
-        but the diagonal blocks differ across neurons (e.g., post-EM
-        with update_transition_matrix=True producing slightly different
-        per-neuron dynamics due to floating-point non-associativity),
-        the block-diagonal filter would extract only block-0's A and
-        apply it to every neuron, silently producing wrong results.
-
-        The detector must catch this and fall back to the dense filter.
-        """
-        m, P, A, Q, Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
-        # Perturb neuron 1's A block so it differs from neuron 0's
+    def test_heterogeneous_blocks_accepted_and_kept_per_neuron(self, problem) -> None:
+        """Per-neuron A and Q blocks may differ: the check accepts them and
+        the structure keeps each neuron's own blocks (the block filter runs
+        neuron j with ``A_blocks[j]`` / ``Q_blocks[j]``)."""
+        m, P, A, Q, Z, _ = problem
         A_het = A.at[4:8, 4:8].set(A[4:8, 4:8] * 1.05)
-        assert _detect_block_diagonal_problem(m, P, A_het, Q, Z) is None
-
-    def test_heterogeneous_q_blocks_returns_none(self) -> None:
-        """Per-neuron Q-block mismatch must reject detection."""
-        m, P, A, Q, Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
-        # Perturb neuron 2's Q block
         Q_het = Q.at[8:12, 8:12].set(Q[8:12, 8:12] * 2.0)
-        assert _detect_block_diagonal_problem(m, P, A, Q_het, Z) is None
+        assert self._ok(P, A_het, Q_het)
+        result = _block_structure(m, P, A_het, Q_het, Z)
+        for j in range(3):
+            s = slice(4 * j, 4 * (j + 1))
+            np.testing.assert_array_equal(
+                np.asarray(result.A_blocks[j]), np.asarray(A_het[s, s])
+            )
+            np.testing.assert_array_equal(
+                np.asarray(result.Q_blocks[j]), np.asarray(Q_het[s, s])
+            )
 
-    def test_place_field_model_problem_is_detected(self) -> None:
-        """End-to-end: construct a PlaceFieldModel problem and verify the
-        detector recognizes its structure. This is the primary target:
-        PlaceFieldModel's multi-neuron path builds exactly this shape,
-        so detection must succeed on its outputs.
-        """
-        import numpy as np_
+    def test_tolerance_allows_small_off_block_noise(self, problem) -> None:
+        """Off-block entries within ``atol`` count as zero; a tighter
+        ``atol`` rejects the same matrix."""
+        _m, P, A, Q, _Z, _ = problem
+        A_noise = A.at[0, 5].set(1e-12).at[5, 0].set(1e-12)
+        assert self._ok(P, A_noise, Q)
+        assert not self._ok(P, A_noise, Q, atol=1e-14)
 
+    def test_tolerance_scales_with_matrix_magnitude(self, problem) -> None:
+        """The tolerance is ``atol * max(1, max|mat|)`` per matrix: the same
+        absolute off-block entry is noise for a large-magnitude init_cov but
+        structure for an O(1) one."""
+        _m, P, A, Q, _Z, _ = problem
+        P_big = P * 1e6 + (jnp.zeros_like(P).at[0, 5].set(1e-6).at[5, 0].set(1e-6))
+        P_small = P + (jnp.zeros_like(P).at[0, 5].set(1e-6).at[5, 0].set(1e-6))
+        assert self._ok(P_big, A, Q)
+        assert not self._ok(P_small, A, Q)
+
+    @pytest.mark.slow
+    def test_place_field_model_problem_is_block_dispatched(self) -> None:
+        """End-to-end: a freshly initialised multi-neuron PlaceFieldModel
+        satisfies the parameter contract, so its dispatch check returns the
+        block ints (the primary target of the block path)."""
         from state_space_practice.place_field_model import PlaceFieldModel
 
-        rng = np_.random.default_rng(0)
+        rng = np.random.default_rng(0)
         position = rng.uniform(0, 100, (500, 2))
-        spikes = rng.poisson(1.0, (500, 3)).astype(np_.int64)
+        spikes = jnp.asarray(rng.poisson(1.0, (500, 3)))
 
         model = PlaceFieldModel(dt=0.02, n_interior_knots=3, init_process_noise=1e-5)
-        # Run fit_sgd with num_steps=0 to populate init state and
-        # design_matrix without any optimizer updates.
-        import optax
-
-        model.fit_sgd(
-            position,
-            spikes,
-            optimizer=optax.sgd(1e-4),
-            num_steps=0,
-            warm_start=True,
-        )
-
-        # Rebuild the design matrix the same way fit_sgd does
+        model.n_neurons = 3
         Z_base = model._build_spline_basis_matrix(position)
-        design_matrix = model._expand_to_block_diagonal(Z_base)
+        model.n_basis = model.n_neurons * model.n_basis_per_neuron
+        model._warm_start_parameters(Z_base, spikes, None)
 
-        result = _detect_block_diagonal_problem(
-            model.init_mean,
-            model.init_cov,
-            model.transition_matrix,
-            model.process_cov,
-            design_matrix,
-        )
-        assert isinstance(result, BlockDiagonalStructure)
-        assert result.n_neurons == 3
-        assert result.block_size == model.n_basis_per_neuron
+        assert model._detect_block_structure() == (3, model.n_basis_per_neuron)
+        assert model._detect_block_structure(force_dense=True) == (None, None)
 
 
 class TestBlockDiagonalFilterEquivalence:
@@ -3352,8 +3288,14 @@ class TestBlockDiagonalFilterEquivalence:
         spikes,
         dt,
         include_laplace_normalization=True,
+        max_newton_iter=1,
     ):
-        """Run the dense filter and the block filter on the same problem."""
+        """Run the dense filter and the block filter on the same problem.
+
+        Uses a single Fisher step by default: the two paths agree to round-off
+        only when no line search backtracks (the dense path backtracks
+        globally, the block path per neuron), which one step guarantees.
+        """
         dense_mean, dense_cov, dense_mll = stochastic_point_process_filter(
             init_mean,
             init_cov,
@@ -3364,16 +3306,17 @@ class TestBlockDiagonalFilterEquivalence:
             Q,
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
+            max_newton_iter=max_newton_iter,
             validate_inputs=False,  # we know the problem is PSD
         )
-        structure = _detect_block_diagonal_problem(init_mean, init_cov, A, Q, Z)
-        assert structure is not None, "test problem must be detected as block-diagonal"
+        structure = _block_structure(init_mean, init_cov, A, Q, Z)
         block_mean, block_cov, block_mll = (
             _stochastic_point_process_filter_block_diagonal(
                 structure,
                 spikes,
                 dt,
                 include_laplace_normalization=include_laplace_normalization,
+                max_newton_iter=max_newton_iter,
             )
         )
         return (dense_mean, dense_cov, dense_mll), (block_mean, block_cov, block_mll)
@@ -3407,6 +3350,43 @@ class TestBlockDiagonalFilterEquivalence:
             atol=1e-9,
             rtol=1e-10,
         )
+
+    def test_matches_dense_at_default_newton_iterations(self, monkeypatch) -> None:
+        """At the default ``max_newton_iter=3`` the paths agree to round-off on
+        a well-conditioned problem where no line search backtracks."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=60, seed=1)
+        dense, block = self._run_both_paths(*problem, max_newton_iter=3)
+        for actual, expected in zip(block, dense):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-10, rtol=1e-10
+            )
+
+        # Guard: the extra iterations move the estimate, so the comparison
+        # exercises the iterated line search and not just one Fisher step.
+        dense_one_step, _ = self._run_both_paths(*problem, max_newton_iter=1)
+        assert not np.allclose(
+            np.asarray(dense[0]), np.asarray(dense_one_step[0]), atol=1e-8
+        )
+
+        # Guard: no step was shortened. With one trial step size per
+        # iteration (no backtracking possible) both paths reproduce their
+        # default-budget output. The budget is read at trace time, so the jit
+        # caches are cleared on both sides of the patch.
+        monkeypatch.setattr(point_process_kalman, "_LINE_SEARCH_MAX_BACKTRACKS", 1)
+        jax.clear_caches()
+        try:
+            dense_full_step, block_full_step = self._run_both_paths(
+                *problem, max_newton_iter=3
+            )
+        finally:
+            monkeypatch.undo()
+            jax.clear_caches()
+        for actual, expected in zip(
+            (*dense_full_step, *block_full_step), (*dense, *block)
+        ):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-12, rtol=1e-12
+            )
 
     def test_public_filter_uses_dense_for_custom_intensity(self) -> None:
         """Manual block args must not bypass a custom log-intensity callable."""
@@ -3482,6 +3462,7 @@ class TestBlockDiagonalFilterEquivalence:
             float(block[2]), float(dense[2]), atol=1e-9, rtol=1e-10
         )
 
+    @pytest.mark.slow  # jax.grad through the dense and the block filter (~5 s)
     def test_gradient_matches_dense_for_fit_sgd(self) -> None:
         """jax.grad through both filters must agree.
 
@@ -3492,8 +3473,8 @@ class TestBlockDiagonalFilterEquivalence:
         silently change optimization behavior.
 
         We differentiate the marginal log-likelihood with respect to a
-        scalar multiplier on Q_block. Detection happens OUTSIDE jax.grad
-        (the detection helper uses host-side ``float()`` and is not
+        scalar multiplier on the Q blocks. The structure check happens OUTSIDE
+        jax.grad (it reads its verdict back on the host and is not
         trace-compatible), and the block filter consumes a pre-built
         ``BlockDiagonalStructure`` with the scaled Q block substituted
         in. The dense path parallel-rebuilds the full Q matrix inside
@@ -3503,13 +3484,11 @@ class TestBlockDiagonalFilterEquivalence:
             n_neurons=3, block_size=4, T=30, seed=7
         )
 
-        # Pre-build the structure OUTSIDE jax.grad (detection uses
-        # host-side float() and is not trace-compatible by design; see
-        # the dispatch note in _detect_block_diagonal_problem). The
-        # block filter then consumes a pre-built structure as a
-        # non-traced input.
-        ref_structure = _detect_block_diagonal_problem(init_mean, init_cov, A, Q, Z)
-        assert ref_structure is not None
+        # Pre-build the structure OUTSIDE jax.grad (the structure check
+        # reads its verdict back on the host and is not trace-compatible
+        # by design). The block filter then consumes a pre-built structure
+        # as a non-traced input.
+        ref_structure = _block_structure(init_mean, init_cov, A, Q, Z)
 
         def dense_loss(q_scale):
             # Rebuild the full (n_state, n_state) Q matrix from q_scale.
@@ -3528,11 +3507,12 @@ class TestBlockDiagonalFilterEquivalence:
             return -mll
 
         def block_loss(q_scale):
-            # Substitute the scaled Q_block into the pre-detected
-            # structure. All other fields (A_block, init_*, Z_base,
+            # Substitute the scaled Q blocks into the pre-detected
+            # structure. All other fields (A_blocks, init_*, Z_base,
             # n_neurons, block_size) are unchanged.
-            Q_block_scaled = ref_structure.Q_block * q_scale
-            structure = ref_structure._replace(Q_block=Q_block_scaled)
+            structure = ref_structure._replace(
+                Q_blocks=ref_structure.Q_blocks * q_scale
+            )
             _, _, mll = _stochastic_point_process_filter_block_diagonal(
                 structure,
                 spikes,
@@ -3548,6 +3528,83 @@ class TestBlockDiagonalFilterEquivalence:
             float(grad_dense),
             atol=1e-8,
             rtol=1e-9,
+        )
+
+    def test_forward_core_compiles_once_across_repeated_calls(
+        self, monkeypatch
+    ) -> None:
+        """The block filter's jitted forward core keeps the option flags
+        static, so calls with identical shapes (every SGD step / EM
+        iteration) reuse one compilation even when the parameter values,
+        ``dt`` and ``max_log_count`` change.
+        """
+        traces = _count_traces(monkeypatch, "_point_process_laplace_update")
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=2, block_size=5, T=27, seed=4
+        )
+        structure = _block_structure(init_mean, init_cov, A, Q, Z)
+
+        def run(q_scale: float, dt_value: float, max_log_count: float):
+            return _stochastic_point_process_filter_block_diagonal(
+                structure._replace(Q_blocks=structure.Q_blocks * q_scale),
+                spikes,
+                dt_value,
+                max_log_count=max_log_count,
+                return_block_covariances=True,
+            )
+
+        _block_diagonal_forward_core.clear_cache()
+        first = run(1.0, dt, 20.0)
+        # guard: the first call after clearing the cache really compiled
+        assert traces
+        traces.clear()
+        second = run(2.0, dt, 20.0)
+        run(0.5, 0.03, 15.0)
+        assert traces == []
+        # guard: the reused compilation really saw the new parameter values
+        assert not np.allclose(np.asarray(first[1]), np.asarray(second[1]))
+        # guard: a different static option does retrace
+        _stochastic_point_process_filter_block_diagonal(
+            structure, spikes, dt, include_laplace_normalization=False
+        )
+        assert traces
+
+    def test_per_neuron_process_noise_gradient_matches_dense(self) -> None:
+        """The gradient of the marginal LL w.r.t. each neuron's own process
+        noise scale, through the public filter's block dispatch (Z_base +
+        block ints, traced Q), equals the dense gradient -- what fit_sgd
+        relies on to train per-neuron Q on the block path."""
+        n_neurons, nb = 3, 4
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=n_neurons, block_size=nb, T=30, seed=7
+        )
+        Z_base = Z[:, 0, :nb]
+
+        def loss(q_scales, design, **block_kwargs):
+            Q_scaled = Q * jnp.repeat(q_scales, nb)[:, None]
+            _, _, mll = stochastic_point_process_filter(
+                init_mean,
+                init_cov,
+                design,
+                spikes,
+                dt,
+                A,
+                Q_scaled,
+                log_conditional_intensity,
+                validate_inputs=False,
+                **block_kwargs,
+            )
+            return -mll
+
+        q_scales = jnp.array([1.0, 3.0, 0.5])
+        grad_dense = jax.grad(loss)(q_scales, Z)
+        grad_block = jax.grad(loss)(
+            q_scales, Z_base, block_n_neurons=n_neurons, block_size=nb
+        )
+        # guard: the neurons' gradients differ, so a shared block would fail
+        assert float(jnp.max(jnp.abs(grad_dense - grad_dense[0]))) > 1e-6
+        np.testing.assert_allclose(
+            np.asarray(grad_block), np.asarray(grad_dense), rtol=1e-8, atol=1e-10
         )
 
     def test_filtered_cov_is_block_diagonal(self) -> None:
@@ -3640,7 +3697,9 @@ class TestBlockDiagonalSmootherEquivalence:
         dt,
         include_laplace_normalization=True,
         return_filtered=False,
+        max_newton_iter=1,
     ):
+        # Single Fisher step by default: see TestBlockDiagonalFilterEquivalence.
         dense_result = stochastic_point_process_smoother(
             init_mean,
             init_cov,
@@ -3652,18 +3711,29 @@ class TestBlockDiagonalSmootherEquivalence:
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
             return_filtered=return_filtered,
+            max_newton_iter=max_newton_iter,
             validate_inputs=False,
         )
-        structure = _detect_block_diagonal_problem(init_mean, init_cov, A, Q, Z)
-        assert structure is not None
+        structure = _block_structure(init_mean, init_cov, A, Q, Z)
         block_result = _stochastic_point_process_smoother_block_diagonal(
             structure,
             spikes,
             dt,
             include_laplace_normalization=include_laplace_normalization,
             return_filtered=return_filtered,
+            max_newton_iter=max_newton_iter,
         )
         return dense_result, block_result
+
+    def test_matches_dense_at_default_newton_iterations(self) -> None:
+        """Smoother outputs agree at ``max_newton_iter=3`` on the problem that
+        ``TestBlockDiagonalFilterEquivalence`` shows never backtracks."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=60, seed=1)
+        dense, block = self._run_both_paths(*problem, max_newton_iter=3)
+        for actual, expected in zip(block, dense):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-10, rtol=1e-10
+            )
 
     def test_smoother_mean_matches_dense_2_neurons(self) -> None:
         problem = self._make_problem(n_neurons=2, block_size=4, T=30)
@@ -3824,6 +3894,180 @@ class TestBlockDiagonalSmootherEquivalence:
                         f"cross_cov off-block ({j},{k}) at t={t} is nonzero"
                     )
 
+    def test_heterogeneous_per_neuron_dynamics_match_dense(self) -> None:
+        """Each neuron may have its own A and Q block: the block smoother
+        (Z_base + block ints through the public API) must use neuron j's
+        blocks for neuron j and match the dense smoother."""
+        init_mean, init_cov, _, _, Z, spikes, dt = self._make_problem(
+            n_neurons=3, block_size=4, T=30
+        )
+        n_neurons, nb = 3, 4
+        key = jax.random.PRNGKey(11)
+        A = jnp.zeros((12, 12))
+        Q = jnp.zeros((12, 12))
+        for j in range(n_neurons):
+            s = slice(j * nb, (j + 1) * nb)
+            noise = jax.random.normal(jax.random.fold_in(key, j), (nb, nb))
+            A = A.at[s, s].set((0.9 + 0.04 * j) * jnp.eye(nb) + 0.02 * noise)
+            Q = Q.at[s, s].set(jnp.eye(nb) * 1e-3 * (1 + 3 * j))
+        dense = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            force_dense=True,
+        )
+        block = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z[:, 0, :nb],
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            block_n_neurons=n_neurons,
+            block_size=nb,
+        )
+        for name, b, d in zip(("mean", "cov", "cross_cov"), block[:3], dense[:3]):
+            np.testing.assert_allclose(
+                np.asarray(b), np.asarray(d), atol=1e-10, err_msg=name
+            )
+        np.testing.assert_allclose(float(block[3]), float(dense[3]), atol=1e-9)
+        assert bool(
+            _block_diagonal_parameters_ok(
+                init_cov, A, Q, n_neurons=n_neurons, block_size=nb
+            )
+        )
+
+    def test_shared_basis_input_and_block_covariances_match_dense(self) -> None:
+        """Z_base + block ints through the public API, covariances as blocks.
+
+        PlaceFieldModel hands the smoother the shared ``(n_time, block_size)``
+        basis instead of the block-expanded design and asks for
+        ``BlockDiagonalCovariance`` outputs. Every block-local view the
+        consumers use (time sum, integer time index, marginal variances, a
+        neuron's blocks, dense materialisation) must equal the dense path.
+        """
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=3, block_size=4, T=30
+        )
+        n_neurons, nb = 3, 4
+        Z_base = Z[:, 0, :nb]
+        dense = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            force_dense=True,
+            return_filtered=True,
+        )
+        block = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z_base,
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            block_n_neurons=n_neurons,
+            block_size=nb,
+            return_filtered=True,
+            return_block_covariances=True,
+        )
+        for block_mean, dense_mean in ((block[0], dense[0]), (block[4], dense[4])):
+            np.testing.assert_allclose(
+                np.asarray(block_mean), np.asarray(dense_mean), atol=1e-10
+            )
+        np.testing.assert_allclose(float(block[3]), float(dense[3]), atol=1e-9)
+
+        pairs = ((block[1], dense[1]), (block[2], dense[2]), (block[5], dense[5]))
+        for cov, dense_cov in pairs:
+            assert isinstance(cov, BlockDiagonalCovariance)
+            assert cov.shape == dense_cov.shape and len(cov) == dense_cov.shape[0]
+            assert cov.blocks.shape == (n_neurons, dense_cov.shape[0], nb, nb)
+            dense_np = np.asarray(dense_cov)
+            np.testing.assert_allclose(np.asarray(cov.to_dense()), dense_np, atol=1e-10)
+            np.testing.assert_allclose(np.asarray(cov), dense_np, atol=1e-10)
+            np.testing.assert_allclose(
+                np.asarray(cov.sum(axis=0)), dense_np.sum(axis=0), atol=1e-10
+            )
+            np.testing.assert_allclose(np.asarray(cov[0]), dense_np[0], atol=1e-10)
+            np.testing.assert_allclose(np.asarray(cov[-1]), dense_np[-1], atol=1e-10)
+            np.testing.assert_allclose(np.asarray(cov[3:7]), dense_np[3:7], atol=1e-10)
+            np.testing.assert_allclose(
+                np.asarray(cov.diagonal()),
+                np.diagonal(dense_np, axis1=1, axis2=2),
+                atol=1e-10,
+            )
+            for j in range(n_neurons):
+                s = slice(j * nb, (j + 1) * nb)
+                np.testing.assert_allclose(
+                    np.asarray(cov.neuron_blocks(j)), dense_np[:, s, s], atol=1e-10
+                )
+                np.testing.assert_allclose(
+                    np.asarray(cov.neuron_blocks(j, slice(5, 9))),
+                    dense_np[5:9, s, s],
+                    atol=1e-10,
+                )
+        # Confidence intervals read the marginal variances from the blocks.
+        np.testing.assert_allclose(
+            np.asarray(get_confidence_interval(block[0], block[1])),
+            np.asarray(get_confidence_interval(dense[0], dense[1])),
+            atol=1e-10,
+        )
+        with pytest.raises(ValueError, match="axis=0"):
+            block[1].sum(axis=1)
+
+    def test_block_cores_compile_once_across_repeated_calls(self, monkeypatch) -> None:
+        """The block cores are jitted with the option flags static, so calls
+        with identical shapes (every EM iteration) reuse one compilation even
+        when the parameter values, ``dt`` and ``max_log_count`` change.
+        """
+        traces = _count_traces(monkeypatch, "_kalman_smoother_update")
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=2, block_size=5, T=23, seed=3
+        )
+        structure = _block_structure(init_mean, init_cov, A, Q, Z)
+
+        def run(q_scale: float, dt_value: float, max_log_count: float):
+            return _stochastic_point_process_smoother_block_diagonal(
+                structure._replace(Q_blocks=structure.Q_blocks * q_scale),
+                spikes,
+                dt_value,
+                max_log_count=max_log_count,
+                return_block_covariances=True,
+            )
+
+        _block_diagonal_smoother_core.clear_cache()
+        first = run(1.0, dt, 20.0)
+        # guard: the first call after clearing the cache really compiled
+        assert traces
+        traces.clear()
+        second = run(2.0, dt, 20.0)
+        run(0.5, 0.03, 15.0)
+        assert traces == []
+        # guard: the reused compilation really saw the new parameter values
+        assert not np.allclose(np.asarray(first[1]), np.asarray(second[1]))
+        # guard: a different static option does retrace
+        _stochastic_point_process_smoother_block_diagonal(
+            structure, spikes, dt, include_laplace_normalization=False
+        )
+        assert traces
+
     def test_shape_mismatch_guard(self) -> None:
         """Block dispatch with wrong n_neurons * block_size raises ValueError.
 
@@ -3936,6 +4180,454 @@ class TestBlockDiagonalSmootherEquivalence:
         np.testing.assert_allclose(float(block[3]), float(dense[3]), atol=1e-9)
 
 
+class TestBlockDiagonalCovarianceContainer:
+    """``BlockDiagonalCovariance`` follows ndarray semantics or raises.
+
+    The container stands in for a dense ``(n_time, n_state, n_state)``
+    array, so every operation it supports must agree with the dense array
+    and every operation that would silently diverge from it must raise.
+    """
+
+    N_NEURONS, N_TIME, NB = 3, 5, 2
+
+    @pytest.fixture
+    def cov_and_dense(self):
+        rng = np.random.default_rng(0)
+        blocks = rng.normal(size=(self.N_NEURONS, self.N_TIME, self.NB, self.NB))
+        # Independent dense reference: scipy's block_diag per time bin.
+        from scipy.linalg import block_diag
+
+        dense = np.stack([block_diag(*blocks[:, t]) for t in range(self.N_TIME)])
+        return BlockDiagonalCovariance(jnp.asarray(blocks)), dense
+
+    def test_sum_requires_axis(self, cov_and_dense) -> None:
+        """``dense.sum()`` is a scalar; the container only supports the
+        time sum, so an axis-less call must not quietly return a matrix."""
+        cov, dense = cov_and_dense
+        with pytest.raises(TypeError):
+            cov.sum()
+        np.testing.assert_allclose(
+            np.asarray(cov.sum(axis=0)), dense.sum(axis=0), atol=1e-12
+        )
+        with pytest.raises(ValueError, match="axis=0"):
+            cov.sum(axis=1)
+
+    @pytest.mark.parametrize("index", [N_TIME, N_TIME + 3, -N_TIME - 1])
+    def test_out_of_range_time_index_raises(self, cov_and_dense, index) -> None:
+        cov, dense = cov_and_dense
+        with pytest.raises(IndexError):
+            dense[index]  # guard: the dense array rejects this index
+        with pytest.raises(IndexError):
+            cov[index]
+        with pytest.raises(IndexError):
+            cov.at_time(index)
+
+    @pytest.mark.parametrize(
+        "index",
+        [0, -1, -N_TIME, N_TIME - 1, np.int64(2), np.int32(-2), jnp.array(1)],
+        ids=["0", "-1", "-n_time", "n_time-1", "np.int64", "np.int32", "jnp-0d"],
+    )
+    def test_integer_time_index_matches_dense(self, cov_and_dense, index) -> None:
+        cov, dense = cov_and_dense
+        expected = dense[int(index)]
+        np.testing.assert_allclose(np.asarray(cov[index]), expected, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(cov.at_time(index)), expected, atol=1e-12)
+
+    @pytest.mark.parametrize("index", [True, False, np.bool_(True)])
+    def test_bool_index_rejected(self, cov_and_dense, index) -> None:
+        """A bool is not a time index (it would otherwise be read as 0 / 1)."""
+        cov, _ = cov_and_dense
+        with pytest.raises(TypeError):
+            cov[index]
+        with pytest.raises(TypeError):
+            cov.at_time(index)
+
+    def test_blocks_are_read_only(self, cov_and_dense) -> None:
+        cov, dense = cov_and_dense
+        with pytest.raises(AttributeError):
+            cov.blocks = jnp.zeros_like(cov.blocks)
+        np.testing.assert_allclose(np.asarray(cov), dense, atol=1e-12)
+
+    def test_asarray_is_the_densify_path(self, cov_and_dense) -> None:
+        """``jnp.asarray`` / ``np.asarray`` materialise the dense array; other
+        ``jax.numpy`` functions and ``jax.jit`` reject the container."""
+        cov, dense = cov_and_dense
+        np.testing.assert_allclose(np.asarray(jnp.asarray(cov)), dense, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(cov), dense, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(cov.to_dense()), dense, atol=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(cov.diagonal()),
+            np.diagonal(dense, axis1=1, axis2=2),
+            atol=1e-12,
+        )
+        # jax >= 0.7 rejects the container outright; jax 0.6 (the Python 3.10
+        # resolution) instead densifies it through the deprecated
+        # ``__jax_array__`` abstractification path and warns, which the test
+        # configuration turns into an error. Both count as "rejected".
+        rejected = (TypeError, ValueError, DeprecationWarning)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            with pytest.raises(rejected):
+                jnp.sum(cov)
+            with pytest.raises(rejected):
+                jax.jit(lambda x: x)(cov)
+
+
+class TestScanOutputMemory:
+    """The block forward pass and the smoothers' backward passes write their
+    outputs in place.
+
+    A backward scan whose stacked outputs are concatenated with the terminal
+    step, or that scans over sliced inputs, holds a second full-size copy of
+    a covariance stack at peak memory; so does a scan-stacked output under
+    ``vmap`` (transposed to the per-neuron layout afterwards). Only the
+    compiled programs are inspected, nothing is run.
+    """
+
+    n_time = 2000
+
+    @staticmethod
+    def _temp_bytes(fn, *arg_specs) -> int:
+        memory = jax.jit(fn).lower(*arg_specs).compile().memory_analysis()
+        if memory is None:
+            pytest.skip("backend reports no memory analysis")
+        return memory.temp_size_in_bytes
+
+    def test_dense_smoother_needs_no_full_size_temporaries(self) -> None:
+        T, d, n_obs = self.n_time, 4, 3
+        spec = jax.ShapeDtypeStruct
+
+        def smoother(init_mean, init_cov, design, spikes, A, Q):
+            # return_filtered: the filtered stacks are outputs, not temps.
+            return stochastic_point_process_smoother(
+                init_mean,
+                init_cov,
+                design,
+                spikes,
+                0.02,
+                A,
+                Q,
+                log_conditional_intensity,
+                validate_inputs=False,
+                return_filtered=True,
+            )
+
+        temp = self._temp_bytes(
+            smoother,
+            spec((d,), jnp.float64),
+            spec((d, d), jnp.float64),
+            spec((T, n_obs, d), jnp.float64),
+            spec((T, n_obs), jnp.float64),
+            spec((d, d), jnp.float64),
+            spec((d, d), jnp.float64),
+        )
+        # One copy of the smoothed covariances is T*d*d*8 = 256 kB.
+        assert temp < 0.1 * T * d * d * 8
+
+    def test_block_forward_needs_no_full_size_temporaries(self) -> None:
+        T, n_neurons, nb = self.n_time, 3, 4
+        spec = jax.ShapeDtypeStruct
+        temp = self._temp_bytes(
+            lambda *args: _block_diagonal_forward_core(
+                *args,
+                0.02,
+                include_laplace_normalization=True,
+                max_log_count=20.0,
+                max_newton_iter=3,
+            ),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((T, nb), jnp.float64),
+            spec((T, n_neurons), jnp.float64),
+        )
+        # The filtered moments are outputs, not temps. One copy of the
+        # per-neuron filtered covariances is n_neurons*T*nb*nb*8 = 768 kB.
+        assert temp < 0.1 * n_neurons * T * nb * nb * 8
+
+    def test_block_smoother_backward_adds_no_full_size_temporaries(self) -> None:
+        T, n_neurons, nb = self.n_time, 3, 4
+        spec = jax.ShapeDtypeStruct
+        arg_specs = (
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((T, nb), jnp.float64),
+            spec((T, n_neurons), jnp.float64),
+        )
+        options = {
+            "include_laplace_normalization": True,
+            "max_log_count": 20.0,
+            "max_newton_iter": 3,
+        }
+        forward_temp = self._temp_bytes(
+            lambda *args: _block_diagonal_forward_core(*args, 0.02, **options),
+            *arg_specs,
+        )
+        smoother_temp = self._temp_bytes(
+            lambda *args: _block_diagonal_smoother_core(*args, 0.02, **options),
+            *arg_specs,
+        )
+        # The smoother core runs the forward core, so its temporaries are
+        # the forward pass's plus the backward pass's. One copy of the
+        # per-neuron smoothed covariances is n_neurons*T*nb*nb*8 = 768 kB.
+        assert smoother_temp - forward_temp < 0.1 * n_neurons * T * nb * nb * 8
+
+
+class TestGradientMemory:
+    """Reverse mode through the filters keeps about one carry per time step.
+
+    ``fit_sgd`` differentiates the marginal log-likelihood through the
+    forward filters. Keeping every time step's Laplace-update residuals
+    (each Fisher iteration's Cholesky factors and solves) costs ~20
+    state-covariance-sized arrays per step -- gigabytes at a few thousand
+    bins. With each step rematerialized only the step's input carry (mean
+    and covariance) is kept. The per-step growth of the compiled gradient's
+    temporaries is measured between two sequence lengths, so fixed costs
+    cancel. Compile-only: nothing is executed.
+    """
+
+    n_times = (100, 300)
+
+    @staticmethod
+    def _per_step_bytes(make_loss, make_specs) -> float:
+        temps = []
+        for T in TestGradientMemory.n_times:
+            memory = (
+                jax.jit(jax.value_and_grad(make_loss()))
+                .lower(*make_specs(T))
+                .compile()
+                .memory_analysis()
+            )
+            if memory is None:
+                pytest.skip("backend reports no memory analysis")
+            temps.append(memory.temp_size_in_bytes)
+        n0, n1 = TestGradientMemory.n_times
+        return (temps[1] - temps[0]) / (n1 - n0)
+
+    def test_block_forward_core(self) -> None:
+        n_neurons, nb = 3, 8
+        spec = jax.ShapeDtypeStruct
+
+        def make_loss():
+            def loss(params, Z, spikes):
+                A, Q, m0, P0 = params
+                _, _, lls, _ = _block_diagonal_forward_core(
+                    A,
+                    Q,
+                    m0,
+                    P0,
+                    Z,
+                    spikes,
+                    0.02,
+                    include_laplace_normalization=True,
+                    max_log_count=20.0,
+                    max_newton_iter=3,
+                )
+                return jnp.sum(lls)
+
+            return loss
+
+        def make_specs(T):
+            return (
+                (
+                    spec((n_neurons, nb, nb), jnp.float64),
+                    spec((n_neurons, nb, nb), jnp.float64),
+                    spec((n_neurons, nb), jnp.float64),
+                    spec((n_neurons, nb, nb), jnp.float64),
+                ),
+                spec((T, nb), jnp.float64),
+                spec((T, n_neurons), jnp.float64),
+            )
+
+        per_step = self._per_step_bytes(make_loss, make_specs)
+        carry_bytes = n_neurons * (nb * nb + nb) * 8
+        # Guard: reverse mode must keep the carry, so the bound is not vacuous.
+        assert per_step >= 0.5 * carry_bytes
+        # Compiler layouts can add a small per-step overhead (5200 bytes on
+        # JAX 0.6.2/macOS vs 5184 for three carries). The 64-byte allowance is
+        # smaller than a single nb x nb covariance and keeps the budget well
+        # below the unrematerialized Fisher iterations' residuals.
+        assert per_step < 3 * carry_bytes + 64, (per_step, carry_bytes)
+
+    def test_dense_filter(self) -> None:
+        d, n_obs = 8, 3
+        spec = jax.ShapeDtypeStruct
+
+        def make_loss():
+            def loss(params, design, spikes):
+                A, Q, m0, P0 = params
+                _, _, marginal_ll = stochastic_point_process_filter(
+                    m0,
+                    P0,
+                    design,
+                    spikes,
+                    0.02,
+                    A,
+                    Q,
+                    log_conditional_intensity,
+                    validate_inputs=False,
+                    max_newton_iter=3,
+                )
+                return marginal_ll
+
+            return loss
+
+        def make_specs(T):
+            return (
+                (
+                    spec((d, d), jnp.float64),
+                    spec((d, d), jnp.float64),
+                    spec((d,), jnp.float64),
+                    spec((d, d), jnp.float64),
+                ),
+                spec((T, n_obs, d), jnp.float64),
+                spec((T, n_obs), jnp.float64),
+            )
+
+        per_step = self._per_step_bytes(make_loss, make_specs)
+        carry_bytes = (d * d + d) * 8
+        # Guard: reverse mode must keep the carry, so the bound is not vacuous.
+        assert per_step >= 0.5 * carry_bytes
+        # Keep the same small bookkeeping allowance across XLA versions.
+        assert per_step < 3 * carry_bytes + 64, (per_step, carry_bytes)
+
+
+# ============================================================================
+# Reverse-mode gradients of the marginal log-likelihood (fit_sgd's loss)
+# ============================================================================
+
+
+def _symmetric_like(a: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    v = rng.normal(size=a.shape)
+    return 0.5 * (v + np.swapaxes(v, -1, -2))
+
+
+def _assert_reverse_mode_gradient_is_correct(loss, params, directions) -> None:
+    """``<grad loss, v>`` from reverse mode matches forward mode and FD.
+
+    Forward mode differentiates the filter step by step as it runs, so it is
+    an independent reference for the reverse-mode gradient ``fit_sgd`` uses
+    (to round-off); central finite differences additionally check that the
+    derivative is that of the loss (to truncation error).
+    """
+    loss_jit = jax.jit(loss)
+    grad = jax.jit(jax.grad(loss))(params)
+    jvp = jax.jit(lambda p, v: jax.jvp(loss, (p,), (v,))[1])
+    h = 1e-6
+    for v in directions:
+        forward = float(jvp(params, v))
+        reverse = float(
+            sum(
+                jnp.vdot(g, d)
+                for g, d in zip(jax.tree.leaves(grad), jax.tree.leaves(v))
+            )
+        )
+        shifted = [
+            float(loss_jit(jax.tree.map(lambda p, d, s=s: p + s * h * d, params, v)))
+            for s in (1.0, -1.0)
+        ]
+        finite_difference = (shifted[0] - shifted[1]) / (2 * h)
+        # Guard: the direction has a real slope, so agreement is informative.
+        assert abs(forward) > 1e-1
+        np.testing.assert_allclose(reverse, forward, rtol=1e-9)
+        np.testing.assert_allclose(reverse, finite_difference, rtol=1e-5)
+
+
+@pytest.mark.slow
+class TestMarginalLogLikelihoodGradient:
+    """Reverse-mode gradients through the forward filters match forward mode.
+
+    ``fit_sgd`` minimizes the negative marginal log-likelihood with
+    ``jax.grad`` through the block-diagonal forward core (PlaceFieldModel)
+    and the dense filter (PointProcessModel), including the Fisher-scoring
+    iterations and their line search.
+    """
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_block_forward_core(self, max_newton_iter: int) -> None:
+        rng = np.random.default_rng(0)
+        T, n_neurons, nb, dt = 60, 3, 4, 0.1
+        Z = np.abs(rng.normal(size=(T, nb)))
+        init_means = rng.normal(0.5, 0.3, (n_neurons, nb))
+        spikes = rng.poisson(np.exp(Z @ init_means.T) * dt).astype(float)
+        params = (
+            np.tile(0.95 * np.eye(nb), (n_neurons, 1, 1)),
+            np.tile(1e-2 * np.eye(nb), (n_neurons, 1, 1)),
+            init_means,
+            np.tile(0.3 * np.eye(nb), (n_neurons, 1, 1)),
+        )
+
+        def loss(p):
+            A, Q, m0, P0 = p
+            _, _, lls, _ = _block_diagonal_forward_core(
+                A,
+                Q,
+                m0,
+                P0,
+                jnp.asarray(Z),
+                jnp.asarray(spikes),
+                dt,
+                include_laplace_normalization=True,
+                max_log_count=20.0,
+                max_newton_iter=max_newton_iter,
+            )
+            return jnp.sum(lls)
+
+        directions = [
+            (
+                rng.normal(size=params[0].shape),
+                _symmetric_like(params[1], rng),
+                rng.normal(size=params[2].shape),
+                _symmetric_like(params[3], rng),
+            )
+            for _ in range(3)
+        ]
+        _assert_reverse_mode_gradient_is_correct(
+            loss, jax.tree.map(jnp.asarray, params), directions
+        )
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_dense_filter(self, max_newton_iter: int) -> None:
+        rng = np.random.default_rng(1)
+        T, d, n_obs, dt = 60, 4, 3, 0.1
+        design = rng.normal(0, 0.5, (T, n_obs, d))
+        init_mean = rng.normal(0.5, 0.3, d)
+        spikes = rng.poisson(np.exp(design @ init_mean) * dt).astype(float)
+        params = (0.95 * np.eye(d), 1e-2 * np.eye(d), init_mean, 0.3 * np.eye(d))
+
+        def loss(p):
+            A, Q, m0, P0 = p
+            _, _, marginal_ll = stochastic_point_process_filter(
+                m0,
+                P0,
+                jnp.asarray(design),
+                jnp.asarray(spikes),
+                dt,
+                A,
+                Q,
+                log_conditional_intensity,
+                validate_inputs=False,
+                max_newton_iter=max_newton_iter,
+            )
+            return marginal_ll
+
+        directions = [
+            (
+                rng.normal(size=params[0].shape),
+                _symmetric_like(params[1], rng),
+                rng.normal(size=params[2].shape),
+                _symmetric_like(params[3], rng),
+            )
+            for _ in range(3)
+        ]
+        _assert_reverse_mode_gradient_is_correct(
+            loss, jax.tree.map(jnp.asarray, params), directions
+        )
+
+
 # ============================================================================
 # Integration: PointProcessModel parameter + trajectory recovery
 # ============================================================================
@@ -3947,7 +4639,8 @@ class TestPointProcessModelRecovery:
     transition matrix recovery and latent trajectory tracking."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         # 1D latent state, single neuron — simplest recovery scenario
         n_basis = 3
         n_time = 500
@@ -3997,16 +4690,6 @@ class TestPointProcessModelRecovery:
 
         _, _, _, _, lls = fitted
         assert_ll_improves(lls, label="PointProcessModel")
-
-    def test_transition_matrix_recovery(self, fitted):
-        model, _, true_A, _, _ = fitted
-        # Point-process EM with Laplace approximation: atol=0.25
-        # (consistent with existing test_random_walk_recovery)
-        np.testing.assert_allclose(
-            model.transition_matrix,
-            true_A,
-            atol=0.25,
-        )
 
     def test_process_cov_psd(self, fitted):
         model, _, _, _, _ = fitted
@@ -4333,12 +5016,36 @@ class TestEMRollbackStateConsistency:
 class TestFrozenTransitionProcessCov:
     """The process-cov M-step must use the transition matrix actually stored.
 
-    The Roweis-Ghahramani shortcut Q = (gamma2 - A beta^T) / (T - 1) equals
-    the full quadratic form only at the freshly solved (unconstrained) A.
-    When ``update_transition_matrix=False`` the stored A is frozen, so Q must
-    be recomputed via the full quadratic form against that frozen A -- not the
-    discarded unconstrained solution.
+    The Roweis-Ghahramani shortcut Q = (gamma2 - A beta^T) / n_transitions
+    equals the full quadratic form only at the freshly solved (unconstrained)
+    A. When ``update_transition_matrix=False`` the stored A is frozen, so Q
+    must be recomputed via the full quadratic form against that frozen A --
+    not the discarded unconstrained solution.
+
+    ``PointProcessModel._m_step`` runs exact EM: the statistics include the
+    ``x_0 -> x_1`` transition, with the smoothed ``x_0`` moments and
+    ``Cov(x_0, x_1 | y) = J_0 P_{1|T}`` (``J_0 = P_0 A' (A P_0 A' + Q)^{-1}``)
+    written out here from the model's prior, so the expected values use all
+    ``T`` transitions.
     """
+
+    @staticmethod
+    def _with_initial_state(model, smoother_mean, smoother_cov, smoother_cross_cov):
+        """Prepend the smoothed x_0 (and its cross-covariance with x_1)."""
+        A = np.asarray(model.transition_matrix)
+        P0 = np.asarray(model.init_cov)
+        m0 = np.asarray(model.init_mean)
+        P_pred = A @ P0 @ A.T + np.asarray(model.process_cov)
+        J0 = P0 @ A.T @ np.linalg.inv(P_pred)
+        m1, P1 = np.asarray(smoother_mean[0]), np.asarray(smoother_cov[0])
+        m0_s = m0 + J0 @ (m1 - A @ m0)
+        P0_s = P0 + J0 @ (P1 - P_pred) @ J0.T
+        C01 = J0 @ P1
+        return (
+            jnp.concatenate([jnp.asarray(m0_s)[None], smoother_mean]),
+            jnp.concatenate([jnp.asarray(P0_s)[None], smoother_cov]),
+            jnp.concatenate([jnp.asarray(C01)[None], smoother_cross_cov]),
+        )
 
     @staticmethod
     def _smoother_stats():
@@ -4369,12 +5076,20 @@ class TestFrozenTransitionProcessCov:
         from state_space_practice.kalman import psd_solve, stabilize_covariance
 
         smoother_mean, smoother_cov, smoother_cross_cov = self._smoother_stats()
-        n_time = smoother_mean.shape[0]
-        gamma1, gamma2, beta = self._gammas(
-            smoother_mean, smoother_cov, smoother_cross_cov
-        )
-
         A_frozen = jnp.array([[0.2, 0.0], [0.0, 0.3]])
+        model = PointProcessModel(
+            n_state_dims=2,
+            dt=0.02,
+            transition_matrix=A_frozen,
+            update_transition_matrix=False,
+            update_process_cov=True,
+            update_init_state=False,
+        )
+        aug = self._with_initial_state(
+            model, smoother_mean, smoother_cov, smoother_cross_cov
+        )
+        n_time = aug[0].shape[0]  # T + 1 states, T transitions
+        gamma1, gamma2, beta = self._gammas(*aug)
         A_new = psd_solve(gamma1, beta.T).T
 
         Q_full = stabilize_covariance(
@@ -4395,14 +5110,6 @@ class TestFrozenTransitionProcessCov:
         # "process_cov == Q_full" is not vacuously the same as "== Q_shortcut".
         assert not np.allclose(np.asarray(Q_full), np.asarray(Q_shortcut))
 
-        model = PointProcessModel(
-            n_state_dims=2,
-            dt=0.02,
-            transition_matrix=A_frozen,
-            update_transition_matrix=False,
-            update_process_cov=True,
-            update_init_state=False,
-        )
         model.smoother_mean = smoother_mean
         model.smoother_cov = smoother_cov
         model.smoother_cross_cov = smoother_cross_cov
@@ -4424,15 +5131,6 @@ class TestFrozenTransitionProcessCov:
         from state_space_practice.kalman import psd_solve, stabilize_covariance
 
         smoother_mean, smoother_cov, smoother_cross_cov = self._smoother_stats()
-        n_time = smoother_mean.shape[0]
-        gamma1, gamma2, beta = self._gammas(
-            smoother_mean, smoother_cov, smoother_cross_cov
-        )
-        A_new = psd_solve(gamma1, beta.T).T
-        Q_shortcut = stabilize_covariance(
-            (gamma2 - A_new @ beta.T) / (n_time - 1), min_eigenvalue=1e-8
-        )
-
         model = PointProcessModel(
             n_state_dims=2,
             dt=0.02,
@@ -4440,6 +5138,16 @@ class TestFrozenTransitionProcessCov:
             update_process_cov=True,
             update_init_state=False,
         )
+        aug = self._with_initial_state(
+            model, smoother_mean, smoother_cov, smoother_cross_cov
+        )
+        n_time = aug[0].shape[0]  # T + 1 states, T transitions
+        gamma1, gamma2, beta = self._gammas(*aug)
+        A_new = psd_solve(gamma1, beta.T).T
+        Q_shortcut = stabilize_covariance(
+            (gamma2 - A_new @ beta.T) / (n_time - 1), min_eigenvalue=1e-8
+        )
+
         model.smoother_mean = smoother_mean
         model.smoother_cov = smoother_cov
         model.smoother_cross_cov = smoother_cross_cov
@@ -4497,3 +5205,713 @@ class TestBlockDispatchValidatesInputs:
         mean, cov, ll = stochastic_point_process_filter(**kwargs, validate_inputs=True)
         assert mean.shape == (5, 2)
         assert bool(jnp.isfinite(ll))
+
+
+# ---------------------------------------------------------------------------
+# Initial-state M-step, traceability, carry dtype, Laplace normaliser, Armijo
+# ---------------------------------------------------------------------------
+
+
+class TestPointProcessInitialStateMStep:
+    """``dynamics_only_m_step`` / ``PointProcessModel`` update the x_0 prior
+    to the smoothed x_0 (the filter predicts before its first update)."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def constant_rate_problem(cls) -> dict:
+        rng = np.random.default_rng(0)
+        n_time = 40
+        return {
+            "design_matrix": jnp.ones((n_time, 1, 1)),
+            "spikes": jnp.asarray(rng.poisson(np.exp(3.0) * 0.1, size=(n_time, 1))),
+        }
+
+    def test_m_step_init_is_smoothed_x0(self, constant_rate_problem) -> None:
+        from state_space_practice.kalman import (
+            InitialStatePrior,
+            smooth_initial_state,
+        )
+
+        A, Q = jnp.eye(1) * 0.5, jnp.eye(1) * 0.1
+        m0, P0 = jnp.zeros(1), jnp.eye(1)
+        sm, sc, scc, _ = stochastic_point_process_smoother(
+            m0,
+            P0,
+            constant_rate_problem["design_matrix"],
+            constant_rate_problem["spikes"],
+            0.1,
+            A,
+            Q,
+            log_conditional_intensity,
+        )
+        prior = InitialStatePrior(m0, P0, A, Q)
+        _, _, init_mean, init_cov = dynamics_only_m_step(
+            sm, sc, scc, initial_state_prior=prior
+        )
+        expected_mean, expected_cov = smooth_initial_state(prior, sm[0], sc[0])
+        np.testing.assert_allclose(init_mean, expected_mean, rtol=1e-12)
+        np.testing.assert_allclose(init_cov, expected_cov, rtol=1e-12)
+        # guard: x_0's posterior is not x_1's (A = 0.5 halves the mean).
+        assert abs(float(init_mean[0]) - float(sm[0, 0])) > 0.5
+
+    def test_init_only_em_is_monotone(self, constant_rate_problem) -> None:
+        """With A = 0.5 (contractive) and only the initial state updated, the
+        Laplace log-likelihood increases every iteration (it decreased from
+        the second iteration when the smoothed x_1 was installed)."""
+        model = PointProcessModel(
+            1,
+            dt=0.1,
+            transition_matrix=jnp.eye(1) * 0.5,
+            process_cov=jnp.eye(1) * 0.1,
+            update_transition_matrix=False,
+            update_process_cov=False,
+        )
+        lls = []
+        for _ in range(6):
+            lls.append(
+                model._e_step(
+                    constant_rate_problem["design_matrix"],
+                    constant_rate_problem["spikes"],
+                )
+            )
+            model._m_step()
+        assert np.all(np.diff(lls) > 0.0), lls
+        assert lls[-1] > lls[0] + 5.0
+
+
+class TestPointProcessTraceability:
+    """Public filters trace under jit/grad with the default validate_inputs,
+    and mixed-precision inputs promote the scan carry."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def problem(cls) -> tuple:
+        rng = np.random.default_rng(3)
+        n_time, n_state = 30, 3
+        Z = jnp.asarray(rng.normal(size=(n_time, 2, n_state)) * 0.3)
+        y = jnp.asarray(rng.poisson(1.0, size=(n_time, 2)))
+        return Z, y, jnp.eye(n_state) * 0.95, jnp.eye(n_state) * 0.01
+
+    def test_filter_jits_with_default_validation(self, problem) -> None:
+        Z, y, A, Q = problem
+
+        def ll(m0):
+            return stochastic_point_process_filter(
+                m0, jnp.eye(3), Z, y, 0.1, A, Q, log_conditional_intensity
+            )[2]
+
+        np.testing.assert_allclose(jax.jit(ll)(jnp.zeros(3)), ll(jnp.zeros(3)))
+
+    def test_filter_grad_wrt_init_cov(self, problem) -> None:
+        Z, y, A, Q = problem
+
+        def ll(P0):
+            return stochastic_point_process_filter(
+                jnp.zeros(3), P0, Z, y, 0.1, A, Q, log_conditional_intensity
+            )[2]
+
+        grad = jax.grad(ll)(jnp.eye(3))
+        eps = 1e-6
+        E = jnp.zeros((3, 3)).at[1, 1].set(1.0)
+        fd = (ll(jnp.eye(3) + eps * E) - ll(jnp.eye(3) - eps * E)) / (2 * eps)
+        np.testing.assert_allclose(grad[1, 1], fd, rtol=1e-5)
+        assert abs(float(grad[1, 1])) > 1e-6
+
+    def test_smoother_jits_with_default_validation(self, problem) -> None:
+        Z, y, A, Q = problem
+
+        def sm(P0):
+            return stochastic_point_process_smoother(
+                jnp.zeros(3), P0, Z, y, 0.1, A, Q, log_conditional_intensity
+            )[0]
+
+        np.testing.assert_allclose(jax.jit(sm)(jnp.eye(3)), sm(jnp.eye(3)))
+
+    def test_eager_validation_still_raises(self, problem) -> None:
+        Z, y, A, Q = problem
+        with pytest.raises(ValueError, match="not positive definite"):
+            stochastic_point_process_filter(
+                jnp.zeros(3), -jnp.eye(3), Z, y, 0.1, A, Q, log_conditional_intensity
+            )
+
+    @pytest.mark.parametrize(
+        "entry", [stochastic_point_process_filter, stochastic_point_process_smoother]
+    )
+    def test_closed_over_constants_are_validated_under_jit(
+        self, problem, entry
+    ) -> None:
+        """Concrete arguments closed over by a jitted function keep the host
+        checks: a valid call traces, and a non-PD init_cov still raises."""
+        Z, y, A, Q = problem
+        m0 = jnp.zeros(3)  # created outside the trace, so it stays concrete
+
+        def run(P0):
+            return entry(m0, P0, Z, y, 0.1, A, Q, log_conditional_intensity)[0]
+
+        P_good, P_bad = jnp.eye(3), -jnp.eye(3)
+        np.testing.assert_allclose(jax.jit(lambda: run(P_good))(), run(P_good))
+        with pytest.raises(ValueError, match="not positive definite"):
+            jax.jit(lambda: run(P_bad))()
+
+    @pytest.mark.parametrize(
+        "entry", [stochastic_point_process_filter, stochastic_point_process_smoother]
+    )
+    def test_traced_non_positive_definite_init_cov_warns(self, problem, entry) -> None:
+        Z, y, A, Q = problem
+
+        def run(P0):
+            return entry(jnp.zeros(3), P0, Z, y, 0.1, A, Q, log_conditional_intensity)[
+                0
+            ]
+
+        with pytest.warns(StateSpaceWarning, match=r"minimum eigenvalue -0\.5"):
+            jax.block_until_ready(jax.jit(run)(-0.5 * jnp.eye(3)))
+            jax.effects_barrier()
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_float32_init_with_float64_params(self, problem, max_newton_iter) -> None:
+        Z, y, A, Q = problem
+        kwargs = dict(max_newton_iter=max_newton_iter)
+        mean, cov, ll = stochastic_point_process_filter(
+            jnp.zeros(3, jnp.float32),
+            jnp.eye(3, dtype=jnp.float32),
+            Z,
+            y,
+            0.1,
+            A,
+            Q,
+            log_conditional_intensity,
+            **kwargs,
+        )
+        assert mean.dtype == jnp.float64 and cov.dtype == jnp.float64
+        ref = stochastic_point_process_filter(
+            jnp.zeros(3),
+            jnp.eye(3),
+            Z,
+            y,
+            0.1,
+            A,
+            Q,
+            log_conditional_intensity,
+            **kwargs,
+        )
+        np.testing.assert_allclose(mean, ref[0], rtol=1e-12)
+        np.testing.assert_allclose(ll, ref[2], rtol=1e-12)
+
+
+class TestLaplaceNormaliser:
+    """The Laplace normaliser uses the same jittered factors as the update."""
+
+    def test_uninformative_observation_leaves_marginal_likelihood(self) -> None:
+        """If the rate does not depend on the state, the posterior is the
+        prior and log p(y_t | y_{1:t-1}) is the plain Poisson log-pmf -- also
+        for a tiny-scale prior (P = 1e-8 I), where log|P_post| computed from
+        a re-jittered posterior covariance used to add a spurious
+        ~log(1.1) per dimension."""
+        dt, rate = 0.1, 5.0
+        y = jnp.array([2.0])
+
+        def log_rate(x):
+            return jnp.array([jnp.log(rate)]) + 0.0 * x[0]
+
+        _, post_cov, ll = _point_process_laplace_update(
+            jnp.zeros(2),
+            jnp.eye(2) * 1e-8,
+            y,
+            dt,
+            log_rate,
+            grad_log_intensity_func=lambda x: jnp.zeros((1, 2)),
+        )
+        expected = jax.scipy.stats.poisson.logpmf(y, rate * dt).sum()
+        np.testing.assert_allclose(ll, expected, rtol=1e-9, atol=1e-9)
+        # guard: the prior really is at the scale of the absolute jitter.
+        assert float(post_cov[0, 0]) < 2e-8
+
+    def test_legacy_logdet_helper_unchanged(self) -> None:
+        """_logdet_psd (used by multinomial_choice) keeps its semantics."""
+        mat = jnp.diag(jnp.array([2.0, 3.0]))
+        np.testing.assert_allclose(
+            _logdet_psd(mat), np.log(2.0 + 1e-9) + np.log(3.0 + 1e-9), rtol=1e-12
+        )
+
+
+@jax.custom_jvp
+def _sign_flipped_log_rate(design, x):
+    """Linear log-rate ``design @ x`` whose derivative has the wrong sign, so
+    every Fisher step points uphill and each line search is exhausted."""
+    return design @ x
+
+
+@_sign_flipped_log_rate.defjvp
+def _sign_flipped_log_rate_jvp(primals, tangents):
+    design, x = primals
+    _, dx = tangents
+    return design @ x, -(design @ dx)
+
+
+def _line_search_failure_problem(n_time: int = 30):
+    """Positional filter arguments (before the log-intensity) for a small
+    two-neuron, two-state problem."""
+    rng = np.random.default_rng(0)
+    Z = jnp.asarray(rng.normal(size=(n_time, 2, 2)))
+    y = jnp.asarray(rng.poisson(3.0, size=(n_time, 2)))
+    return (jnp.zeros(2), jnp.eye(2), Z, y, 0.1, jnp.eye(2), jnp.eye(2) * 0.1)
+
+
+_PPK_LOGGER = "state_space_practice.point_process_kalman"
+
+
+def _line_search_warned(caplog) -> bool:
+    return any("line search" in r.getMessage() for r in caplog.records)
+
+
+class TestArmijoLineSearch:
+    """The Fisher-scoring line search enforces sufficient decrease and counts
+    exhausted backtracks."""
+
+    @staticmethod
+    def _quadratic(precision_scale: float, gradient_sign: float = 1.0):
+        """f(x) = 0.5 |x|^2 with a Fisher precision ``precision_scale * I``
+        (1.0 is the exact Hessian) and optionally a sign-flipped gradient."""
+
+        def fisher_step_at(x):
+            gradient = -gradient_sign * x
+            post_prec = precision_scale * jnp.eye(x.shape[0])
+            return gradient / precision_scale, post_prec, gradient
+
+        def neg_log_posterior(x):
+            return 0.5 * x @ x
+
+        return fisher_step_at, neg_log_posterior
+
+    def test_full_step_accepted_unchanged(self) -> None:
+        step, f = self._quadratic(1.0)
+        x0 = jnp.array([1.0, -2.0])
+        x, _, n_failed = _fisher_scoring_line_search(
+            x0, jnp.eye(2), step, f, max_newton_iter=1, line_search_beta=0.5
+        )
+        np.testing.assert_allclose(x, 0.0, atol=1e-15)
+        assert int(n_failed) == 0
+
+    def test_insufficient_decrease_is_backtracked(self) -> None:
+        """A curvature underestimate of 2x makes the full step land at -0.9999
+        x0: a strict decrease of only ~1e-4 of the predicted one. Armijo
+        rejects it and the halved step lands near the minimum."""
+        step, f = self._quadratic(0.50005)
+        x0 = jnp.array([1.0, -2.0])
+        x, _, n_failed = _fisher_scoring_line_search(
+            x0, jnp.eye(2), step, f, max_newton_iter=1, line_search_beta=0.5
+        )
+        assert float(f(x)) < 1e-6 * float(f(x0))
+        assert int(n_failed) == 0
+        # guard: the full step alone is a (tiny) strict decrease that a pure
+        # decrease test would have accepted.
+        full = x0 + step(x0)[0]
+        assert float(f(full)) < float(f(x0))
+        assert float(f(full)) > 0.99 * float(f(x0))
+
+    def test_exhausted_backtracking_is_counted(self) -> None:
+        """An ascent direction (sign-flipped gradient) exhausts every
+        backtrack: x is kept and each iteration counts as a failure."""
+        step, f = self._quadratic(1.0, gradient_sign=-1.0)
+        x0 = jnp.array([1.0, -2.0])
+        x, _, n_failed = _fisher_scoring_line_search(
+            x0, jnp.eye(2), step, f, max_newton_iter=3, line_search_beta=0.5
+        )
+        np.testing.assert_allclose(x, x0)
+        assert int(n_failed) == 3
+
+    def test_converged_point_is_not_a_failure(self) -> None:
+        step, f = self._quadratic(1.0)
+        _, _, n_failed = _fisher_scoring_line_search(
+            jnp.zeros(2),
+            jnp.eye(2),
+            step,
+            f,
+            max_newton_iter=3,
+            line_search_beta=0.5,
+        )
+        assert int(n_failed) == 0
+
+    @staticmethod
+    def _count_objective_evaluations(precision_scale: float) -> int:
+        """Run three jitted line-searched iterations and count (host side)
+        how many times the objective is evaluated."""
+        step, f = TestArmijoLineSearch._quadratic(precision_scale)
+        n_calls = []
+
+        def counted_f(x):
+            jax.debug.callback(lambda: n_calls.append(1))
+            return f(x)
+
+        run = jax.jit(
+            lambda x0: _fisher_scoring_line_search(
+                x0, jnp.eye(2), step, counted_f, max_newton_iter=3, line_search_beta=0.5
+            )
+        )
+        jax.block_until_ready(run(jnp.array([1.0, -2.0])))
+        jax.effects_barrier()
+        return len(n_calls)
+
+    def test_search_stops_at_the_first_accepted_step(self) -> None:
+        """An accepted full step costs one objective evaluation, not the
+        whole backtracking budget: 1 (initial point) + 1 per iteration."""
+        assert self._count_objective_evaluations(1.0) == 1 + 3
+
+    def test_backtracking_evaluates_only_until_acceptance(self) -> None:
+        """With a 2x curvature underestimate the full step fails Armijo and
+        the halved step is accepted (2 evaluations); the later iterations
+        start ~1e-4 from the minimum, where the round-off slack admits the
+        full step (1 evaluation each). A fixed-length search would evaluate
+        all 10 trial step sizes in every iteration."""
+        assert self._count_objective_evaluations(0.50005) == 1 + 2 + 1 + 1
+
+    def test_reverse_mode_gradient_through_backtracking(self) -> None:
+        """Reverse-mode AD runs through the early-exit search (fit_sgd
+        differentiates the filters) and matches central finite differences
+        on a problem whose full Fisher steps are backtracked, under jit and
+        vmap alike."""
+        cov = 100.0 * jnp.eye(2)
+        spikes = jnp.array([40.0, 0.0, 55.0])
+        design = jnp.array([[1.0, 0.5], [-0.3, 1.0], [0.8, -0.6]])
+
+        def posterior_summary(scale):
+            def log_rate(x):
+                return scale * (design @ x)
+
+            mean, post_cov, ll = _point_process_laplace_update(
+                jnp.zeros(2), cov, spikes, 0.1, log_rate, max_newton_iter=4
+            )
+            return jnp.sum(mean) + jnp.trace(post_cov) + 1e-3 * ll
+
+        # guard: this problem actually backtracks (a single trial step size
+        # changes the result)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(point_process_kalman, "_LINE_SEARCH_MAX_BACKTRACKS", 1)
+            one_trial = posterior_summary(1.0)
+        assert not np.isclose(float(one_trial), float(posterior_summary(1.0)))
+
+        grad = jax.jit(jax.grad(posterior_summary))
+        scales = jnp.array([0.9, 1.0, 1.1])
+        h = 1e-6
+        for scale in scales:
+            fd = (posterior_summary(scale + h) - posterior_summary(scale - h)) / (2 * h)
+            np.testing.assert_allclose(float(grad(scale)), float(fd), rtol=1e-5)
+        np.testing.assert_allclose(
+            np.asarray(jax.vmap(grad)(scales)),
+            np.asarray([grad(s) for s in scales]),
+            rtol=1e-12,
+        )
+
+    def test_filter_logs_when_many_bins_fail(self, caplog) -> None:
+        """A log-intensity whose derivative has the wrong sign makes every
+        bin's line search fail; the public filter logs one warning."""
+        args = _line_search_failure_problem()
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            stochastic_point_process_filter(
+                *args, _sign_flipped_log_rate, max_newton_iter=3
+            )
+        assert _line_search_warned(caplog)
+        # guard: a correct intensity with the same data does not warn.
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            stochastic_point_process_filter(
+                *args, log_conditional_intensity, max_newton_iter=3
+            )
+        assert not _line_search_warned(caplog)
+
+    @pytest.mark.parametrize(
+        ("n_failed", "n_bins", "max_newton_iter", "warns"),
+        [
+            (10, 100, 3, False),  # exactly 10%: not above the threshold
+            (11, 100, 3, True),
+            (100, 100, 1, False),  # no line search runs at one iteration
+            (0, 0, 3, False),
+        ],
+    )
+    def test_warning_threshold(
+        self, caplog, n_failed, n_bins, max_newton_iter, warns
+    ) -> None:
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            _warn_line_search_failures(
+                jnp.asarray(n_failed, dtype=jnp.int32), n_bins, max_newton_iter, "f"
+            )
+        assert _line_search_warned(caplog) is warns
+        if warns:
+            assert f"{n_failed}/{n_bins}" in caplog.text
+
+    def test_warning_threshold_under_jit(self, caplog) -> None:
+        @jax.jit
+        def report(n_failed):
+            _warn_line_search_failures(n_failed, 100, 3, "f")
+            return n_failed
+
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            report(jnp.asarray(10, dtype=jnp.int32))
+        assert not _line_search_warned(caplog)
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            report(jnp.asarray(11, dtype=jnp.int32))
+        assert _line_search_warned(caplog)
+
+    def test_traced_filter_reports_failures(self, caplog) -> None:
+        """Under ``jax.jit`` / ``jax.grad`` (an SGD loss) the filter still
+        reports exhausted line searches."""
+        init_mean, *rest = _line_search_failure_problem()
+
+        def neg_ll(mean0):
+            _, _, ll = stochastic_point_process_filter(
+                mean0, *rest, _sign_flipped_log_rate, max_newton_iter=3
+            )
+            return -ll
+
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            jax.jit(jax.grad(neg_ll))(init_mean)
+        assert _line_search_warned(caplog)
+
+    def test_glm_laplace_update_returns_failure_count(self) -> None:
+        rng = np.random.default_rng(0)
+        design = jnp.asarray(rng.normal(size=(2, 2)))
+        y = jnp.asarray(rng.poisson(3.0, size=2)).astype(float)
+        common = (jnp.zeros(2), jnp.eye(2), y)
+        family = poisson_family(0.1)
+
+        *_, n_bad = glm_laplace_update(
+            *common,
+            lambda x: _sign_flipped_log_rate(design, x),
+            family,
+            max_newton_iter=3,
+            return_line_search_failures=True,
+        )
+        *_, n_good = glm_laplace_update(
+            *common,
+            lambda x: design @ x,
+            family,
+            max_newton_iter=3,
+            return_line_search_failures=True,
+        )
+        assert int(n_bad) == 3
+        assert int(n_good) == 0
+
+
+class TestPointProcessModelNonFiniteFirstEStep:
+    def test_non_finite_first_e_step_leaves_model_unfitted(self, caplog) -> None:
+        """A first E-step with a non-finite LL has no accepted state to roll
+        back to: the posteriors it installed are cleared, EM stops with an
+        empty history, a warning is logged and the model reads as unfitted."""
+        rng = np.random.default_rng(0)
+        n_time = 20
+        Z = jnp.ones((n_time, 1, 1))
+        y = jnp.asarray(rng.poisson(1.0, size=(n_time, 1)))
+        model = PointProcessModel(1, dt=0.1)
+        real_e_step = model._e_step
+        n_calls = []
+
+        def nan_e_step(*args, **kwargs):
+            real_e_step(*args, **kwargs)  # installs posteriors
+            n_calls.append(1)
+            return float("nan")
+
+        model._e_step = nan_e_step
+        with caplog.at_level("WARNING"):
+            lls = model.fit(Z, y, max_iter=3)
+        assert len(n_calls) == 1  # guard: the injected E-step ran, EM stopped
+        assert lls == []
+        assert "non-finite" in caplog.text.lower()
+        for attr in (
+            "smoother_mean",
+            "smoother_cov",
+            "smoother_cross_cov",
+            "filtered_mean",
+            "filtered_cov",
+        ):
+            assert not is_set(model, attr), attr
+        with pytest.raises(NotFittedError, match="not been fitted"):
+            model.get_rate_estimate(Z)
+
+
+class TestScaleEquivariance:
+    """Rescaling the latent state leaves the filter / smoother unchanged.
+
+    With ``x -> c x`` (all covariances times ``s = c**2``, the design times
+    ``1/c``) the log-rates are identical, so the filtered and smoothed means
+    must scale by ``c``, the covariances by ``s`` and the Laplace marginal
+    log-likelihood must not change. This holds only if every Cholesky
+    stabilisation shift is scale-relative: the former absolute
+    ``diagonal_boost=1e-9`` changed the answer by ~2% (means) / ~7%
+    (covariances) at ``s = 1e-6`` and produced garbage (errors > 100%) at
+    ``s = 1e-10``.
+    """
+
+    @staticmethod
+    def _problem():
+        rng = np.random.default_rng(0)
+        T, d, n = 50, 3, 4
+        Z = rng.normal(0, 1, (T, n, d))
+        A = 0.95 * np.eye(d)
+        A[0, 1] = 0.05
+        Q = np.diag([0.02, 0.03, 0.01])
+        P0 = 0.5 * np.eye(d)
+        P0[0, 2] = P0[2, 0] = 0.2
+        m0 = np.array([0.5, -0.2, 0.1])
+        y = rng.poisson(0.3, (T, n)).astype(float)
+        return m0, P0, Z, y, A, Q
+
+    @pytest.mark.parametrize(
+        ("max_newton_iter", "rtol"),
+        [(1, 1e-11), (3, 2e-8)],
+    )
+    @pytest.mark.parametrize("scale", [1e-6, 1e-10])
+    def test_filter_and_smoother_are_scale_equivariant(
+        self, scale, max_newton_iter, rtol
+    ) -> None:
+        """N1 is equivariant to roundoff. N3 to ~1e-8: its line search
+        accepts a step only when the loss strictly decreases, and near the
+        mode that comparison is decided by roundoff (see
+        ``test_oracle_point_process``), so the two runs can stop ~sqrt(eps)
+        apart."""
+        m0, P0, Z, y, A, Q = self._problem()
+
+        def run(s):
+            c = np.sqrt(s)
+            sm, sc, scc, ll, fm, fc = stochastic_point_process_smoother(
+                m0 * c,
+                P0 * s,
+                Z / c,
+                y,
+                0.1,
+                A,
+                Q * s,
+                log_conditional_intensity,
+                max_newton_iter=max_newton_iter,
+                return_filtered=True,
+            )
+            return (
+                np.asarray(fm) / c,
+                np.asarray(fc) / s,
+                np.asarray(sm) / c,
+                np.asarray(sc) / s,
+                np.asarray(scc) / s,
+                float(ll),
+            )
+
+        ref = run(1.0)
+        got = run(scale)
+        # Guard: at this scale the covariances are far below the former
+        # absolute 1e-9 jitter, which would have swamped them.
+        assert np.max(np.asarray(got[1]) * scale) < 1e-9 * 1e3
+        names = ("filt_mean", "filt_cov", "smooth_mean", "smooth_cov", "cross_cov")
+        for name, a, b in zip(names, got[:5], ref[:5]):
+            np.testing.assert_allclose(
+                a, b, rtol=0, atol=rtol * np.max(np.abs(b)), err_msg=name
+            )
+        np.testing.assert_allclose(got[5], ref[5], rtol=rtol)
+
+
+def _affine_log_rate(design_t, x):
+    """log lambda_n = b_n + w_n . x with ``design_t[n] = [b_n, w_n]``."""
+    return design_t[:, 0] + design_t[:, 1:] @ x
+
+
+@pytest.mark.slow
+class TestPointProcessRecoverySweep:
+    """Parameter recovery as a statistic over seeds and sequence lengths.
+
+    Replaces single-seed thresholds: ``test_em_recovers_stationary_params``
+    (atol=0.5 on one seed), ``test_random_walk_recovery`` (whose spikes were
+    independent of the latent state, so A ~ I came from the prior) and
+    ``TestPointProcessModelRecovery.test_transition_matrix_recovery`` (which
+    started A at 0.8 I and allowed atol=0.25, so it passed without
+    recovering anything). Both sweeps use ``max_newton_iter=3``: with the
+    one-step update and a broad prior (init_cov = 4 I, intercept 3 away
+    from the prior mean) one of these GLM seeds diverges to
+    ``|error| ~ 25`` -- the EKF overshoot quantified in
+    ``test_oracle_point_process`` -- which is an approximation failure,
+    not a regression target.
+    """
+
+    _SEEDS = (0, 1, 2, 3, 4)
+
+    def test_glm_weight_error_decreases_with_data(self) -> None:
+        """Static GLM weights (A = I, Q = 1e-6 I held fixed) from 400 vs 3200
+        bins at ~20 Hz: the error should shrink roughly like 1/sqrt(T)
+        (expected ratio ~0.35).
+
+        Observed per-seed errors 0.08-0.37 (T=400) vs 0.02-0.05 (T=3200).
+        """
+        true = np.array([3.0, 0.8, -0.5])
+        dt = 0.01
+        errors = {}
+        for n_time in (400, 3200):
+            errors[n_time] = []
+            for seed in self._SEEDS:
+                rng = np.random.default_rng(seed)
+                X = np.concatenate(
+                    [np.ones((n_time, 1)), rng.normal(0.0, 1.0, (n_time, 2))], 1
+                )
+                y = rng.poisson(np.exp(X @ true) * dt).astype(float)
+                model = PointProcessModel(
+                    3,
+                    dt,
+                    transition_matrix=jnp.eye(3),
+                    process_cov=jnp.eye(3) * 1e-6,
+                    init_mean=jnp.zeros(3),
+                    init_cov=jnp.eye(3) * 4.0,
+                    update_transition_matrix=False,
+                    update_process_cov=False,
+                    max_newton_iter=3,
+                )
+                model.fit(X, y, max_iter=5)
+                estimate = np.asarray(model.smoother_mean[-1])
+                errors[n_time].append(float(np.linalg.norm(estimate - true)))
+        short, long = np.array(errors[400]), np.array(errors[3200])
+        msg = f"per-seed |w_hat - w|: T=400 {np.round(short, 4)}, T=3200 {np.round(long, 4)}"
+        assert np.all(short < 0.8) and np.all(long < 0.15), msg
+        assert np.mean(long) < 0.5 * np.mean(short), msg
+        assert np.median(long) < np.median(short), msg
+
+    def test_transition_error_decreases_with_data(self) -> None:
+        """EM for A (started at 0.5 I; truth diag(0.95, 0.8)) on 2-latent,
+        4-neuron AR(1) data, 500 vs 2000 bins.
+
+        EM for A is slow and the Laplace log-likelihood is not a strict EM
+        objective, so recovery is partial after 60 iterations; the test
+        asserts that every seed moves A substantially toward the truth and
+        that the error shrinks with more data. Observed max|A_hat - A|:
+        T=500 ~0.06-0.27, T=2000 ~0.08-0.27 (median 0.18 -> 0.11).
+        """
+        A_true = np.diag([0.95, 0.8])
+        q_true = np.array([0.02, 0.05])
+        dt, n_neurons = 0.02, 4
+        initial_error = float(np.max(np.abs(0.5 * np.eye(2) - A_true)))
+        errors = {}
+        for n_time in (500, 2000):
+            errors[n_time] = []
+            for seed in self._SEEDS[:4]:
+                rng = np.random.default_rng(seed)
+                W = rng.normal(0.0, 1.0, (n_neurons, 2))
+                b = np.full(n_neurons, np.log(20.0))
+                x, spikes = np.zeros(2), []
+                for _ in range(n_time):
+                    x = A_true @ x + rng.normal(0.0, np.sqrt(q_true))
+                    spikes.append(rng.poisson(np.exp(b + W @ x) * dt))
+                design = np.tile(np.concatenate([b[:, None], W], 1), (n_time, 1, 1))
+                model = PointProcessModel(
+                    2,
+                    dt,
+                    transition_matrix=0.5 * jnp.eye(2),
+                    process_cov=0.1 * jnp.eye(2),
+                    log_intensity_func=_affine_log_rate,
+                    max_newton_iter=3,
+                )
+                model.fit(
+                    design, np.asarray(spikes, float), max_iter=60, tolerance=1e-7
+                )
+                A_hat = np.asarray(model.transition_matrix)
+                errors[n_time].append(float(np.max(np.abs(A_hat - A_true))))
+        short, long = np.array(errors[500]), np.array(errors[2000])
+        msg = (
+            f"per-seed max|A_hat - A| (initial {initial_error:.2f}): "
+            f"T=500 {np.round(short, 3)}, T=2000 {np.round(long, 3)}"
+        )
+        assert np.all(long < 0.7 * initial_error), msg
+        assert np.median(long) < np.median(short), msg

@@ -1,4 +1,5 @@
 """Compare BFGS with and without the loss-improvement guard on CA1 data."""
+
 # %%
 import time
 import jax
@@ -51,22 +52,43 @@ print(f"Data: {data['n_time']} steps, {nn} neurons")
 _original_glm_step = spp._single_neuron_glm_step_second_order
 
 
-def _no_guard_glm_step(baseline, weights, y_n, smoother_mean, smoother_cov,
-                        dt, time_weights=None, weight_l2=0.0,
-                        baseline_prior=None, baseline_prior_l2=0.0,
-                        max_steps=50):
+def _no_guard_glm_step(
+    baseline,
+    weights,
+    y_n,
+    smoother_mean,
+    smoother_cov,
+    dt,
+    time_weights=None,
+    weight_l2=0.0,
+    baseline_prior=None,
+    baseline_prior_l2=0.0,
+    max_steps=50,
+):
     """BFGS GLM step without loss-improvement guard — accept if finite."""
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
 
     def loss_fn(p, args):
         return spp._neg_Q_single_neuron(
-            p, y_n, smoother_mean, smoother_cov, dt, weight_l2,
-            time_weights, baseline_prior, baseline_prior_l2,
+            p,
+            y_n,
+            smoother_mean,
+            smoother_cov,
+            dt,
+            weight_l2,
+            time_weights,
+            baseline_prior,
+            baseline_prior_l2,
         )
 
     solver = optx.BFGS(rtol=1e-5, atol=1e-5)
     result = optx.minimise(
-        loss_fn, solver, params, args=None, max_steps=max_steps, throw=False,
+        loss_fn,
+        solver,
+        params,
+        args=None,
+        max_steps=max_steps,
+        throw=False,
     )
     # Accept if finite only — no loss comparison
     new_loss = loss_fn(result.value, None)
@@ -75,18 +97,28 @@ def _no_guard_glm_step(baseline, weights, y_n, smoother_mean, smoother_cov,
 
 
 def make_model(damping_off, damping_on):
-    A_off = construct_common_oscillator_transition_matrix(theta_freq, jnp.array([damping_off]), sf)
-    A_on = construct_common_oscillator_transition_matrix(theta_freq, jnp.array([damping_on]), sf)
+    A_off = construct_common_oscillator_transition_matrix(
+        theta_freq, jnp.array([damping_off]), sf
+    )
+    A_on = construct_common_oscillator_transition_matrix(
+        theta_freq, jnp.array([damping_on]), sf
+    )
     Q_off = construct_common_oscillator_process_covariance(jnp.array([0.01]))
     Q_on = construct_common_oscillator_process_covariance(jnp.array([0.02]))
 
     model = SwitchingSpikeOscillatorModel(
-        n_oscillators=1, n_neurons=nn, n_discrete_states=2,
-        sampling_freq=sf, dt=dt,
+        n_oscillators=1,
+        n_neurons=nn,
+        n_discrete_states=2,
+        sampling_freq=sf,
+        dt=dt,
         q_regularization=QRegularizationConfig(),
-        separate_spike_params=True, spike_weight_l2=0.05,
-        update_continuous_transition_matrix=False, update_process_cov=False,
-        update_init_mean=False, update_init_cov=False,
+        separate_spike_params=True,
+        spike_weight_l2=0.05,
+        update_continuous_transition_matrix=False,
+        update_process_cov=False,
+        update_init_mean=False,
+        update_init_cov=False,
         update_discrete_transition_matrix=False,
     )
     key = jax.random.PRNGKey(42)
@@ -97,7 +129,9 @@ def make_model(damping_off, damping_on):
     model.discrete_transition_matrix = Z_emp
     model.init_discrete_state_prob = init_prob
     model.spike_params = SpikeObsParams(
-        baseline=jnp.stack([jnp.array(empirical_baseline), jnp.array(empirical_baseline)], axis=-1),
+        baseline=jnp.stack(
+            [jnp.array(empirical_baseline), jnp.array(empirical_baseline)], axis=-1
+        ),
         weights=jax.random.normal(key, (nn, 2, 2)) * 0.01,
     )
     return model

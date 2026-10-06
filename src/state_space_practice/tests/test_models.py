@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice import models
 from state_space_practice.models import (
     get_confidence_interval,
     log_receptive_field_model,
@@ -134,8 +135,28 @@ def simple_point_process_model():
     }
 
 
+# The legacy filter is deprecated; these tests pin its numerics until removal.
+@pytest.mark.filterwarnings(
+    "ignore:stochastic_point_process_filter in models.py:DeprecationWarning"
+)
 class TestStochasticPointProcessFilter:
     """Tests for the stochastic_point_process_filter function."""
+
+    def test_emits_deprecation_warning_naming_removal_version(
+        self, simple_point_process_model
+    ) -> None:
+        m = simple_point_process_model
+        with pytest.warns(DeprecationWarning, match=r"removed in version 0\.2\.0"):
+            stochastic_point_process_filter(
+                m["init_mode"],
+                m["init_cov"],
+                m["position"],
+                m["spike_indicator"],
+                m["dt"],
+                m["transition_matrix"],
+                m["latent_state_cov"],
+                log_receptive_field_model,
+            )
 
     def test_output_shapes(self, simple_point_process_model) -> None:
         """Filter should output correct shapes."""
@@ -472,3 +493,90 @@ class TestGetConfidenceInterval:
 
         np.testing.assert_allclose(lower, posterior_mode, rtol=1e-10)
         np.testing.assert_allclose(upper, posterior_mode, rtol=1e-10)
+
+    def test_keyword_arguments(self) -> None:
+        """The documented keyword names give a mode +/- z * sd interval."""
+        posterior_mode = jnp.array([[1.0, -2.0], [0.5, 3.0]])
+        variances = jnp.array([[4.0, 0.25], [1.0, 9.0]])
+        posterior_cov = jax.vmap(jnp.diag)(variances)
+
+        ci = get_confidence_interval(
+            posterior_mode=posterior_mode,
+            posterior_covariance=posterior_cov,
+            alpha=0.05,
+        )
+
+        half_width = 1.959963984540054 * jnp.sqrt(variances)
+        np.testing.assert_allclose(ci[..., 0], posterior_mode - half_width)
+        np.testing.assert_allclose(ci[..., 1], posterior_mode + half_width)
+
+
+@pytest.mark.filterwarnings(
+    "ignore:stochastic_point_process_filter in models.py:DeprecationWarning"
+)
+class TestDeprecatedFilterJitAndFloors:
+    """The deprecated observed-Hessian filter runs as one jitted scan and
+    floors eigenvalues relative to the matrix scale."""
+
+    def test_compiles_once_across_calls(self, simple_point_process_model, monkeypatch):
+        m = simple_point_process_model
+        traces: list = []
+        original = models._safe_expected_count
+
+        def counting(*args, **kwargs):
+            traces.append(None)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(models, "_safe_expected_count", counting)
+        args = (
+            m["init_mode"],
+            m["init_cov"],
+            m["position"],
+            m["spike_indicator"],
+        )
+        models._stochastic_point_process_filter_impl.clear_cache()
+        first, _ = stochastic_point_process_filter(
+            *args,
+            m["dt"],
+            m["transition_matrix"],
+            m["latent_state_cov"],
+            log_receptive_field_model,
+        )
+        # guard: the first call after clearing the cache traced the scan once.
+        assert len(traces) == 1
+        second, _ = stochastic_point_process_filter(
+            *args,
+            0.5 * m["dt"],
+            m["transition_matrix"],
+            2 * m["latent_state_cov"],
+            log_receptive_field_model,
+        )
+        assert len(traces) == 1
+        # guard: the cached compilation saw the new dt / process noise.
+        assert not np.allclose(first, second)
+
+    def test_indefinite_precision_is_floored_relatively_and_logged(
+        self, caplog
+    ) -> None:
+        """Zero spikes at a very high rate make the observed-Hessian precision
+        indefinite. Its negative eigenvalue is raised to a floor relative to
+        the precision's scale (1e-8 * lambda_max, giving a posterior variance
+        ~4e5 here instead of the ~1e9 an absolute 1e-9 floor gave), and one
+        warning is logged for the whole scan."""
+        init_mode = jnp.array([jnp.log(1e4), 150.0, 10.0])
+        with caplog.at_level("WARNING", logger="state_space_practice.models"):
+            _, posterior_cov = stochastic_point_process_filter(
+                init_mode,
+                jnp.eye(3) * 10.0,
+                jnp.array([150.0, 150.0]),
+                jnp.zeros(2),
+                0.02,
+                jnp.eye(3),
+                jnp.eye(3) * 1e-3,
+                log_receptive_field_model,
+            )
+        eigs = np.linalg.eigvalsh(np.asarray(posterior_cov[-1]))
+        assert np.all(np.isfinite(eigs)) and eigs.min() > 0.0
+        assert 1e4 < eigs.max() < 1e7
+        floor_logs = [r for r in caplog.records if "PSD floor" in r.getMessage()]
+        assert len(floor_logs) == 1

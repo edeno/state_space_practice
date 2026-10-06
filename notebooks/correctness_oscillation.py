@@ -53,11 +53,15 @@ theta = 2 * np.pi * freq_hz * dt  # rotation angle per step
 damping_0 = 0.85  # heavily damped
 damping_1 = 0.99  # nearly undamped
 
+
 def make_rotation_matrix(damping, theta):
-    return damping * jnp.array([
-        [jnp.cos(theta), -jnp.sin(theta)],
-        [jnp.sin(theta),  jnp.cos(theta)],
-    ])
+    return damping * jnp.array(
+        [
+            [jnp.cos(theta), -jnp.sin(theta)],
+            [jnp.sin(theta), jnp.cos(theta)],
+        ]
+    )
+
 
 A0 = make_rotation_matrix(damping_0, theta)
 A1 = make_rotation_matrix(damping_1, theta)
@@ -73,14 +77,17 @@ key = jax.random.PRNGKey(42)
 k_w, k_s = jax.random.split(key)
 # Create weights as cos/sin at evenly spaced phases
 preferred_phases = jnp.linspace(0, 2 * jnp.pi, n_neurons, endpoint=False)
-W_true = jnp.stack([
-    jnp.cos(preferred_phases) * 0.5,
-    jnp.sin(preferred_phases) * 0.5,
-], axis=-1)  # (n_neurons, 2)
+W_true = jnp.stack(
+    [
+        jnp.cos(preferred_phases) * 0.5,
+        jnp.sin(preferred_phases) * 0.5,
+    ],
+    axis=-1,
+)  # (n_neurons, 2)
 
 b_true = jnp.ones(n_neurons) * 2.5  # ~12 Hz baseline
 
-print(f"Oscillation: {freq_hz} Hz, {1/(freq_hz*dt):.0f} steps/cycle")
+print(f"Oscillation: {freq_hz} Hz, {1 / (freq_hz * dt):.0f} steps/cycle")
 print(f"Damping: state 0 = {damping_0}, state 1 = {damping_1}")
 print(f"A0 eigenvalues: {np.array(jnp.linalg.eigvals(A0))}")
 print(f"A1 eigenvalues: {np.array(jnp.linalg.eigvals(A1))}")
@@ -107,7 +114,9 @@ for t in range(1, n_time):
     key_state, k = jax.random.split(key_state)
     A_t = np.array(A_true[:, :, disc_states[t]])
     Q_t = np.array(Q_true[:, :, disc_states[t]])
-    noise = np.array(jax.random.multivariate_normal(k, jnp.zeros(n_latent), jnp.array(Q_t)))
+    noise = np.array(
+        jax.random.multivariate_normal(k, jnp.zeros(n_latent), jnp.array(Q_t))
+    )
     states[t] = A_t @ states[t - 1] + noise
 
 # Spikes
@@ -129,7 +138,9 @@ n_transitions = np.sum(np.diff(disc_states) != 0)
 print(f"\nSimulated:")
 print(f"  Total spikes: {int(jnp.sum(spikes))}")
 print(f"  Mean rate: {float(jnp.mean(spikes) / dt):.1f} Hz/neuron")
-print(f"  State occupancy: {[f'{float((disc_states==j).mean()):.2f}' for j in range(2)]}")
+print(
+    f"  State occupancy: {[f'{float((disc_states == j).mean()):.2f}' for j in range(2)]}"
+)
 print(f"  State transitions: {n_transitions}")
 print(f"  Mean block length: {n_time / (n_transitions + 1):.0f} steps")
 
@@ -145,10 +156,22 @@ t_show = slice(0, 6000)
 
 # Panel 1: True discrete state
 ax = axes[0]
-ax.fill_between(time_sec[t_show], 0, disc_states[t_show], alpha=0.3, color="C1",
-                label="State 1 (sustained)")
-ax.fill_between(time_sec[t_show], 0, 1 - disc_states[t_show], alpha=0.3, color="C0",
-                label="State 0 (damped)")
+ax.fill_between(
+    time_sec[t_show],
+    0,
+    disc_states[t_show],
+    alpha=0.3,
+    color="C1",
+    label="State 1 (sustained)",
+)
+ax.fill_between(
+    time_sec[t_show],
+    0,
+    1 - disc_states[t_show],
+    alpha=0.3,
+    color="C0",
+    label="State 0 (damped)",
+)
 ax.set_ylabel("State")
 ax.set_title("True discrete state")
 ax.legend(loc="upper right")
@@ -187,7 +210,9 @@ ax.set_xlabel("Time (seconds)")
 ax.set_title("Total spike count (25-step moving average)")
 
 plt.tight_layout()
-plt.savefig(output_dir / "oscillation_1_simulated_data.png", dpi=150, bbox_inches="tight")
+plt.savefig(
+    output_dir / "oscillation_1_simulated_data.png", dpi=150, bbox_inches="tight"
+)
 plt.show()
 
 # %% [markdown]
@@ -231,17 +256,22 @@ sustained_label = best_j if corr[best_j] > 0 else 1 - best_j
 best_corr = max(np.abs(corr))
 
 # Recovered spectral properties
-fitted_eigs = [np.array(jnp.linalg.eigvals(model.continuous_transition_matrix[:, :, j])) for j in range(2)]
+fitted_eigs = [
+    np.array(jnp.linalg.eigvals(model.continuous_transition_matrix[:, :, j]))
+    for j in range(2)
+]
 fitted_sr = [np.max(np.abs(e)) for e in fitted_eigs]
 fitted_freq = [np.abs(np.angle(e[0])) / (2 * np.pi * dt) for e in fitted_eigs]
 fitted_damping = fitted_sr  # spectral radius = damping for rotation matrix
 
 # Smoother mean
-smoother_mean = np.array(jnp.einsum(
-    "tls,ts->tl",
-    model.smoother_state_cond_mean,
-    model.smoother_discrete_state_prob,
-))
+smoother_mean = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model.smoother_state_cond_mean,
+        model.smoother_discrete_state_prob,
+    )
+)
 smoother_amp = np.sqrt(smoother_mean[:, 0] ** 2 + smoother_mean[:, 1] ** 2)
 smoother_phase = np.arctan2(smoother_mean[:, 1], smoother_mean[:, 0])
 
@@ -260,10 +290,21 @@ for ax in axes[1:]:
 
 # Panel 2: Discrete state recovery
 ax = axes[1]
-ax.fill_between(time_sec[t_show], 0, disc_states[t_show], alpha=0.2, color="C1",
-                label="True sustained state")
-ax.plot(time_sec[t_show], prob[t_show, sustained_label], color="C0", alpha=0.8,
-        label=f"P(sustained | y)")
+ax.fill_between(
+    time_sec[t_show],
+    0,
+    disc_states[t_show],
+    alpha=0.2,
+    color="C1",
+    label="True sustained state",
+)
+ax.plot(
+    time_sec[t_show],
+    prob[t_show, sustained_label],
+    color="C0",
+    alpha=0.8,
+    label=f"P(sustained | y)",
+)
 ax.set_ylabel("P(sustained)")
 ax.set_title(f"Discrete state recovery (|corr| = {best_corr:.3f})")
 ax.legend(loc="upper right")
@@ -299,16 +340,23 @@ text = (
     f"  State 0: true = {damping_0:.3f}, fitted = {fitted_sr[order[0]]:.3f}\n"
     f"  State 1: true = {damping_1:.3f}, fitted = {fitted_sr[order[1]]:.3f}\n\n"
     f"Transition matrix diagonal:\n"
-    f"  true = [{float(Z_true[0,0]):.3f}, {float(Z_true[1,1]):.3f}], "
-    f"fitted = [{float(Z_fit[0,0]):.3f}, {float(Z_fit[1,1]):.3f}]\n\n"
+    f"  true = [{float(Z_true[0, 0]):.3f}, {float(Z_true[1, 1]):.3f}], "
+    f"fitted = [{float(Z_fit[0, 0]):.3f}, {float(Z_fit[1, 1]):.3f}]\n\n"
     f"Spike params:\n"
     f"  Baseline error: {float(jnp.max(jnp.abs(model.spike_params.baseline - b_true))):.3f} "
     f"(true = {float(b_true[0]):.1f})\n"
     f"  Weights MAE: {float(jnp.mean(jnp.abs(model.spike_params.weights - W_true))):.3f}"
 )
-ax.text(0.05, 0.5, text, transform=ax.transAxes, fontsize=11,
-        verticalalignment="center", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+ax.text(
+    0.05,
+    0.5,
+    text,
+    transform=ax.transAxes,
+    fontsize=11,
+    verticalalignment="center",
+    fontfamily="monospace",
+    bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+)
 ax.set_axis_off()
 ax.set_title("Recovered parameters")
 
@@ -333,8 +381,7 @@ ax = axes[0]
 ax.scatter(true_preferred_phase, fitted_preferred_phase, s=50, alpha=0.8)
 # Handle wraparound: add diagonal lines
 for offset in [-2 * np.pi, 0, 2 * np.pi]:
-    ax.plot([-np.pi, np.pi], [-np.pi + offset, np.pi + offset],
-            "k--", alpha=0.3)
+    ax.plot([-np.pi, np.pi], [-np.pi + offset, np.pi + offset], "k--", alpha=0.3)
 ax.set_xlabel("True preferred phase (rad)")
 ax.set_ylabel("Fitted preferred phase (rad)")
 ax.set_title("Phase preference recovery")
@@ -344,10 +391,24 @@ ax.set_ylim(-np.pi - 0.5, np.pi + 0.5)
 # Panel 2: Polar plot of neuron phases
 ax = axes[1]
 ax = fig.add_subplot(132, projection="polar")
-ax.scatter(true_preferred_phase, np.ones(n_neurons), c="C0", s=60, alpha=0.6,
-           label="True", zorder=5)
-ax.scatter(fitted_preferred_phase, np.ones(n_neurons) * 0.7, c="C1", s=60, alpha=0.6,
-           label="Fitted", zorder=5)
+ax.scatter(
+    true_preferred_phase,
+    np.ones(n_neurons),
+    c="C0",
+    s=60,
+    alpha=0.6,
+    label="True",
+    zorder=5,
+)
+ax.scatter(
+    fitted_preferred_phase,
+    np.ones(n_neurons) * 0.7,
+    c="C1",
+    s=60,
+    alpha=0.6,
+    label="Fitted",
+    zorder=5,
+)
 ax.set_title("Neuron preferred phases", pad=15)
 ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.0))
 
@@ -362,7 +423,9 @@ ax.set_ylabel("Fitted modulation strength")
 ax.set_title("Modulation strength recovery")
 
 plt.tight_layout()
-plt.savefig(output_dir / "oscillation_3_phase_locking.png", dpi=150, bbox_inches="tight")
+plt.savefig(
+    output_dir / "oscillation_3_phase_locking.png", dpi=150, bbox_inches="tight"
+)
 plt.show()
 
 # %% [markdown]
@@ -388,7 +451,9 @@ fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
 ax = axes[0]
 ax.fill_between(time_zoom, 0, disc_states[zoom], alpha=0.3, color="C1")
 ax.plot(time_zoom, prob[zoom, sustained_label], color="C0", alpha=0.8)
-ax.axvline(transition_idx * dt, color="red", linestyle="--", alpha=0.5, label="Transition")
+ax.axvline(
+    transition_idx * dt, color="red", linestyle="--", alpha=0.5, label="Transition"
+)
 ax.set_ylabel("P(sustained)")
 ax.set_title("Zoomed: state transition from damped to sustained")
 ax.legend()
@@ -419,7 +484,9 @@ for n in range(min(6, n_neurons)):
         ax.scatter(
             time_zoom[spike_times_zoom],
             np.ones_like(spike_times_zoom) * n,
-            s=3, c=f"C{n}", alpha=0.6,
+            s=3,
+            c=f"C{n}",
+            alpha=0.6,
         )
 ax.axvline(transition_idx * dt, color="red", linestyle="--", alpha=0.5)
 ax.set_ylabel("Neuron")
@@ -435,9 +502,17 @@ plt.show()
 print("\n" + "=" * 70)
 print("SUMMARY")
 print("=" * 70)
-print(f"Data: {n_time} steps ({n_time*dt:.0f} sec), {n_neurons} neurons, {freq_hz} Hz oscillation")
-print(f"EM: {len(lls)} iterations, LL improvement = {lls[-1]-lls[0]:.1f}")
+print(
+    f"Data: {n_time} steps ({n_time * dt:.0f} sec), {n_neurons} neurons, {freq_hz} Hz oscillation"
+)
+print(f"EM: {len(lls)} iterations, LL improvement = {lls[-1] - lls[0]:.1f}")
 print(f"State recovery |corr|: {best_corr:.3f}")
-print(f"Frequency recovery: {fitted_freq[order[0]]:.1f} / {fitted_freq[order[1]]:.1f} Hz (true = {freq_hz:.1f})")
-print(f"Damping recovery: {fitted_sr[order[0]]:.3f} / {fitted_sr[order[1]]:.3f} (true = {damping_0}/{damping_1})")
-print(f"Latent state tracking corr: {np.corrcoef(states[:,0], smoother_mean[:,0])[0,1]:.3f}")
+print(
+    f"Frequency recovery: {fitted_freq[order[0]]:.1f} / {fitted_freq[order[1]]:.1f} Hz (true = {freq_hz:.1f})"
+)
+print(
+    f"Damping recovery: {fitted_sr[order[0]]:.3f} / {fitted_sr[order[1]]:.3f} (true = {damping_0}/{damping_1})"
+)
+print(
+    f"Latent state tracking corr: {np.corrcoef(states[:, 0], smoother_mean[:, 0])[0, 1]:.3f}"
+)

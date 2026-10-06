@@ -372,7 +372,9 @@ def summarize_inference(
     accuracy = float(jnp.maximum(accuracy_direct, accuracy_flipped))
     latent_corr = float(jnp.corrcoef(true_latent, marginal_smoother_mean[:, 0])[0, 1])
     posterior_entropy = -jnp.mean(
-        jnp.sum(smoother_discrete_prob * jnp.log(smoother_discrete_prob + PROB_MIN), axis=1)
+        jnp.sum(
+            smoother_discrete_prob * jnp.log(smoother_discrete_prob + PROB_MIN), axis=1
+        )
     )
 
     return (
@@ -408,11 +410,13 @@ def main():
     # Simulate data
     key = jax.random.PRNGKey(42)
     key, sim_key = jax.random.split(key)
-    spikes, true_states, true_latent, baseline, weights = simulate_switching_dynamics_neuron(
-        n_time=n_time,
-        dt=dt,
-        transition_prob=transition_prob,
-        key=sim_key,
+    spikes, true_states, true_latent, baseline, weights = (
+        simulate_switching_dynamics_neuron(
+            n_time=n_time,
+            dt=dt,
+            transition_prob=transition_prob,
+            key=sim_key,
+        )
     )
 
     n_transitions = jnp.sum(jnp.abs(jnp.diff(true_states)))
@@ -476,9 +480,7 @@ def main():
     )
     mean_rate_multi = jnp.sum(spikes_multi, axis=0) / (n_time * dt)
     print(f"  Neurons: {n_neurons_check}")
-    print(
-        f"  Mean firing rate per neuron: {float(jnp.mean(mean_rate_multi)):.2f} Hz"
-    )
+    print(f"  Mean firing rate per neuron: {float(jnp.mean(mean_rate_multi)):.2f} Hz")
     print(
         f"  Rate range: [{float(mean_rate_multi.min()):.2f}, {float(mean_rate_multi.max()):.2f}] Hz"
     )
@@ -520,14 +522,27 @@ def main():
     # Panel 2: True latent state
     ax = axes[1, 0]
     ax.plot(time, true_latent[plot_start:plot_end], "k-", alpha=0.7, label="True")
-    ax.plot(time, marginal_mean_true[plot_start:plot_end, 0], "b-", alpha=0.7, label="Inferred")
+    ax.plot(
+        time,
+        marginal_mean_true[plot_start:plot_end, 0],
+        "b-",
+        alpha=0.7,
+        label="Inferred",
+    )
     ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("Latent State")
     ax.legend(loc="upper right")
 
     # Panel 3: True discrete state
     ax = axes[2, 0]
-    ax.fill_between(time, true_states[plot_start:plot_end], alpha=0.5, step="mid", color="C0", label="True state")
+    ax.fill_between(
+        time,
+        true_states[plot_start:plot_end],
+        alpha=0.5,
+        step="mid",
+        color="C0",
+        label="True state",
+    )
     ax.set_ylabel("True State")
     ax.set_ylim(-0.1, 1.1)
 
@@ -553,19 +568,34 @@ def main():
         spike_times = time[spikes_multi[plot_start:plot_end, i] > 0]
         ax.eventplot([spike_times], lineoffsets=i, colors="black", linewidths=0.5)
     ax.set_ylabel("Neuron")
-    ax.set_title(f"Multi-neuron ({n_neurons_check} neurons, Accuracy: {accuracy_multi:.1%})")
+    ax.set_title(
+        f"Multi-neuron ({n_neurons_check} neurons, Accuracy: {accuracy_multi:.1%})"
+    )
 
     # Panel 2: True latent state
     ax = axes[1, 1]
     ax.plot(time, true_latent_multi[plot_start:plot_end], "k-", alpha=0.7, label="True")
-    ax.plot(time, marginal_mean_multi[plot_start:plot_end, 0], "b-", alpha=0.7, label="Inferred")
+    ax.plot(
+        time,
+        marginal_mean_multi[plot_start:plot_end, 0],
+        "b-",
+        alpha=0.7,
+        label="Inferred",
+    )
     ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("Latent State")
     ax.legend(loc="upper right")
 
     # Panel 3: True discrete state
     ax = axes[2, 1]
-    ax.fill_between(time, true_states_multi[plot_start:plot_end], alpha=0.5, step="mid", color="C0", label="True state")
+    ax.fill_between(
+        time,
+        true_states_multi[plot_start:plot_end],
+        alpha=0.5,
+        step="mid",
+        color="C0",
+        label="True state",
+    )
     ax.set_ylabel("True State")
     ax.set_ylim(-0.1, 1.1)
 

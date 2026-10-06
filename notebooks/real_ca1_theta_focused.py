@@ -49,7 +49,9 @@ dt = data["dt"]
 n_neurons = data["n_neurons"]
 n_time = data["n_time"]
 
-print(f"Data: {n_time} steps ({n_time*dt:.0f}s), {n_neurons} neurons, {sampling_freq} Hz")
+print(
+    f"Data: {n_time} steps ({n_time * dt:.0f}s), {n_neurons} neurons, {sampling_freq} Hz"
+)
 
 # %% [markdown]
 # # Model setup: strong theta contrast
@@ -64,17 +66,23 @@ theta_freq = jnp.array([8.0])
 
 # Strong damping contrast
 A_off = construct_common_oscillator_transition_matrix(
-    theta_freq, jnp.array([0.95]), sampling_freq  # damped
+    theta_freq,
+    jnp.array([0.95]),
+    sampling_freq,  # damped
 )
 A_on = construct_common_oscillator_transition_matrix(
-    theta_freq, jnp.array([0.99]), sampling_freq  # sustained
+    theta_freq,
+    jnp.array([0.99]),
+    sampling_freq,  # sustained
 )
 
 # Process noise — keep small to avoid large covariance growth
 Q_off = construct_common_oscillator_process_covariance(jnp.array([0.01]))
 Q_on = construct_common_oscillator_process_covariance(jnp.array([0.02]))
 
-print(f"A_off spectral radius: {float(jnp.max(jnp.abs(jnp.linalg.eigvals(A_off)))):.3f}")
+print(
+    f"A_off spectral radius: {float(jnp.max(jnp.abs(jnp.linalg.eigvals(A_off)))):.3f}"
+)
 print(f"A_on spectral radius:  {float(jnp.max(jnp.abs(jnp.linalg.eigvals(A_on)))):.3f}")
 
 # Empirical transition matrix from behavior
@@ -115,25 +123,30 @@ model.continuous_transition_matrix = jnp.stack([A_off, A_on], axis=-1)
 model.process_cov = jnp.stack([Q_off, Q_on], axis=-1)
 model.init_cov = jnp.stack([jnp.eye(2) * 0.5, jnp.eye(2) * 0.5], axis=-1)
 
-model.discrete_transition_matrix = jnp.array([
-    [p_im_stay, 1 - p_im_stay],
-    [1 - p_run_stay, p_run_stay],
-])
+model.discrete_transition_matrix = jnp.array(
+    [
+        [p_im_stay, 1 - p_im_stay],
+        [1 - p_run_stay, p_run_stay],
+    ]
+)
 model.init_discrete_state_prob = jnp.array([1 - running_frac, running_frac])
 
 # Initialize spike params from data
 model.spike_params = SpikeObsParams(
-    baseline=jnp.stack([
-        jnp.array(empirical_baseline),
-        jnp.array(empirical_baseline),
-    ], axis=-1),
+    baseline=jnp.stack(
+        [
+            jnp.array(empirical_baseline),
+            jnp.array(empirical_baseline),
+        ],
+        axis=-1,
+    ),
     weights=jax.random.normal(key, (n_neurons, 2, 2)) * 0.01,
 )
 
 print(f"\nFitting on full dataset ({n_time} steps, {n_neurons} neurons)...")
 lls = model.fit(spikes, max_iter=20, skip_init=True)
 print(f"Done. {len(lls)} iterations.")
-print(f"LL: {lls[0]:.0f} -> {lls[-1]:.0f} (delta={lls[-1]-lls[0]:.0f})")
+print(f"LL: {lls[0]:.0f} -> {lls[-1]:.0f} (delta={lls[-1] - lls[0]:.0f})")
 
 # %%
 prob = np.array(model.smoother_discrete_state_prob)
@@ -148,9 +161,13 @@ clear_mask = (labels == 0) | (labels == 1)
 auc = roc_auc_score(running_mask[clear_mask], prob[clear_mask, theta_on])
 
 # Smoother
-smoother_mean = np.array(jnp.einsum(
-    "tls,ts->tl", model.smoother_state_cond_mean, model.smoother_discrete_state_prob,
-))
+smoother_mean = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model.smoother_state_cond_mean,
+        model.smoother_discrete_state_prob,
+    )
+)
 amplitude = np.sqrt(smoother_mean[:, 0] ** 2 + smoother_mean[:, 1] ** 2)
 phase = np.arctan2(smoother_mean[:, 1], smoother_mean[:, 0])
 
@@ -179,13 +196,23 @@ ax = axes[0]
 ax.plot(time_show, speed[t_show], color="gray", alpha=0.5, linewidth=0.5)
 ax.axhline(5.0, color="red", linestyle="--", alpha=0.3, label="5 cm/s")
 ax.set_ylabel("Speed (cm/s)")
-ax.set_title(f"CA1 theta segmentation — full dataset ({n_time*dt:.0f}s, AUC={auc:.3f})")
+ax.set_title(
+    f"CA1 theta segmentation — full dataset ({n_time * dt:.0f}s, AUC={auc:.3f})"
+)
 ax.legend(fontsize=8)
 
 ax = axes[1]
-ax.fill_between(time_show, 0, running_mask[t_show], alpha=0.15, color="C0", label="Running")
-ax.plot(time_show, prob[t_show, theta_on], color="C1", alpha=0.8, linewidth=0.5,
-        label="P(theta-on)")
+ax.fill_between(
+    time_show, 0, running_mask[t_show], alpha=0.15, color="C0", label="Running"
+)
+ax.plot(
+    time_show,
+    prob[t_show, theta_on],
+    color="C1",
+    alpha=0.8,
+    linewidth=0.5,
+    label="P(theta-on)",
+)
 ax.set_ylabel("P(theta-on)")
 ax.set_ylim(-0.05, 1.05)
 ax.legend(fontsize=8)
@@ -220,7 +247,9 @@ plt.show()
 transition_t = None
 for t in range(1000, n_time - 2000):
     if labels[t - 1] == 0 and labels[t] == 1 and speed[t] > 5:
-        if (labels[max(0, t - 500):t] == 0).mean() > 0.5 and (labels[t:min(n_time, t + 500)] == 1).mean() > 0.5:
+        if (labels[max(0, t - 500) : t] == 0).mean() > 0.5 and (
+            labels[t : min(n_time, t + 500)] == 1
+        ).mean() > 0.5:
             transition_t = t
             break
 
@@ -234,8 +263,12 @@ if transition_t is None:
 if transition_t is None:
     transition_t = 5000  # fallback
 
-zoom = slice(transition_t - int(3 * sampling_freq), transition_t + int(5 * sampling_freq))
-time_zoom = (np.arange(zoom.start, zoom.stop) - transition_t) * dt  # centered on transition
+zoom = slice(
+    transition_t - int(3 * sampling_freq), transition_t + int(5 * sampling_freq)
+)
+time_zoom = (
+    np.arange(zoom.start, zoom.stop) - transition_t
+) * dt  # centered on transition
 
 fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
 
@@ -287,8 +320,8 @@ aligned_prob = []
 aligned_speed = []
 for t in transitions:
     if t - window >= 0 and t + window <= n_time:
-        p = prob[t - window:t + window, theta_on]
-        s = speed[t - window:t + window]
+        p = prob[t - window : t + window, theta_on]
+        s = speed[t - window : t + window]
         if len(p) == 2 * window and len(s) == 2 * window:
             aligned_prob.append(p)
             aligned_speed.append(s)
@@ -306,10 +339,13 @@ fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
 
 ax = axes[0]
 ax.plot(time_aligned, aligned_speed.mean(axis=0), color="gray")
-ax.fill_between(time_aligned,
-                aligned_speed.mean(axis=0) - aligned_speed.std(axis=0),
-                aligned_speed.mean(axis=0) + aligned_speed.std(axis=0),
-                alpha=0.2, color="gray")
+ax.fill_between(
+    time_aligned,
+    aligned_speed.mean(axis=0) - aligned_speed.std(axis=0),
+    aligned_speed.mean(axis=0) + aligned_speed.std(axis=0),
+    alpha=0.2,
+    color="gray",
+)
 ax.axvline(0, color="black", linestyle="--", alpha=0.5)
 ax.axhline(5.0, color="red", linestyle="--", alpha=0.3)
 ax.set_ylabel("Speed (cm/s)")
@@ -317,16 +353,21 @@ ax.set_title(f"Movement-triggered average (n={len(aligned_prob)} transitions)")
 
 ax = axes[1]
 ax.plot(time_aligned, aligned_prob.mean(axis=0), color="C1")
-ax.fill_between(time_aligned,
-                aligned_prob.mean(axis=0) - aligned_prob.std(axis=0) / np.sqrt(len(aligned_prob)),
-                aligned_prob.mean(axis=0) + aligned_prob.std(axis=0) / np.sqrt(len(aligned_prob)),
-                alpha=0.3, color="C1")
+ax.fill_between(
+    time_aligned,
+    aligned_prob.mean(axis=0) - aligned_prob.std(axis=0) / np.sqrt(len(aligned_prob)),
+    aligned_prob.mean(axis=0) + aligned_prob.std(axis=0) / np.sqrt(len(aligned_prob)),
+    alpha=0.3,
+    color="C1",
+)
 ax.axvline(0, color="black", linestyle="--", alpha=0.5)
 ax.set_ylabel("P(theta-on)")
 ax.set_xlabel("Time relative to movement onset (seconds)")
 
 plt.tight_layout()
-plt.savefig(output_dir / "theta_focused_triggered_avg.png", dpi=150, bbox_inches="tight")
+plt.savefig(
+    output_dir / "theta_focused_triggered_avg.png", dpi=150, bbox_inches="tight"
+)
 plt.show()
 
 # %%
@@ -336,7 +377,7 @@ plt.show()
 onset_lags = []
 for i, t in enumerate(transitions):
     if t - window >= 0 and t + window < n_time:
-        p = prob[t - window:t + window, theta_on]
+        p = prob[t - window : t + window, theta_on]
         # Find first crossing above 0.5 relative to transition
         above = np.where(p > 0.5)[0]
         if len(above) > 0:
@@ -345,16 +386,24 @@ for i, t in enumerate(transitions):
 
 onset_lags = np.array(onset_lags)
 print(f"\nTheta onset timing (relative to movement):")
-print(f"  Median: {np.median(onset_lags)*1000:.0f} ms")
-print(f"  Mean: {np.mean(onset_lags)*1000:.0f} ms")
+print(f"  Median: {np.median(onset_lags) * 1000:.0f} ms")
+print(f"  Mean: {np.mean(onset_lags) * 1000:.0f} ms")
 print(f"  Fraction before movement: {(onset_lags < 0).mean():.1%}")
 
 # Save results
 with open(output_dir / "theta_focused_results.pkl", "wb") as f:
-    pickle.dump({
-        "model": model, "lls": lls, "prob": prob,
-        "theta_on": theta_on, "auc": auc,
-        "smoother_mean": smoother_mean, "amplitude": amplitude, "phase": phase,
-        "onset_lags": onset_lags,
-    }, f)
+    pickle.dump(
+        {
+            "model": model,
+            "lls": lls,
+            "prob": prob,
+            "theta_on": theta_on,
+            "auc": auc,
+            "smoother_mean": smoother_mean,
+            "amplitude": amplitude,
+            "phase": phase,
+            "onset_lags": onset_lags,
+        },
+        f,
+    )
 print(f"\nResults saved to {output_dir / 'theta_focused_results.pkl'}")

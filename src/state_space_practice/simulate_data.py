@@ -1,14 +1,39 @@
+from typing import Any, NamedTuple
+
 import numpy as np
 from numpy.typing import ArrayLike
 
 from state_space_practice.place_field_model import build_2d_spline_basis
 
 
+class EdenBrownJumpSimulation(NamedTuple):
+    """Output of :func:`simulate_eden_brown_2004_jump`."""
+
+    time: np.ndarray
+    position: np.ndarray
+    spike_indicator: np.ndarray
+    dt: float
+    true_params1: np.ndarray
+    true_params2: np.ndarray
+
+
+class EdenBrownLinearSimulation(NamedTuple):
+    """Output of :func:`simulate_eden_brown_2004_linear`."""
+
+    time: np.ndarray
+    position: np.ndarray
+    spike_indicator: np.ndarray
+    dt: float
+    true_params: np.ndarray
+
+
 def receptive_field_model(position: ArrayLike, params: np.ndarray) -> np.ndarray:
     if params.ndim == 1:
         params = params[None]
     log_max_rate, place_field_center, scale = params.T
-    result: np.ndarray = np.exp(log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2))
+    result: np.ndarray = np.exp(
+        log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2)
+    )
     return result
 
 
@@ -35,11 +60,41 @@ def _eden_brown_2004_base(
     return time, position, n_total_steps, true_params1, true_params2
 
 
+def _resolve_rng(
+    rng: np.random.Generator | None, seed: int | None
+) -> np.random.Generator:
+    """The generator to draw from: ``rng`` if given, else one seeded by ``seed``."""
+    if rng is not None:
+        if seed is not None:
+            raise ValueError("Pass either rng or seed, not both.")
+        return rng
+    return np.random.default_rng(seed)
+
+
 def simulate_eden_brown_2004_jump(
     rng: np.random.Generator | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
-    if rng is None:
-        rng = np.random.default_rng()
+    seed: int | None = None,
+) -> EdenBrownJumpSimulation:
+    """Simulate a 1D place cell whose field jumps halfway through the session.
+
+    Eden et al. (2004) setup: 8000 s of back-and-forth runs on a 300 cm track
+    at 125 cm/s, 20 ms bins; the Gaussian receptive field switches from
+    ``true_params1`` to ``true_params2`` at the midpoint.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator or None, optional
+        Generator for the Poisson spike draws.
+    seed : int or None, optional
+        Seed for a fresh generator when ``rng`` is None. With both None
+        (the default) the spikes are nondeterministic (fresh OS entropy);
+        pass ``seed`` (or a seeded ``rng``) for a reproducible realization.
+
+    Returns
+    -------
+    EdenBrownJumpSimulation
+    """
+    rng = _resolve_rng(rng, seed)
     dt = 0.020
     time, position, _, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
 
@@ -48,16 +103,39 @@ def simulate_eden_brown_2004_jump(
     true_rate = np.concatenate((true_rate1, true_rate2))
     spike_indicator = rng.poisson(true_rate * dt)
 
-    return time, position, spike_indicator, dt, true_params1, true_params2
+    return EdenBrownJumpSimulation(
+        time, position, spike_indicator, dt, true_params1, true_params2
+    )
 
 
 def simulate_eden_brown_2004_linear(
     rng: np.random.Generator | None = None,
-):
-    if rng is None:
-        rng = np.random.default_rng()
+    seed: int | None = None,
+) -> EdenBrownLinearSimulation:
+    """Simulate a 1D place cell whose field drifts linearly over the session.
+
+    Same track and timing as :func:`simulate_eden_brown_2004_jump`, with the
+    receptive-field parameters interpolated linearly from ``true_params1`` to
+    ``true_params2``.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator or None, optional
+        Generator for the Poisson spike draws.
+    seed : int or None, optional
+        Seed for a fresh generator when ``rng`` is None. With both None
+        (the default) the spikes are nondeterministic (fresh OS entropy);
+        pass ``seed`` (or a seeded ``rng``) for a reproducible realization.
+
+    Returns
+    -------
+    EdenBrownLinearSimulation
+    """
+    rng = _resolve_rng(rng, seed)
     dt = 0.020
-    time, position, n_total_steps, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
+    time, position, n_total_steps, true_params1, true_params2 = _eden_brown_2004_base(
+        dt=dt
+    )
 
     # Interpolate between true_params1 and true_params2
     true_params = np.linspace(true_params1, true_params2, n_total_steps)
@@ -67,7 +145,7 @@ def simulate_eden_brown_2004_linear(
     )
     spike_indicator = rng.poisson(true_rate * dt)
 
-    return time, position, spike_indicator, dt, true_params
+    return EdenBrownLinearSimulation(time, position, spike_indicator, dt, true_params)
 
 
 def simulate_2d_moving_place_field(
@@ -81,7 +159,7 @@ def simulate_2d_moving_place_field(
     drift_speed: float = 0.02,
     n_interior_knots: int = 5,
     rng: np.random.Generator | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Simulate a neuron with a 2D place field that drifts over time.
 
     The animal runs a lawnmower trajectory in a square arena. The neuron's
@@ -176,9 +254,8 @@ def simulate_2d_moving_place_field(
 
     # --- True firing rate from 2D Gaussian place field + background ---
     dist_sq = np.sum((position - true_center) ** 2, axis=1)
-    true_rate = (
-        background_rate
-        + (peak_rate - background_rate) * np.exp(-dist_sq / (2 * place_field_sigma**2))
+    true_rate = background_rate + (peak_rate - background_rate) * np.exp(
+        -dist_sq / (2 * place_field_sigma**2)
     )
 
     # --- Build design matrix from 2D spline basis ---

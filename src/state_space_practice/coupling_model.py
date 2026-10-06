@@ -16,7 +16,7 @@ two deterministic maps (transition, logit) shared by the simulator and the
 estimators. Requires float64 (the test suite enables ``jax_enable_x64``).
 """
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +71,7 @@ class CouplingModelParams(NamedTuple):
     beta_imag: Array
     baseline: Array
     dt: float
-    history_kernel: Optional[Array] = None
+    history_kernel: Array | None = None
     lfp_noise_var: float = 0.25
 
 
@@ -113,7 +113,7 @@ class SimulatedCoupling(NamedTuple):
 
 def _coupling_x64_enabled() -> bool:
     """Return whether JAX is configured to honor float64 dtypes."""
-    return bool(jax.config.jax_enable_x64)
+    return bool(jax.config.read("jax_enable_x64"))
 
 
 def require_coupling_x64() -> None:
@@ -161,13 +161,9 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
     freq_shape = tuple(np.shape(params.osc_frequencies))
     beta_real_shape = tuple(np.shape(params.beta_real))
     if len(freq_shape) != 1 or freq_shape[0] == 0:
-        raise ValueError(
-            f"osc_frequencies must have shape (J,), got {freq_shape}."
-        )
+        raise ValueError(f"osc_frequencies must have shape (J,), got {freq_shape}.")
     if len(beta_real_shape) != 2 or 0 in beta_real_shape:
-        raise ValueError(
-            f"beta_real must have shape (S, J), got {beta_real_shape}."
-        )
+        raise ValueError(f"beta_real must have shape (S, J), got {beta_real_shape}.")
     n_bands = int(freq_shape[0])
     n_neurons = int(beta_real_shape[0])
     expected_shapes = {
@@ -185,9 +181,8 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
                 f"(S={n_neurons}, J={n_bands})"
             )
         arr_np = np.asarray(arr)
-        if (
-            not np.issubdtype(arr_np.dtype, np.number)
-            or np.issubdtype(arr_np.dtype, np.complexfloating)
+        if not np.issubdtype(arr_np.dtype, np.number) or np.issubdtype(
+            arr_np.dtype, np.complexfloating
         ):
             raise ValueError(f"{name} must be real-valued numeric data.")
         if not np.all(np.isfinite(arr_np)):
@@ -201,20 +196,49 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
         )
     if np.any(np.asarray(params.process_noise_var) < 0.0):
         raise ValueError("process_noise_var must be nonnegative")
-    for name, value in (
-        ("dt", params.dt),
-        ("lfp_noise_var", params.lfp_noise_var),
+    _validate_positive_real_scalar("dt", params.dt)
+    _validate_positive_real_scalar("lfp_noise_var", params.lfp_noise_var)
+
+
+def _validate_positive_real_scalar(
+    name: str,
+    value: ArrayLike,
+    *,
+    type_requirement: str = "a real-valued numeric scalar",
+) -> float:
+    """Validate a finite, positive, real numeric scalar and return it as a float.
+
+    Parameters
+    ----------
+    name : str
+        Argument name used in error messages.
+    value : ArrayLike, shape ()
+        Value to check.
+    type_requirement : str, default "a real-valued numeric scalar"
+        Completes ``"{name} must be ..."`` in the error raised when ``value``
+        is not a real numeric scalar.
+
+    Returns
+    -------
+    float
+
+    Raises
+    ------
+    ValueError
+        If ``value`` is not a real numeric scalar, or is non-finite or
+        non-positive.
+    """
+    value_arr = np.asarray(value)
+    if (
+        value_arr.shape != ()
+        or not np.issubdtype(value_arr.dtype, np.number)
+        or np.issubdtype(value_arr.dtype, np.complexfloating)
     ):
-        value_arr = np.asarray(value)
-        if (
-            value_arr.shape != ()
-            or not np.issubdtype(value_arr.dtype, np.number)
-            or np.issubdtype(value_arr.dtype, np.complexfloating)
-        ):
-            raise ValueError(f"{name} must be a real-valued numeric scalar, got {value}.")
-        value_float = float(value_arr)
-        if not np.isfinite(value_float) or value_float <= 0.0:
-            raise ValueError(f"{name} must be finite and positive, got {value}.")
+        raise ValueError(f"{name} must be {type_requirement}, got {value}.")
+    value_float = float(value_arr)
+    if not np.isfinite(value_float) or value_float <= 0.0:
+        raise ValueError(f"{name} must be finite and positive, got {value}.")
+    return value_float
 
 
 def validate_coupling_observations(

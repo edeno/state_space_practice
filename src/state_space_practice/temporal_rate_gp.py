@@ -20,8 +20,10 @@ Gauss-Newton** smoothing: at each iteration the Poisson likelihood is replaced b
 its local Gaussian (IRLS) site and a linear-Gaussian RTS smoother is run; the
 iteration is repeated to the posterior mode. For a canonical (log) link the
 Poisson observed and expected Hessians coincide, so this is exact Newton on the
-concave log-posterior and converges to the true mode (Rasmussen & Williams,
-2006, ch. 3; Nickisch et al., 2018).
+concave log-posterior (Rasmussen & Williams, 2006, ch. 3; Nickisch et al., 2018).
+Each Newton step is damped by a backtracking (Armijo) line search on the exact
+log-posterior, which makes the iteration globally convergent: an undamped step
+overshoots by tens of nats when the prior mean is far below the data.
 
 Numerical precision
 -------------------
@@ -43,27 +45,81 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
     with Non-Gaussian Likelihood. ICML, PMLR 80:3789-3798.
 """
 
-import operator
-from typing import NamedTuple, Optional
+import warnings
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
+from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import gammaln, ndtri
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.gp_ssm import matern32_continuous, matern32_discretize
 from state_space_practice.kalman import kalman_smoother
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    UNCONSTRAINED,
+    frozen,
+)
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _validate_filter_numerics,
+    contains_tracer,
+    typed_jit,
     validate_count_array,
+    validate_finite_array,
+    validate_int,
     validate_scalar,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 #: Default floor on the Fisher weight ``rate`` to keep the site variance finite
 #: at (near-)zero-rate bins. exp(-20)/dt Hz is far below any real firing rate.
 _DEFAULT_MIN_WEIGHT = 1e-9
+
+
+#: Number of trial step lengths (1, 1/2, ..., 1/2**11) in the Newton line search.
+_N_BACKTRACK = 12
+
+#: Relative slack in the Armijo test, so a converged iteration whose full step
+#: changes the log-posterior only by round-off still takes the full step.
+_MERIT_RTOL = 1e-10
+
+
+def _prior_whitened_residuals(
+    states: Array,
+    transition: Array,
+    stationary_chol: Array,
+    process_chol: Array,
+) -> Array:
+    r"""Whitened innovations of a state trajectory under the Markov prior.
+
+    For ``x_1 ~ N(0, Pinf)`` and ``x_t = A x_{t-1} + w_t``, ``w_t ~ N(0, Q)``,
+    returns ``[L_P^{-1} x_1, L_Q^{-1}(x_2 - A x_1), ...]`` flattened, so the prior
+    quadratic form ``x^T Sigma_x^{-1} x`` is the sum of squares of the result.
+
+    Parameters
+    ----------
+    states : Array, shape (n_time, n_state)
+    transition : Array, shape (n_state, n_state)
+    stationary_chol, process_chol : Array, shape (n_state, n_state)
+        Lower Cholesky factors of ``Pinf`` and ``Q``.
+
+    Returns
+    -------
+    Array, shape (n_time * n_state,)
+    """
+    first = solve_triangular(stationary_chol, states[0], lower=True)
+    innovations = states[1:] - states[:-1] @ transition.T
+    rest = solve_triangular(process_chol, innovations.T, lower=True)
+    return jnp.concatenate([first, rest.T.reshape(-1)])
 
 
 class LaplaceRateResult(NamedTuple):
@@ -80,12 +136,62 @@ class LaplaceRateResult(NamedTuple):
     max_abs_update : Array, shape ()
         Infinity-norm of the final Newton update to ``g`` (a convergence
         diagnostic; small means the iteration reached the mode).
+    n_nonfinite_merit : Array, shape ()
+        Newton iterations whose log-posterior merit was not finite, so the
+        line search could not run and the full undamped step was taken (int32).
+    n_unaccepted_steps : Array, shape ()
+        Newton iterations in which no trial step length satisfied the Armijo
+        condition, so the smallest trial step was taken although it does not
+        increase the log-posterior sufficiently (int32).
     """
 
     log_rate_mean: Array
     log_rate_var: Array
     log_marginal_likelihood: Array
     max_abs_update: Array
+    n_nonfinite_merit: Array
+    n_unaccepted_steps: Array
+
+
+def _warn_laplace_diagnostics(result: LaplaceRateResult, name: str) -> None:
+    """Warn (host side) about non-convergence or line-search fallbacks.
+
+    The mode counts as converged when the final Newton update satisfies
+    ``max_abs_update <= sqrt(eps) * (1 + max|log_rate_mean|)``: Newton
+    converges quadratically near the mode, so a converged iteration's last
+    update is at round-off level, far below this. Skipped under tracing (e.g.
+    inside an SGD loss); the fitted model's final :func:`infer_log_rate` call
+    reports instead. Handles single-train and batched (``(n_neurons,)``
+    diagnostic) results.
+    """
+    if contains_tracer(result):
+        return
+    max_abs_update = np.atleast_1d(np.asarray(result.max_abs_update))
+    log_rate_mean = np.asarray(result.log_rate_mean).reshape(max_abs_update.size, -1)
+    eps = np.finfo(log_rate_mean.dtype).eps
+    tolerance = np.sqrt(eps) * (1.0 + np.max(np.abs(log_rate_mean), axis=1))
+    not_converged = ~(max_abs_update <= tolerance)
+    if np.any(not_converged):
+        warnings.warn(
+            f"{name}: the Laplace Newton iteration did not reach the posterior "
+            f"mode for {int(np.sum(not_converged))}/{max_abs_update.size} spike "
+            f"train(s) (largest final update {float(np.max(max_abs_update)):.3g}); "
+            "the mode, variance and evidence are unconverged. Increase n_iter.",
+            StateSpaceWarning,
+            stacklevel=3,
+        )
+    n_nonfinite = int(np.sum(np.asarray(result.n_nonfinite_merit)))
+    n_unaccepted = int(np.sum(np.asarray(result.n_unaccepted_steps)))
+    if n_nonfinite > 0 or n_unaccepted > 0:
+        warnings.warn(
+            f"{name}: the Newton line search fell back in {n_nonfinite} "
+            "iteration(s) with a non-finite log-posterior (full undamped step "
+            f"taken) and in {n_unaccepted} iteration(s) where no step length "
+            "passed the Armijo test (smallest trial step taken). Check the "
+            "hyperparameters (very small dt or lengthscale) and enable float64.",
+            StateSpaceWarning,
+            stacklevel=3,
+        )
 
 
 def poisson_log_rate_site(
@@ -123,7 +229,7 @@ def poisson_log_rate_site(
     expected_count : Array, shape (n_time,)
         ``W = exp(g + offset)``, the expected count per bin.
     """
-    if not isinstance(min_weight, jax.core.Tracer):
+    if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
     latent = jnp.asarray(latent)
     counts = jnp.asarray(counts)
@@ -132,6 +238,160 @@ def poisson_log_rate_site(
     working_response = latent + (counts - expected_count) / weight
     site_variance = 1.0 / weight
     return working_response, site_variance, expected_count
+
+
+def _make_newton_target(
+    counts: Array,
+    offset: ArrayLike,
+    transition: Array,
+    process_cov: Array,
+    stationary_cov: Array,
+    measurement_matrix: Array,
+    min_weight: float,
+) -> Callable[[Array], Array]:
+    """Full (undamped) IRLS Newton target: the smoother mean of the sites at ``g``.
+
+    Parameters are as in :func:`_make_newton_step`.
+
+    Returns
+    -------
+    Callable
+        ``target(g) -> states`` with ``g`` of shape ``(n_time,)`` and states
+        of shape ``(n_time, 2)``.
+    """
+    init_mean = jnp.zeros(2)
+
+    def _newton_target(g: Array) -> Array:
+        working_response, site_variance, _ = poisson_log_rate_site(
+            g, counts, offset, min_weight
+        )
+        smoother_mean, _cov, _cross, _ll = kalman_smoother(
+            init_mean,
+            stationary_cov,
+            working_response[:, None],
+            transition,
+            process_cov,
+            measurement_matrix,
+            site_variance[:, None, None],
+            validate_inputs=False,
+        )
+        return smoother_mean
+
+    return _newton_target
+
+
+def _make_newton_step(
+    counts: Array,
+    offset: ArrayLike,
+    transition: Array,
+    process_cov: Array,
+    stationary_cov: Array,
+    measurement_matrix: Array,
+    min_weight: float,
+) -> Callable[[Array, None], tuple[Array, tuple[Array, Array, Array]]]:
+    """One line-searched Newton step on the Laplace log-posterior, as a scan body.
+
+    Parameters
+    ----------
+    counts : Array, shape (n_time,)
+    offset : ArrayLike, shape ()
+        ``mean + log(dt)``.
+    transition, process_cov, stationary_cov : Array, shape (2, 2)
+        Matern-3/2 state-space prior.
+    measurement_matrix : Array, shape (1, 2)
+    min_weight : float
+        Fisher-weight floor; see :func:`poisson_log_rate_site`.
+
+    Returns
+    -------
+    Callable
+        ``step(states, None) -> (new_states, (max_abs_update, merit_nonfinite,
+        unaccepted))`` with ``states`` of shape ``(n_time, 2)``.
+    """
+    _newton_target = _make_newton_target(
+        counts,
+        offset,
+        transition,
+        process_cov,
+        stationary_cov,
+        measurement_matrix,
+        min_weight,
+    )
+    backtrack_steps = 0.5 ** jnp.arange(float(_N_BACKTRACK))  # largest first
+    # Whitening factors of the Markov prior, for the log-posterior merit
+    # function of the line search (see _prior_whitened_residuals).
+    stationary_chol = jnp.linalg.cholesky(stationary_cov)
+    process_chol = jnp.linalg.cholesky(process_cov)
+
+    def _whiten(states: Array) -> Array:
+        return _prior_whitened_residuals(
+            states, transition, stationary_chol, process_chol
+        )
+
+    def _newton_step(
+        states: Array, _: None
+    ) -> tuple[Array, tuple[Array, Array, Array]]:
+        # Full Newton step: the smoother mean of the current IRLS sites.
+        #
+        # A pure Newton step on this concave posterior can overshoot by tens
+        # of nats when the prior mean is far below the data (tiny Fisher
+        # weights at g = 0 give a nearly flat quadratic model), after which
+        # the iteration crawls back ~1 nat per step and a fixed-length scan
+        # returns an unconverged mode and a wildly wrong evidence. So the step
+        # is damped by backtracking (Armijo) on the exact log-posterior.
+        #
+        # The merit function needs g^T K^-1 g, which the state space gives
+        # without K: the smoother mean is the prior-conditional mean of the
+        # full state given its value component, x = x*(g), so
+        # g^T K^-1 g = x^T Sigma_x^-1 x (the Markov-prior quadratic form).
+        # x*(.) is linear, so every point on the segment between the current
+        # state and the Newton target is again of the form x*(g).
+        target = _newton_target(states[:, 0])
+        direction = target - states
+        g, g_direction = states[:, 0], direction[:, 0]
+        # log-posterior along the segment, psi(a) = log p(y | g + a dg)
+        #   - 0.5 |w_x + a w_d|^2, with w the whitened prior innovations; the
+        # prior term is a scalar quadratic in a, so every trial step costs
+        # one exp over the sequence.
+        white_states = _whiten(states)
+        white_direction = _whiten(direction)
+        q_xx = jnp.sum(white_states**2)
+        q_xd = jnp.sum(white_states * white_direction)
+        q_dd = jnp.sum(white_direction**2)
+        trial_latent = g[None, :] + backtrack_steps[:, None] * g_direction[None, :]
+        trial_log_lik = jnp.sum(
+            counts * (trial_latent + offset) - jnp.exp(trial_latent + offset), axis=1
+        )
+        psi_trial = trial_log_lik - 0.5 * (
+            q_xx + 2.0 * backtrack_steps * q_xd + backtrack_steps**2 * q_dd
+        )
+        psi_current = jnp.sum(counts * (g + offset) - jnp.exp(g + offset)) - 0.5 * q_xx
+        slope = jnp.sum((counts - jnp.exp(g + offset)) * g_direction) - q_xd
+        tolerance = _MERIT_RTOL * (1.0 + jnp.abs(psi_current))
+        accept = psi_trial >= psi_current + 1e-4 * backtrack_steps * slope - tolerance
+        # Largest accepted step; the smallest trial step if none is accepted.
+        # If the merit itself is not finite (e.g. a Cholesky factor of Q lost
+        # to float32 round-off at tiny dt) fall back to the full Newton step.
+        # Both fallbacks are counted and reported by the public entry points.
+        merit_finite = jnp.isfinite(psi_current)
+        any_accepted = jnp.any(accept)
+        index = jnp.where(
+            merit_finite,
+            jnp.where(any_accepted, jnp.argmax(accept), _N_BACKTRACK - 1),
+            0,
+        )
+        # The step length is a discrete choice: keep it out of the gradient
+        # (at the mode the full step is always taken, so the derivative of
+        # the final step is the fixed-point derivative of the mode).
+        step = jax.lax.stop_gradient(backtrack_steps[index])
+        new_states = states + step * direction
+        return new_states, (
+            jnp.max(jnp.abs(new_states[:, 0] - g)),
+            ~merit_finite,
+            merit_finite & ~any_accepted,
+        )
+
+    return _newton_step
 
 
 def _infer_log_rate_traced(
@@ -147,6 +407,18 @@ def _infer_log_rate_traced(
 
     Does no host-side validation, so hyperparameters may be tracers. The public
     :func:`infer_log_rate` validates concrete inputs before delegating here.
+
+    Gradients are implicit (fixed-point) derivatives: all ``n_iter`` Newton
+    steps run on gradient-stopped hyperparameters, and the mode's derivative
+    comes from one *exact* Newton step taken at the converged mode. The
+    iteration floors the Fisher weights at ``min_weight``, which makes it
+    quasi-Newton where the floor binds; it still converges to the true mode,
+    but its update map then has a nonzero Jacobian in ``g`` there, so its own
+    derivative would be wrong. The exact (unfloored) Newton map has zero
+    Jacobian in ``g`` at the mode, so its hyperparameter derivative is
+    ``dg*/dtheta`` (implicit function theorem). Its value enters only as a
+    zero-valued straight-through term, so forward outputs are those of the
+    floored iteration, and no per-iteration residuals are kept.
     """
     offset = mean + jnp.log(dt)
     _F, _L, _Qc, measurement_vector, stationary_cov = matern32_continuous(
@@ -159,28 +431,33 @@ def _infer_log_rate_traced(
     init_mean = jnp.zeros(2)
     n_time = counts.shape[0]
 
-    def _smooth_at(g: Array) -> tuple[Array, Array, Array]:
-        working_response, site_variance, _ = poisson_log_rate_site(
-            g, counts, offset, min_weight
-        )
-        smoother_mean, smoother_cov, _cross, marginal_ll = kalman_smoother(
-            init_mean,
-            stationary_cov,
-            working_response[:, None],
-            transition,
-            process_cov,
-            measurement_matrix,
-            site_variance[:, None, None],
-            validate_inputs=False,
-        )
-        return smoother_mean[:, 0], smoother_cov[:, 0, 0], marginal_ll
-
-    def _newton_step(g: Array, _: None) -> tuple[Array, Array]:
-        g_new, _var, _ll = _smooth_at(g)
-        return g_new, jnp.max(jnp.abs(g_new - g))
-
-    g_mode, updates = jax.lax.scan(_newton_step, jnp.zeros(n_time), None, length=n_iter)
-    max_abs_update = updates[-1]
+    # Run the Newton iteration on gradient-stopped hyperparameters.
+    stopped_prior = jax.lax.stop_gradient(
+        (offset, transition, process_cov, stationary_cov, measurement_matrix)
+    )
+    newton_step = _make_newton_step(counts, *stopped_prior, min_weight)
+    warm_states, (_warm_updates, warm_nonfinite, warm_unaccepted) = jax.lax.scan(
+        newton_step, jnp.zeros((n_time, 2)), None, length=n_iter - 1
+    )
+    states_last, (max_abs_update, last_nonfinite, last_unaccepted) = newton_step(
+        warm_states, None
+    )
+    # Derivative of the mode: one exact Newton step at it. Its weights are
+    # floored only at eps**2, far below any prior precision, so the step is
+    # exact to round-off yet its sites stay finite when a rate underflows.
+    exact_target = _make_newton_target(
+        counts,
+        offset,
+        transition,
+        process_cov,
+        stationary_cov,
+        measurement_matrix,
+        float(jnp.finfo(jnp.result_type(offset)).eps) ** 2,
+    )(states_last[:, 0])
+    states_mode = states_last + (exact_target - jax.lax.stop_gradient(exact_target))
+    g_mode = states_mode[:, 0]
+    nonfinite_merit = jnp.append(warm_nonfinite, last_nonfinite)
+    unaccepted = jnp.append(warm_unaccepted, last_unaccepted)
 
     # Evaluate the Laplace evidence at the converged mode. The Kalman filter's
     # marginal likelihood of the mode's Gaussian sites, corrected by (true
@@ -218,7 +495,15 @@ def _infer_log_rate_traced(
         log_rate_var=log_rate_var,
         log_marginal_likelihood=log_marginal_likelihood,
         max_abs_update=max_abs_update,
+        n_nonfinite_merit=jnp.sum(nonfinite_merit, dtype=jnp.int32),
+        n_unaccepted_steps=jnp.sum(unaccepted, dtype=jnp.int32),
     )
+
+
+#: Compiled :func:`_infer_log_rate_traced` (``n_iter`` static) for the eager
+#: entry points: data and hyperparameters are arguments, so a repeat call with
+#: same-shaped inputs reuses the program instead of re-tracing the scan.
+_infer_log_rate_jit = typed_jit(_infer_log_rate_traced, static_argnames="n_iter")
 
 
 def infer_log_rate(
@@ -250,9 +535,9 @@ def infer_log_rate(
     mean : ArrayLike, default 0.0
         Baseline log-rate ``mu``; the prior mean of ``f = mu + g``.
     n_iter : int, default 25
-        Number of Newton iterations. The iteration is a fixed-length scan so the
-        evidence stays differentiable for hyperparameter learning; the concave
-        Poisson-GP posterior converges quadratically, so the default is ample and
+        Number of Newton iterations, run as a fixed-length scan. Steps are
+        damped by a backtracking line search, so the iteration converges from
+        any start (typically in < 10 steps, quadratically near the mode) and
         extra steps are stable no-ops. ``max_abs_update`` reports convergence.
     min_weight : float
         Floor on the Fisher weight; see :func:`poisson_log_rate_site`.
@@ -260,7 +545,15 @@ def infer_log_rate(
     Returns
     -------
     LaplaceRateResult
-        Posterior mode, variance, log-evidence, and convergence diagnostic.
+        Posterior mode, variance, log-evidence, and convergence diagnostics.
+
+    Warns
+    -----
+    StateSpaceWarning
+        With concrete inputs, when the iteration did not reach the mode (see
+        :func:`_warn_laplace_diagnostics`) or a Newton step fell back because
+        the log-posterior merit was non-finite or no step length passed the
+        Armijo test.
 
     Notes
     -----
@@ -268,18 +561,19 @@ def infer_log_rate(
     validation of those is skipped when they are tracers), so
     ``jax.grad(lambda th: infer_log_rate(..., *th).log_marginal_likelihood)``
     gives the marginal-likelihood gradient used by
-    :class:`TemporalRateGP.fit_sgd`.
+    :class:`TemporalRateGP.fit_sgd`. The gradient is the implicit derivative
+    at the mode: only the final Newton step is differentiated, so its memory
+    does not grow with ``n_iter``. It is exact once the iteration has
+    converged (see ``max_abs_update``).
+
+    The inference is compiled once per input shape and ``n_iter``; repeat
+    calls with new data or hyperparameter values of the same shapes reuse it.
     """
     counts = jnp.asarray(counts)
     if counts.ndim != 1:
         raise ValueError(f"counts must be 1D (n_time,), got shape {counts.shape}.")
     validate_count_array(counts, "counts", allow_empty=False)
-    try:
-        n_iter = operator.index(n_iter)
-    except TypeError as exc:
-        raise ValueError("n_iter must be a positive integer.") from exc
-    if n_iter <= 0:
-        raise ValueError("n_iter must be a positive integer.")
+    n_iter = validate_int(n_iter, "n_iter", positive=True)
     # Validate scalar hyperparameters only when concrete: under jax.grad they
     # arrive as tracers, and host-side float() checks would break tracing. The
     # model layer constrains them positive via parameter_transforms.
@@ -288,16 +582,18 @@ def infer_log_rate(
         (variance, "variance"),
         (lengthscale, "lengthscale"),
     ):
-        if not isinstance(value, jax.core.Tracer):
+        if not contains_tracer(value):
             validate_scalar(value, name, positive=True)
-    if not isinstance(mean, jax.core.Tracer):
+    if not contains_tracer(mean):
         validate_scalar(mean, "mean")
-    if not isinstance(min_weight, jax.core.Tracer):
+    if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    return _infer_log_rate_traced(
+    result = _infer_log_rate_jit(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
+    _warn_laplace_diagnostics(result, "infer_log_rate")
+    return result
 
 
 def _infer_log_rate_batch_traced(
@@ -321,6 +617,12 @@ def _infer_log_rate_batch_traced(
     return jax.vmap(_one)(counts, variance, lengthscale, mean)
 
 
+#: Compiled :func:`_infer_log_rate_batch_traced`; see ``_infer_log_rate_jit``.
+_infer_log_rate_batch_jit = typed_jit(
+    _infer_log_rate_batch_traced, static_argnames="n_iter"
+)
+
+
 def _broadcast_hyperparameter(
     value: ArrayLike,
     n_neurons: int,
@@ -333,7 +635,7 @@ def _broadcast_hyperparameter(
     (under ``jax.grad``) pass through unchecked, matching :func:`infer_log_rate`.
     """
     array = jnp.asarray(value)
-    if not isinstance(value, jax.core.Tracer):
+    if not contains_tracer(value):
         if array.ndim == 0:
             validate_scalar(value, name, positive=positive)
         elif array.ndim == 1:
@@ -342,8 +644,7 @@ def _broadcast_hyperparameter(
                     f"{name} must be a scalar or have length n_neurons="
                     f"{n_neurons}; got shape {array.shape}."
                 )
-            if not bool(jnp.all(jnp.isfinite(array))):
-                raise ValueError(f"{name} must contain only finite values.")
+            validate_finite_array(name, array)
             if positive and not bool(jnp.all(array > 0.0)):
                 raise ValueError(f"{name} must be strictly positive.")
         else:
@@ -388,8 +689,13 @@ def infer_log_rate_batch(
     -------
     LaplaceRateResult
         Batched fields: ``log_rate_mean`` / ``log_rate_var`` of shape
-        ``(n_neurons, n_time)``, and ``log_marginal_likelihood`` /
-        ``max_abs_update`` of shape ``(n_neurons,)``.
+        ``(n_neurons, n_time)``, and ``log_marginal_likelihood``,
+        ``max_abs_update`` and the fallback counts of shape ``(n_neurons,)``.
+
+    Warns
+    -----
+    StateSpaceWarning
+        As :func:`infer_log_rate`, aggregated over neurons.
     """
     counts = jnp.asarray(counts)
     if counts.ndim != 2:
@@ -397,27 +703,24 @@ def infer_log_rate_batch(
             f"counts must be 2D (n_neurons, n_time), got shape {counts.shape}."
         )
     validate_count_array(counts, "counts", allow_empty=False)
-    try:
-        n_iter = operator.index(n_iter)
-    except TypeError as exc:
-        raise ValueError("n_iter must be a positive integer.") from exc
-    if n_iter <= 0:
-        raise ValueError("n_iter must be a positive integer.")
+    n_iter = validate_int(n_iter, "n_iter", positive=True)
 
     n_neurons = counts.shape[0]
-    if not isinstance(dt, jax.core.Tracer):
+    if not contains_tracer(dt):
         validate_scalar(dt, "dt", positive=True)
     variance = _broadcast_hyperparameter(variance, n_neurons, "variance", positive=True)
     lengthscale = _broadcast_hyperparameter(
         lengthscale, n_neurons, "lengthscale", positive=True
     )
     mean = _broadcast_hyperparameter(mean, n_neurons, "mean", positive=False)
-    if not isinstance(min_weight, jax.core.Tracer):
+    if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    return _infer_log_rate_batch_traced(
+    result = _infer_log_rate_batch_jit(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
+    _warn_laplace_diagnostics(result, "infer_log_rate_batch")
+    return result
 
 
 class TemporalRateGP(SGDFittableMixin):
@@ -458,7 +761,18 @@ class TemporalRateGP(SGDFittableMixin):
         Laplace log-evidence at the fitted hyperparameters.
     log_likelihood_history_ : list of float
         Log-evidence at each SGD step (from the mixin).
+
+    The fitted attributes raise ``NotFittedError`` until :meth:`fit_sgd` sets
+    them.
     """
+
+    # Posterior, set by fit_sgd.
+    log_rate_mean_: FittedAttribute[Array] = FittedAttribute()
+    log_rate_var_: FittedAttribute[Array] = FittedAttribute()
+    log_marginal_likelihood_: FittedAttribute[float] = FittedAttribute()
+
+    # The posterior above, cleared when a fit fails.
+    _fit_output_attrs = ("log_rate_mean_", "log_rate_var_", "log_marginal_likelihood_")
 
     def __init__(
         self,
@@ -474,29 +788,25 @@ class TemporalRateGP(SGDFittableMixin):
         min_weight: float = _DEFAULT_MIN_WEIGHT,
     ) -> None:
         self.dt = validate_scalar(dt, "dt", positive=True)
-        self.variance = validate_scalar(variance, "variance", positive=True)
-        self.lengthscale = validate_scalar(lengthscale, "lengthscale", positive=True)
-        self.mean = validate_scalar(mean, "mean")
-        try:
-            self.n_iter = operator.index(n_iter)
-        except TypeError as exc:
-            raise ValueError("n_iter must be a positive integer.") from exc
-        if self.n_iter <= 0:
-            raise ValueError("n_iter must be a positive integer.")
+        # Scalars for one neuron; per-neuron vectors after fitting several.
+        self.variance: float | Array = validate_scalar(
+            variance, "variance", positive=True
+        )
+        self.lengthscale: float | Array = validate_scalar(
+            lengthscale, "lengthscale", positive=True
+        )
+        self.mean: float | Array = validate_scalar(mean, "mean")
+        self.n_iter = validate_int(n_iter, "n_iter", positive=True)
         self.update_variance = bool(update_variance)
         self.update_lengthscale = bool(update_lengthscale)
         self.update_mean = bool(update_mean)
         self.share_hyperparameters = bool(share_hyperparameters)
         self.min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-        # Data and posterior, populated by fit_sgd. _n_neurons is 1 for a 1D
+        # Data shape, populated by fit_sgd. _n_neurons is 1 for a 1D
         # (single-train) fit and n_neurons for a 2D (n_neurons, n_time) fit.
-        self._counts: Optional[Array] = None
         self._n_neurons: int = 1
         self._sgd_n_time: int = 0
-        self.log_rate_mean_: Optional[Array] = None
-        self.log_rate_var_: Optional[Array] = None
-        self.log_marginal_likelihood_: Optional[float] = None
 
     def __repr__(self) -> str:
         return (
@@ -523,14 +833,14 @@ class TemporalRateGP(SGDFittableMixin):
 
     # -- public fitting / prediction ------------------------------------------
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         counts: ArrayLike,
         *,
         num_steps: int = 200,
-        optimizer: Optional[object] = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Learn hyperparameters by maximizing the Laplace log-evidence.
 
@@ -550,39 +860,6 @@ class TemporalRateGP(SGDFittableMixin):
         list of float
             Log-evidence (summed over neurons) at each optimization step.
         """
-        counts = jnp.asarray(counts)
-        if counts.ndim == 1:
-            n_neurons, n_time = 1, int(counts.shape[0])
-        elif counts.ndim == 2:
-            n_neurons, n_time = int(counts.shape[0]), int(counts.shape[1])
-        else:
-            raise ValueError(
-                "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
-                f"shape {counts.shape}."
-            )
-        validate_count_array(counts, "counts", allow_empty=False)
-        self._counts = counts
-        self._n_neurons = n_neurons
-        # Total observation count normalizes the mixin's loss so the learning
-        # rate scale is comparable across single- and multi-neuron fits.
-        self._sgd_n_time = n_time * n_neurons
-
-        # Numerical-precision guard: the Laplace-EKF smoother needs float64 for
-        # long sequences. Validate the stationary prior once (also warns on
-        # f32 + long T), matching the other filter entry points. A representative
-        # scalar hyperparameter suffices for the per-neuron case.
-        representative_variance = float(jnp.mean(jnp.asarray(self.variance)))
-        representative_lengthscale = float(jnp.mean(jnp.asarray(self.lengthscale)))
-        _, _, _, _, stationary_cov = matern32_continuous(
-            representative_variance, representative_lengthscale
-        )
-        _validate_filter_numerics(
-            stationary_cov,
-            n_time=n_time,
-            stacklevel=3,
-            filter_name="TemporalRateGP.fit_sgd",
-        )
-
         return super().fit_sgd(
             counts,
             num_steps=num_steps,
@@ -592,13 +869,12 @@ class TemporalRateGP(SGDFittableMixin):
         )
 
     def _check_fitted(self) -> None:
-        if self.log_rate_mean_ is None:
-            raise RuntimeError("Model is not fitted. Call fit_sgd(counts) first.")
+        if not is_set(self, "log_rate_mean_"):
+            raise NotFittedError("Model is not fitted. Call fit_sgd(counts) first.")
 
     def predict_log_rate(self) -> tuple[Array, Array]:
         """Posterior mode and variance of the log-rate ``f`` (after fitting)."""
         self._check_fitted()
-        assert self.log_rate_mean_ is not None and self.log_rate_var_ is not None
         return self.log_rate_mean_, self.log_rate_var_
 
     def predict_rate(self) -> Array:
@@ -609,7 +885,6 @@ class TemporalRateGP(SGDFittableMixin):
         ``exp(f_mean)``.
         """
         self._check_fitted()
-        assert self.log_rate_mean_ is not None and self.log_rate_var_ is not None
         return jnp.exp(self.log_rate_mean_ + 0.5 * self.log_rate_var_)
 
     def credible_interval(self, level: float = 0.95) -> tuple[Array, Array]:
@@ -628,7 +903,6 @@ class TemporalRateGP(SGDFittableMixin):
         if not 0.0 < level < 1.0:
             raise ValueError(f"level must be in (0, 1), got {level}.")
         self._check_fitted()
-        assert self.log_rate_mean_ is not None and self.log_rate_var_ is not None
         z = ndtri(0.5 * (1.0 + level))
         sd = jnp.sqrt(self.log_rate_var_)
         lower = jnp.exp(self.log_rate_mean_ - z * sd)
@@ -641,36 +915,70 @@ class TemporalRateGP(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
 
-    def _check_sgd_initialized(self) -> None:
-        if self._counts is None:
-            raise RuntimeError(
-                "No data. Call fit_sgd(counts), not SGDFittableMixin.fit_sgd() "
-                "directly."
-            )
+    def _prepare_sgd_data(
+        self, counts: ArrayLike
+    ) -> tuple[tuple[Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` counts and record their shape.
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            UNCONSTRAINED,
-            frozen,
+        Runs after ``fit_sgd`` has validated its settings, so a call rejected
+        for its settings or data leaves the model untouched.
+        """
+        counts = jnp.asarray(counts)
+        if counts.ndim == 1:
+            n_neurons, n_time = 1, int(counts.shape[0])
+        elif counts.ndim == 2:
+            n_neurons, n_time = int(counts.shape[0]), int(counts.shape[1])
+        else:
+            raise ValueError(
+                "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
+                f"shape {counts.shape}."
+            )
+        validate_count_array(counts, "counts", allow_empty=False)
+
+        # Numerical-precision guard: the Laplace-EKF smoother needs float64 for
+        # long sequences. Validate the stationary prior once (also warns on
+        # f32 + long T), matching the other filter entry points. A representative
+        # scalar hyperparameter suffices for the per-neuron case. stacklevel=5:
+        # user -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook.
+        representative_variance = float(jnp.mean(jnp.asarray(self.variance)))
+        representative_lengthscale = float(jnp.mean(jnp.asarray(self.lengthscale)))
+        _, _, _, _, stationary_cov = matern32_continuous(
+            representative_variance, representative_lengthscale
+        )
+        _validate_filter_numerics(
+            stationary_cov,
+            n_time=n_time,
+            stacklevel=5,
+            filter_name="TemporalRateGP.fit_sgd",
         )
 
+        self._n_neurons = n_neurons
+        # Total observation count normalizes the mixin's loss so the learning
+        # rate scale is comparable across single- and multi-neuron fits.
+        self._sgd_n_time = n_time * n_neurons
+        return (counts,), {}
+
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         n_neurons = self._n_neurons
+        # An explicit dtype keeps Python-float hyperparameters from becoming
+        # weak-typed leaves: the optimizer's first update returns them strong,
+        # which would re-trace the compiled SGD step on the second step.
+        variance = jnp.asarray(self.variance, dtype=float)
+        lengthscale = jnp.asarray(self.lengthscale, dtype=float)
+        mean = jnp.asarray(self.mean, dtype=float)
         # Shared variance/lengthscale stay scalar; per-neuron ones become
         # (n_neurons,) vectors. The baseline mean is always per-neuron for a
         # multi-neuron fit so each cell keeps its own firing level.
         if n_neurons == 1 or self.share_hyperparameters:
-            variance_init = jnp.asarray(self.variance)
-            lengthscale_init = jnp.asarray(self.lengthscale)
+            variance_init = variance
+            lengthscale_init = lengthscale
         else:
-            variance_init = jnp.broadcast_to(jnp.asarray(self.variance), (n_neurons,))
-            lengthscale_init = jnp.broadcast_to(
-                jnp.asarray(self.lengthscale), (n_neurons,)
-            )
+            variance_init = jnp.broadcast_to(variance, (n_neurons,))
+            lengthscale_init = jnp.broadcast_to(lengthscale, (n_neurons,))
         if n_neurons == 1:
-            mean_init = jnp.asarray(self.mean)
+            mean_init = mean
         else:
-            mean_init = jnp.broadcast_to(jnp.asarray(self.mean), (n_neurons,))
+            mean_init = jnp.broadcast_to(mean, (n_neurons,))
 
         params = {
             "variance": variance_init,
@@ -684,7 +992,7 @@ class TemporalRateGP(SGDFittableMixin):
         }
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, counts: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, counts: Array) -> Array:
         if self._n_neurons == 1:
             result = _infer_log_rate_traced(
                 counts,
@@ -709,7 +1017,7 @@ class TemporalRateGP(SGDFittableMixin):
         )
         return -jnp.sum(result.log_marginal_likelihood)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if self._n_neurons == 1:
             self.variance = float(params["variance"])
             self.lengthscale = float(params["lengthscale"])
@@ -720,7 +1028,7 @@ class TemporalRateGP(SGDFittableMixin):
             self.lengthscale = params["lengthscale"]
             self.mean = params["mean"]
 
-    def _finalize_sgd(self, counts: Array) -> None:
+    def _finalize_sgd(self, counts: Array) -> float:
         if self._n_neurons == 1:
             result = infer_log_rate(
                 counts,
@@ -742,6 +1050,9 @@ class TemporalRateGP(SGDFittableMixin):
                 n_iter=self.n_iter,
                 min_weight=self.min_weight,
             )
-            self.log_marginal_likelihood_ = float(jnp.sum(result.log_marginal_likelihood))
+            self.log_marginal_likelihood_ = float(
+                jnp.sum(result.log_marginal_likelihood)
+            )
         self.log_rate_mean_ = result.log_rate_mean
         self.log_rate_var_ = result.log_rate_var
+        return self.log_marginal_likelihood_

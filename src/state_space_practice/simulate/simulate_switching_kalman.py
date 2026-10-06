@@ -1,10 +1,44 @@
+from typing import Any
+
 import numpy as np
 import scipy
+from numpy.typing import ArrayLike, NDArray
 
-np.random.seed(0)
 
+def simdata_settings(
+    init_seed: int | None = 0,
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    NDArray[np.int_],
+    NDArray[np.float64],
+    NDArray[np.int_],
+    int,
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    int,
+]:
+    """Parameters of the three-state switching oscillator simulation.
 
-def simdata_settings():
+    Parameters
+    ----------
+    init_seed : int or None, default=0
+        Seed for the random initial oscillatory state ``X0``. ``None`` draws
+        fresh OS entropy (a different ``X0`` on every call). The global
+        NumPy random state is neither read nor modified.
+
+    Returns
+    -------
+    tuple
+        ``(fs, k, n, M, osc_freqs, rhos, var_state_nois, var_obs_noi, A, Q,
+        R, B, Z, X0, S0)``; see :func:`simulate_model`.
+    """
     # Define the dimensions of the input data
     k = 2  # # of oscillators
     n = 4  # # of electrodes
@@ -29,17 +63,28 @@ def simdata_settings():
     R = build_R(n, M, var_obs_noi)  # Observation noise covariance
 
     B = np.zeros((n, x_dim, M))  # Observation matrix
-    B[:, :, 0] = [[0.4, 0, 0, 0], [0, 0, 0.4, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
-    B[:, :, 1] = [[0.3, 0, 0, 0], [0, 0.3, 0, 0], [0, 0, 0.25, 0], [0, 0, 0, -0.25]]
-    B[:, :, 2] = [[0.5, 0, 0, 0], [-0.5, 0, 0, 0], [0.5, 0, 0, 0], [0, 0, 0.4, 0]]
+    B[:, :, 0] = np.asarray(
+        [[0.4, 0, 0, 0], [0, 0, 0.4, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=float
+    )
+    B[:, :, 1] = np.asarray(
+        [[0.3, 0, 0, 0], [0, 0.3, 0, 0], [0, 0, 0.25, 0], [0, 0, 0, -0.25]], dtype=float
+    )
+    B[:, :, 2] = np.asarray(
+        [[0.5, 0, 0, 0], [-0.5, 0, 0, 0], [0.5, 0, 0, 0], [0, 0, 0.4, 0]], dtype=float
+    )
 
     Z = np.asarray(
         [[0.998, 0.001, 0.001], [0.001, 0.998, 0.001], [0.001, 0.001, 0.998]]
     )  # Discrete state transition matrix
 
-    X0 = np.random.multivariate_normal(
-        np.zeros(x_dim), np.eye(x_dim)
-    ).T  # Initial oscillatory state
+    # Initial oscillatory state. A seeded RandomState (rather than a
+    # Generator) keeps the default X0 equal to the value the module used to
+    # draw after reseeding the global RNG with 0 at import time.
+    X0 = (
+        np.random.RandomState(init_seed)
+        .multivariate_normal(np.zeros(x_dim), np.eye(x_dim))
+        .T
+    )
     S0 = 0  # Initial discrete state
 
     return (
@@ -61,7 +106,13 @@ def simdata_settings():
     )
 
 
-def build_AQ(M, fs, osc_freqs, rhos, var_state_nois):
+def build_AQ(
+    M: int,
+    fs: float,
+    osc_freqs: NDArray[np.number],
+    rhos: NDArray[np.number],
+    var_state_nois: NDArray[np.number],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
 
     k = len(osc_freqs)
     assert len(rhos) == k
@@ -88,14 +139,25 @@ def build_AQ(M, fs, osc_freqs, rhos, var_state_nois):
     return A, Q
 
 
-def build_R(n, M, var_obs_noi):
+def build_R(n: int, M: int, var_obs_noi: float) -> NDArray[np.float64]:
     R = np.zeros((n, n, M))
     for i in range(M):
         R[:, :, i] = var_obs_noi * np.eye(n)
     return R
 
 
-def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None, seed: int = 14):
+def simulate(
+    A: NDArray[np.floating],
+    B0: NDArray[np.floating],
+    Q: NDArray[np.floating],
+    R: NDArray[np.floating],
+    Z: NDArray[np.floating],
+    X_0: NDArray[np.floating],
+    S_0: int,
+    T: int,
+    s: ArrayLike | None = None,
+    seed: int | None = 14,
+) -> tuple[NDArray[np.float64], NDArray[np.int_], NDArray[np.float64]]:
     if T <= 0:
         raise ValueError(f"T must be positive, got {T}.")
     rng = np.random.default_rng(seed)
@@ -114,9 +176,7 @@ def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None, seed: int = 14):
     x = np.zeros([T, x_dim])
     x[0, :] = X_0
     y = np.zeros([T, n])
-    y[0, :] = B0[:, :, s[0]] @ X_0 + rng.multivariate_normal(
-        np.zeros(n), R[:, :, s[0]]
-    )
+    y[0, :] = B0[:, :, s[0]] @ X_0 + rng.multivariate_normal(np.zeros(n), R[:, :, s[0]])
     for t in range(1, T):
         if blnSimS:
             s[t] = np.nonzero(rng.multinomial(1, Z[s[t - 1], :]))[0][
@@ -131,14 +191,52 @@ def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None, seed: int = 14):
     return y, s, x
 
 
-def simulate_model(T: int = 30000, blnSimS: bool = False):
+def simulate_model(
+    T: int = 30000,
+    blnSimS: bool = False,
+    init_seed: int | None = 0,
+    noise_seed: int | None = 14,
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    NDArray[np.int_],
+    NDArray[np.float64],
+    NDArray[np.int_],
+    int,
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    int,
+    int,
+    NDArray[np.int_],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
     """
 
     Parameters
     ----------
     T : int, optional
-        _description_, by default 30000
+        Number of time steps, by default 30000
     blnSimS : bool, optional
+        If True, simulate the discrete state sequence from ``Z``; otherwise
+        use the fixed schedule (state 1 after 80 s, state 2 after 200 s).
+    init_seed : int or None, optional
+        Seed for the initial continuous state ``X0`` (see
+        :func:`simdata_settings`), by default 0.
+    noise_seed : int or None, optional
+        Seed for the state/observation noise and simulated discrete states
+        (passed to :func:`simulate`), by default 14.
+
+    With integer seeds the output is a deterministic function of the
+    arguments; ``None`` for either seed makes that part nondeterministic.
+    The global NumPy random state is neither read nor modified.
 
     Returns
     -------
@@ -184,7 +282,7 @@ def simulate_model(T: int = 30000, blnSimS: bool = False):
         Time sequence
     """
     fs, k, n, M, osc_freqs, rhos, var_state_nois, var_obs_noi, A, Q, R, B, Z, X0, S0 = (
-        simdata_settings()
+        simdata_settings(init_seed)
     )
 
     x_dim = k * 2
@@ -200,7 +298,7 @@ def simulate_model(T: int = 30000, blnSimS: bool = False):
         s[ta > 80] = 1
         s[ta > 200] = 2
 
-    y, s, x = simulate(A, B, Q, R, Z, X0, S0, T, s=s)
+    y, s, x = simulate(A, B, Q, R, Z, X0, S0, T, s=s, seed=noise_seed)
     time = np.arange(T) / fs
 
     return (
@@ -230,7 +328,7 @@ def simulate_model(T: int = 30000, blnSimS: bool = False):
 def simulate_distinguishable_states(
     n_time: int = 1000,
     seed: int = 42,
-) -> dict:
+) -> dict[str, Any]:
     """
     Generate data where discrete states are easy to distinguish.
 
@@ -268,93 +366,6 @@ def simulate_distinguishable_states(
     H = np.array([[[1.0]], [[1.0]]]).T
     R = np.array([[[0.1]], [[0.1]]]).T  # low observation noise
     Z = np.array([[0.98, 0.02], [0.02, 0.98]])  # long stays
-
-    init_mean = np.zeros((n_cont, n_disc))
-    init_cov = np.eye(n_cont)[..., None] * np.ones((1, 1, n_disc))
-    init_prob = np.array([0.5, 0.5])
-
-    # Simulate discrete states
-    s = np.zeros(n_time, dtype=int)
-    s[0] = rng.choice(n_disc, p=init_prob)
-    for t in range(1, n_time):
-        s[t] = rng.choice(n_disc, p=Z[s[t - 1]])
-
-    # Simulate continuous states
-    x = np.zeros((n_time, n_cont))
-    x[0] = rng.multivariate_normal(init_mean[:, s[0]], init_cov[:, :, s[0]])
-    for t in range(1, n_time):
-        w = rng.multivariate_normal(np.zeros(n_cont), Q[:, :, s[t]])
-        x[t] = A[:, :, s[t]] @ x[t - 1] + w
-
-    # Simulate observations
-    y = np.zeros((n_time, n_obs))
-    for t in range(n_time):
-        v = rng.multivariate_normal(np.zeros(n_obs), R[:, :, s[t]])
-        y[t] = H[:, :, s[t]] @ x[t] + v
-
-    params = {
-        "A": A,
-        "Q": Q,
-        "H": H,
-        "R": R,
-        "Z": Z,
-        "init_mean": init_mean,
-        "init_cov": init_cov,
-        "init_prob": init_prob,
-        "n_cont": n_cont,
-        "n_obs": n_obs,
-        "n_disc": n_disc,
-    }
-
-    return {
-        "obs": y,
-        "true_states": s,
-        "true_continuous": x,
-        "params": params,
-    }
-
-
-def simulate_challenging_states(
-    n_time: int = 1000,
-    seed: int = 42,
-) -> dict:
-    """
-    Generate data where discrete states are harder to distinguish.
-
-    Similar dynamics between states, requiring careful inference:
-    - State 0: A=0.85, Q=0.15
-    - State 1: A=0.90, Q=0.25
-    - Moderate stays (Z diagonal = 0.90)
-    - Higher observation noise
-
-    Parameters
-    ----------
-    n_time : int
-        Number of time steps.
-    seed : int
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    dict
-        Dictionary with:
-        - obs: observations, shape (n_time, n_obs)
-        - true_states: discrete state sequence, shape (n_time,)
-        - true_continuous: continuous state sequence, shape (n_time, n_cont)
-        - params: dict of all model parameters
-    """
-    rng = np.random.default_rng(seed)
-
-    n_cont = 1
-    n_obs = 1
-    n_disc = 2
-
-    # Similar dynamics (harder to distinguish)
-    A = np.array([[[0.85]], [[0.90]]]).T
-    Q = np.array([[[0.15]], [[0.25]]]).T
-    H = np.array([[[1.0]], [[1.0]]]).T
-    R = np.array([[[0.5]], [[0.5]]]).T  # higher observation noise
-    Z = np.array([[0.90, 0.10], [0.10, 0.90]])  # more frequent switching
 
     init_mean = np.zeros((n_cont, n_disc))
     init_cov = np.eye(n_cont)[..., None] * np.ones((1, 1, n_disc))

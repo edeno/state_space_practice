@@ -33,9 +33,10 @@ public name.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -49,20 +50,28 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 from scipy.sparse.csgraph import connected_components
 
-from state_space_practice.kalman import (
-    psd_solve,
-    rts_backward_scan,
-    sum_of_outer_products,
-    symmetrize,
+from state_space_practice.em_driver import (
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
 )
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
+from state_space_practice.fitted_state import FittedAttribute
+from state_space_practice.kalman import rts_backward_scan, sum_of_outer_products
 from state_space_practice.point_process_kalman import (
     _validate_filter_numerics,
     glm_laplace_update,
     log_conditional_intensity,
     poisson_family,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, validate_count_array
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
+from state_space_practice.utils import (
+    psd_solve,
+    symmetrize,
+    validate_count_array,
+    validate_int,
+    validate_scalar,
+)
 
 if TYPE_CHECKING:
     from neurospatial import Environment
@@ -145,13 +154,13 @@ def _validate_laplacian_convention(convention: str) -> LaplacianConvention:
             f"laplacian convention must be one of {supported}; got {convention!r}. "
             "The finite-volume operator is not exposed by neurospatial's public API."
         )
-    return cast(LaplacianConvention, convention)
+    return convention
 
 
 def validate_graph_laplacian(
     laplacian: sp.spmatrix | NDArray[np.float64],
     *,
-    n_bins: Optional[int] = None,
+    n_bins: int | None = None,
     atol: float = 1e-10,
 ) -> None:
     """Validate the structural invariants of a weighted graph Laplacian.
@@ -202,7 +211,7 @@ def validate_graph_laplacian(
         raise ValueError("graph Laplacian off-diagonal entries must be non-positive.")
 
 
-def _inverse_distance_laplacian(env: "Environment") -> sp.csr_matrix:
+def _inverse_distance_laplacian(env: Environment) -> sp.csr_matrix:
     """Construct a conductance Laplacian with edge weight ``1 / distance``."""
     graph = env.connectivity.copy()
     if graph.is_directed():
@@ -232,7 +241,7 @@ def _inverse_distance_laplacian(env: "Environment") -> sp.csr_matrix:
 
 
 def build_graph_laplacian(
-    env: "Environment",
+    env: Environment,
     convention: LaplacianConvention = "distance",
 ) -> sp.csr_matrix:
     """Build and validate the environment graph Laplacian.
@@ -283,13 +292,13 @@ def _laplacian_key(
 
 
 def _env_key(
-    env: "Environment", convention: LaplacianConvention
+    env: Environment, convention: LaplacianConvention
 ) -> tuple[str, int, int, str]:
     """Fingerprint of ``env`` under the requested Laplacian convention."""
     return _laplacian_key(build_graph_laplacian(env, convention), convention)
 
 
-def _check_basis_matches_env(env: "Environment", basis: GraphBasis) -> None:
+def _check_basis_matches_env(env: Environment, basis: GraphBasis) -> None:
     """Refuse a basis built for a different (or since-refit) environment.
 
     The basis rows and the ``bin_sequence`` ids the consumers index by must belong to
@@ -315,8 +324,8 @@ def _check_basis_matches_env(env: "Environment", basis: GraphBasis) -> None:
 def _resolve_rank(
     eigvals: NDArray[np.float64],
     n_components: int,
-    rank: Optional[int],
-    sigma: Optional[float],
+    rank: int | None,
+    sigma: float | None,
     tol: float,
 ) -> int:
     """Resolve the number of modes to keep.
@@ -376,10 +385,10 @@ def _full_eigensystem(
 
 
 def build_graph_basis(
-    env: "Environment",
-    rank: Optional[int] = None,
+    env: Environment,
+    rank: int | None = None,
     *,
-    sigma: Optional[float] = None,
+    sigma: float | None = None,
     tol: float = 1e-6,
     laplacian_convention: LaplacianConvention = "distance",
 ) -> GraphBasis:
@@ -425,10 +434,9 @@ def build_graph_basis(
     if cache is None or cache.get("key") != key:
         eigvals, eigvecs = _full_eigensystem(laplacian, labels, int(n_components))
         cache = {"key": key, "eigvals": eigvals, "eigvecs": eigvecs, "labels": labels}
-        try:
+        # An environment that forbids attribute assignment simply skips caching.
+        with contextlib.suppress(AttributeError):
             setattr(env, _CACHE_ATTR, cache)
-        except AttributeError:  # environment forbids attribute assignment; skip caching
-            pass
 
     eigvals_full = cache["eigvals"]
     keep = _resolve_rank(eigvals_full, int(n_components), rank, sigma, tol)
@@ -484,7 +492,7 @@ def spectral_shape(
 
 
 def _bin_ids(
-    env: "Environment",
+    env: Environment,
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
 ) -> NDArray[np.int_]:
@@ -499,15 +507,16 @@ def _bin_ids(
         trajectory = trajectory[:, None]
     # neurospatial types bin_sequence with a ``Self: EnvironmentProtocol`` bound
     # that mypy does not recognize the concrete Environment as satisfying; the
-    # call is valid at runtime.
-    ids = env.bin_sequence(  # type: ignore[misc]
+    # call is valid at runtime. The ignore is needed only when the optional
+    # neurospatial types are installed; minimal CI environments omit them.
+    ids = env.bin_sequence(  # type: ignore[misc, unused-ignore]
         np.asarray(times, dtype=float), trajectory, dedup=False, outside_value=-1
     )
     return np.asarray(ids, dtype=np.int_)
 
 
 def graph_design_matrix(
-    env: "Environment",
+    env: Environment,
     basis: GraphBasis,
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
@@ -558,7 +567,7 @@ def graph_design_matrix(
 
 
 def bin_occupancy(
-    env: "Environment",
+    env: Environment,
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
     dt: float,
@@ -594,7 +603,7 @@ def bin_occupancy(
 
 
 def bin_spike_counts(
-    env: "Environment",
+    env: Environment,
     spikes: NDArray[np.float64],
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
@@ -641,7 +650,7 @@ def bin_spike_counts(
     return out
 
 
-def laplacian_matches_distance_weight(env: "Environment") -> bool:
+def laplacian_matches_distance_weight(env: Environment) -> bool:
     """True if ``get_differential_operator`` gives the distance-weighted Laplacian.
 
     A cheap invariant check (used by the contract test): ``D @ D.T`` must equal
@@ -1209,13 +1218,26 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     x64 is required (see the module and repo CLAUDE.md notes).
     """
 
+    smoother_mean: FittedAttribute[Array] = FittedAttribute()
+    smoother_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_cross_cov: FittedAttribute[Array] = FittedAttribute()
+    filtered_mean: FittedAttribute[Array] = FittedAttribute()
+    filtered_cov: FittedAttribute[Array] = FittedAttribute()
+    _fit_output_attrs = (
+        "smoother_mean",
+        "smoother_cov",
+        "smoother_cross_cov",
+        "filtered_mean",
+        "filtered_cov",
+    )
+
     def __init__(
         self,
-        env: "Environment",
+        env: Environment,
         dt: float,
         *,
-        rank: Optional[int] = None,
-        sigma: Optional[float] = None,
+        rank: int | None = None,
+        sigma: float | None = None,
         kappa2: float = 1.0,
         alpha: float = 1.0,
         tau2: float = 1.0,
@@ -1337,13 +1359,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
         # Populated during fit.
         self.n_neurons: int = 1
-        self.drift_scale: Optional[Array] = None  # (n_neurons,)
-        self.init_mean: Optional[Array] = None  # (n_neurons, rank)
-        self.smoother_mean: Optional[Array] = None  # (n_neurons, n_time, rank)
-        self.smoother_cov: Optional[Array] = None
-        self.smoother_cross_cov: Optional[Array] = None
-        self.filtered_mean: Optional[Array] = None
-        self.filtered_cov: Optional[Array] = None
+        self.drift_scale: Array | None = None  # (n_neurons,)
+        self.init_mean: Array | None = None  # (n_neurons, rank)
         # Set True only after a fit/fit_sgd that finished with finite, accepted
         # posteriors; the sole gate for _check_fitted. A failed fit that leaves NaN
         # posteriors behind must not read as fitted.
@@ -1403,7 +1420,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             )
         return jnp.asarray(Z_full), spikes_arr.T, jnp.asarray(valid)
 
-    def _e_step(self, Z: Array, spikes: Array, valid: Optional[Array] = None) -> float:
+    def _e_step(self, Z: Array, spikes: Array, valid: Array | None = None) -> float:
         """Per-neuron vmap Laplace-EKF smoother; returns total marginal LL."""
         assert self.init_mean is not None
         assert self.drift_scale is not None
@@ -1413,7 +1430,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         P0 = jnp.diag(self.tau2 * S)
         A = self.transition_matrix
 
-        def _one(m0: Array, spk: Array, q_c: Array):
+        def _one(
+            m0: Array, spk: Array, q_c: Array
+        ) -> tuple[Array, Array, Array, Array, Array, Array]:
             Q = jnp.diag(q_c * S)
             filtered_mean, filtered_cov, marginal_ll = (
                 _masked_graph_point_process_filter(
@@ -1454,9 +1473,16 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         ) = jax.vmap(_one, in_axes=(0, 0, 0))(self.init_mean, spikes, self.drift_scale)
         return float(jnp.sum(marginal_ll))
 
-    def _warm_start(self, times, trajectory, spikes) -> None:
+    def _warm_start(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+    ) -> None:
         """Set per-neuron init_mean from the static GLM MAP on aggregated bins."""
-        counts = bin_spike_counts(self.env, spikes, times, trajectory, self.basis)
+        counts = bin_spike_counts(
+            self.env, np.asarray(spikes), times, trajectory, self.basis
+        )
         occ = bin_occupancy(self.env, times, trajectory, self.dt)
         prec = spectral_precision(
             self.basis.eigvals, self.tau2, self.kappa2, self.alpha
@@ -1480,7 +1506,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     "at least two time rows are required to update drift_scale."
                 )
 
-            def _increment_stats(sm, sc, scc):
+            def _increment_stats(sm: Array, sc: Array, scc: Array) -> Array:
                 # sm (T, rank), sc (T, rank, rank), scc (T-1, rank, rank)
                 gamma = jnp.sum(sc, axis=0) + sum_of_outer_products(sm, sm)
                 gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
@@ -1546,7 +1572,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Initialize ``init_mean`` from the static GLM MAP on aggregated bins
             (and reset ``drift_scale`` to ``init_drift_scale``), by default True.
         verbose : bool, optional
-            Print per-iteration marginal LL, by default True.
+            Log per-iteration marginal LL at INFO level, by default True.
 
         Returns
         -------
@@ -1556,23 +1582,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         # Reset before any validation or attribute mutation: a re-fit that fails (bad
         # args, no in-bounds rows, non-finite E-step) must not leave the model reading
         # as fitted with stale posteriors for a previous neuron count.
-        self._is_fitted = False
-        self._clear_posteriors()
-        if isinstance(max_iter, (bool, np.bool_)) or not isinstance(
-            max_iter, (int, np.integer)
-        ):
-            raise ValueError(f"max_iter must be a positive integer; got {max_iter!r}.")
-        if max_iter <= 0:
-            raise ValueError(f"max_iter must be a positive integer; got {max_iter!r}.")
-        tolerance_arr = np.asarray(tolerance)
-        if (
-            tolerance_arr.shape != ()
-            or not np.isfinite(tolerance_arr)
-            or float(tolerance_arr) <= 0
-        ):
-            raise ValueError(
-                f"tolerance must be a finite positive scalar; got {tolerance!r}."
-            )
+        self._clear_fit_state()
+        if isinstance(max_iter, (bool, np.bool_)):
+            raise ValueError("max_iter must be a positive integer.")
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
+        tolerance = validate_scalar(tolerance, "tolerance", positive=True)
 
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
@@ -1614,96 +1628,31 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
         _validate_filter_numerics(self.prior_cov(), n_time=self._n_time)
 
-        def _log(msg: str) -> None:
+        snapshot_keys = self._fit_output_attrs + ("drift_scale", "init_mean", "tau2")
+
+        def _on_iteration(iteration: int, ll: float, change: float) -> None:
             if verbose:
-                print(msg)
+                logger.info("EM iter %d/%d: LL = %.2f", iteration + 1, max_iter, ll)
 
-        self.log_likelihoods = []
-        last_state: Optional[dict] = None
-        converged = False
-
-        def _capture() -> dict:
-            return {
-                k: getattr(self, k)
-                for k in (
-                    "smoother_mean",
-                    "smoother_cov",
-                    "smoother_cross_cov",
-                    "filtered_mean",
-                    "filtered_cov",
-                    "drift_scale",
-                    "init_mean",
-                    "tau2",
-                )
-            }
-
-        def _restore(state: Optional[dict]) -> None:
-            if state is not None:
-                for k, v in state.items():
-                    setattr(self, k, v)
-
-        for iteration in range(max_iter):
-            ll = self._e_step(Z, spk, valid)
-            self.log_likelihoods.append(ll)
-            _log(f"  EM iter {iteration + 1}/{max_iter}: LL = {ll:.2f}")
-            if not np.isfinite(ll):
-                self.log_likelihoods.pop()
-                if last_state is None:
-                    # First E-step is non-finite: there is no accepted state to fall
-                    # back to. Clear the NaN posteriors and fail loud (the model is
-                    # left not-fitted via self._is_fitted, so predict_rate_map/score
-                    # will refuse rather than return NaN).
-                    self._clear_posteriors()
-                    raise RuntimeError(
-                        "GraphPlaceFieldModel.fit: the first E-step produced a "
-                        "non-finite marginal log-likelihood; the fit cannot proceed. "
-                        "Check init_mean/tau2/kappa2, trajectory coverage, and that "
-                        "x64 is enabled."
-                    )
-                _restore(last_state)
-                msg = "non-finite marginal LL; rolling back to the last accepted state."
-                logger.warning("GraphPlaceFieldModel.fit: %s", msg)
-                _log(f"  WARNING: {msg}")
-                break
-            if iteration > 0:
-                converged, increasing = check_converged(
-                    ll, self.log_likelihoods[-2], tolerance
-                )
-                if not increasing:
-                    _restore(last_state)
-                    bad = self.log_likelihoods.pop()
-                    msg = (
-                        f"LL decreased {self.log_likelihoods[-1]:.2f} -> {bad:.2f}; "
-                        "rolling back and stopping."
-                    )
-                    logger.warning("GraphPlaceFieldModel.fit: %s", msg)
-                    _log(f"  WARNING: {msg}")
-                    break
-                if converged:
-                    _log(f"  Converged after {iteration + 1} iterations.")
-                    break
-            last_state = _capture()
-            self._m_step()
-        else:
-            # The loop ends immediately after an M-step. Evaluate that candidate so
-            # returned parameters, posteriors, and LL all describe the same state.
-            final_ll = self._e_step(Z, spk, valid)
-            final_is_finite = np.isfinite(final_ll)
-            final_converged, final_increasing = check_converged(
-                final_ll, self.log_likelihoods[-1], tolerance
-            )
-            if final_is_finite and final_increasing:
-                self.log_likelihoods.append(final_ll)
-                converged = bool(final_converged)
-            else:
-                _restore(last_state)
-                msg = "final E-step rejected the last M-step; rolling back."
-                logger.warning("GraphPlaceFieldModel.fit: %s", msg)
-                _log(f"  WARNING: {msg}")
-
-        self._finalize_convergence(bool(converged), max_iter)
-        # Reached only via a normal loop exit (converge/rollback/max-iter), all of
-        # which leave finite, accepted posteriors; the iteration-0 failure raises above.
+        result = run_em(
+            lambda: self._e_step(Z, spk, valid),
+            self._m_step,
+            lambda: snapshot_attributes(self, snapshot_keys),
+            lambda state: restore_attributes(self, state),
+            max_iter=max_iter,
+            tol=tolerance,
+            on_first_nonfinite="raise",
+            clear_state=self._clear_fit_state,
+            require_increase_to_converge=True,
+            logger=logger,
+            on_iteration=_on_iteration,
+        )
+        self.log_likelihoods = result.log_likelihoods
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
         self._is_fitted = True
         return self.log_likelihoods
 
@@ -1713,20 +1662,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._n_time
 
-    def _check_sgd_initialized(self) -> None:
-        if self.init_mean is None or self.drift_scale is None or self._n_time <= 0:
-            raise RuntimeError(
-                "Model not initialized. Call fit_sgd(times, trajectory, spikes), "
-                "not SGDFittableMixin.fit_sgd() directly."
-            )
-
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
 
         assert self.init_mean is not None
         assert self.drift_scale is not None
-        params: dict = {}
-        spec: dict = {}
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
         if self.update_kappa2:
             params["kappa2"] = jnp.asarray(self.kappa2)
             spec["kappa2"] = POSITIVE
@@ -1748,14 +1690,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(
-        self, params: dict, Z: Array, spikes: Array, valid: Array
+        self, params: SGDParams, Z: Array, spikes: Array, valid: Array
     ) -> Array:
-        assert self.init_mean is not None
-        assert self.drift_scale is not None
-        kappa2 = params.get("kappa2", self.kappa2)
-        tau2 = params.get("tau2", self.tau2)
-        drift_scale = params.get("drift_scale", self.drift_scale)
-        init_mean = params.get("init_mean", self.init_mean)
+        kappa2 = self._sgd_param(params, "kappa2")
+        tau2 = self._sgd_param(params, "tau2")
+        drift_scale = self._sgd_param(params, "drift_scale")
+        init_mean = self._sgd_param(params, "init_mean")
         eigvals = jnp.asarray(self.basis.eigvals)
         S = (kappa2 + eigvals) ** (-self.alpha)
         P0 = jnp.diag(tau2 * S)
@@ -1778,7 +1718,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         marginal_ll = jax.vmap(_one, in_axes=(0, 0, 0))(init_mean, spikes, drift_scale)
         return -jnp.sum(marginal_ll)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "drift_scale" in params:
             self.drift_scale = params["drift_scale"]
         if "tau2" in params:
@@ -1788,28 +1728,28 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         if "init_mean" in params:
             self.init_mean = params["init_mean"]
 
-    def _finalize_sgd(self, Z: Array, spikes: Array, valid: Array) -> None:
+    def _finalize_sgd(self, Z: Array, spikes: Array, valid: Array) -> float:
         final_ll = self._e_step(Z, spikes, valid)
-        self.log_likelihoods = [final_ll]
-        if np.isfinite(final_ll):
-            self._is_fitted = True
-        else:
-            self._clear_posteriors()
-            raise RuntimeError(
+        if not np.isfinite(final_ll):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError(
                 "GraphPlaceFieldModel.fit_sgd: the final E-step produced a non-finite "
                 "marginal log-likelihood; the model was not fitted."
             )
+        self.log_likelihoods = [final_ll]
+        self._is_fitted = True
+        return final_ll
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         times: NDArray[np.float64],
         trajectory: NDArray[np.float64],
         spikes: ArrayLike,
         *,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         warm_start: bool = True,
     ) -> list[float]:
         """Fit graph hyperparameters by minimizing the negative marginal LL.
@@ -1843,33 +1783,44 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Marginal log-likelihood at each evaluated optimization step that
             produced a finite loss.
         """
-        # Reset before any validation or attribute mutation (see fit()): a failed
-        # re-fit must not leave the model reading as fitted with stale posteriors.
-        self._is_fitted = False
-        self._clear_posteriors()
+        return super().fit_sgd(
+            times,
+            trajectory,
+            spikes,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+            warm_start=warm_start,
+        )
+
+    def _prepare_sgd_data(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+        warm_start: bool = True,
+    ) -> tuple[tuple[Array, Array, Array], dict[str, Any]]:
+        """Validate data before binding it or replacing an earlier fit."""
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
             spikes_arr = spikes_arr[:, None]
         validate_count_array(spikes_arr, "spikes", allow_empty=False)
-        if spikes_arr.ndim != 2:
-            raise ValueError(
-                "spikes must be 1D (n_time,) or 2D (n_time, n_neurons); "
-                f"got shape {spikes_arr.shape}."
-            )
-        self.n_neurons = int(spikes_arr.shape[1])
         Z, spk, valid = self._design_and_spikes(times, trajectory, spikes_arr)
-        self._n_time = int(Z.shape[0])
-        n_valid = int(jnp.sum(valid))
-        if n_valid == 0:
+        if int(jnp.sum(valid)) == 0:
             raise ValueError(
                 "trajectory contains no in-bounds observations for this environment."
             )
-        if self.update_drift_scale and self._n_time < 2:
+        if self.update_drift_scale and Z.shape[0] < 2:
             raise ValueError(
                 "at least two time rows are required to update "
                 "drift_scale; set update_drift_scale=False to keep it fixed."
             )
+        _validate_filter_numerics(self.prior_cov(), n_time=Z.shape[0])
 
+        self._clear_fit_state()
+        self.n_neurons = int(spikes_arr.shape[1])
+        self._n_time = int(Z.shape[0])
         state_shape_matches = self.init_mean is not None and self.init_mean.shape == (
             self.n_neurons,
             self.rank,
@@ -1888,39 +1839,25 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 initial_drift = max(initial_drift, 1e-12)
             self.drift_scale = jnp.full(self.n_neurons, initial_drift)
 
-        _validate_filter_numerics(self.prior_cov(), n_time=self._n_time)
-
-        # _is_fitted stays False (set at entry) until _finalize_sgd confirms a
-        # finite final log-likelihood.
-        return super().fit_sgd(
-            Z,
-            spk,
-            valid,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
+        return (Z, spk, valid), {}
 
     # --- prediction / scoring ---
 
-    def _clear_posteriors(self) -> None:
-        """Drop any (possibly NaN) posterior arrays left by a failed fit."""
-        self.smoother_mean = None
-        self.smoother_cov = None
-        self.smoother_cross_cov = None
-        self.filtered_mean = None
-        self.filtered_cov = None
+    def _clear_fit_state(self) -> None:
+        """Unset posterior arrays and fit results after a failed fit."""
+        super()._clear_fit_state()
+        self.log_likelihoods = []
+        self._is_fitted = False
 
     def _check_fitted(self, method: str) -> None:
         if not self._is_fitted:
-            raise RuntimeError(
+            raise NotFittedError(
                 f"Model not fitted (or the last fit failed); call fit(...)/fit_sgd(...) "
                 f"successfully before {method}()."
             )
 
     def predict_log_rate_trajectory(
-        self, neuron_idx: int = 0, time_slice: Optional[slice] = None
+        self, neuron_idx: int = 0, time_slice: slice | None = None
     ) -> NDArray[np.float64]:
         """Posterior-mean log-rate field over time and active graph bins.
 
@@ -1954,7 +1891,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         return cast(NDArray[np.float64], means @ np.asarray(self.basis.eigvecs).T)
 
     def predict_rate_map(
-        self, neuron_idx: int = 0, time_slice: Optional[slice] = None
+        self, neuron_idx: int = 0, time_slice: slice | None = None
     ) -> NDArray[np.float64]:
         """Per-active-bin firing rate (Hz), the log-normal posterior mean over time.
 

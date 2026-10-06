@@ -28,29 +28,62 @@ References
     Neural Computation 16, 971-998.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
-from typing import Any, Callable, NamedTuple, Optional
+import operator
+import warnings
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
+from numpy.typing import DTypeLike
 
-from state_space_practice.kalman import (
-    _kalman_smoother_update,
-    psd_solve,
-    stabilize_covariance,
-    sum_of_outer_products,
-    symmetrize,
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
+from state_space_practice.kalman import (
+    InitialStatePrior,
+    _kalman_smoother_update,
+    _scan_with_boundary,
+    process_cov_residual_form,
+    rts_backward_scan,
+    smooth_initial_state_with_cross_cov,
+    sum_of_outer_products,
+)
+from state_space_practice.parameter_transforms import (
+    PSD_MATRIX,
+    UNCONSTRAINED,
+)
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _validate_filter_numerics as _validate_filter_numerics_impl,
-    check_converged,
+)
+from state_space_practice.utils import (
+    contains_tracer,
+    project_psd_relative,
+    psd_cholesky,
+    psd_logdet,
+    psd_solve,
+    symmetrize,
+    typed_jit,
     validate_count_array,
     validate_scalar,
+    warn_if_not_positive_definite_in_graph,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 logger = logging.getLogger(__name__)
 
@@ -76,59 +109,56 @@ def _validate_filter_numerics(
     )
 
 
-def _is_block_diagonal(
-    mat: Array,
-    n_blocks: int,
-    block_size: int,
-    atol: float = 1e-10,
-) -> bool:
-    """Check whether a square matrix has block-diagonal structure.
+def _validate_public_inputs(
+    dt: float,
+    init_mean_params: Array,
+    init_covariance_params: Array,
+    design_matrix: Array,
+    spike_indicator: Array,
+    transition_matrix: Array,
+    process_cov: Array,
+    *,
+    filter_name: str,
+    stacklevel: int,
+) -> None:
+    """Value checks of the public point-process filter and smoother.
 
-    Returns True iff ``mat`` is a ``(n_blocks*block_size, n_blocks*block_size)``
-    matrix whose off-diagonal blocks are all zero within ``atol``.
+    Host-side value checks need concrete inputs. Concrete arrays (including
+    constants closed over by a jitted caller) are checked under
+    ``jax.ensure_compile_time_eval`` so jnp ops on them are not staged. When
+    any input is a tracer (jax.jit / jax.grad / jax.vmap argument) the checks
+    are skipped, keeping the entry point traceable with its default
+    arguments, and a non-positive-definite ``init_covariance_params`` is
+    reported at run time as a ``StateSpaceWarning``.
 
-    Parameters
-    ----------
-    mat : Array, shape (n, n) where n = n_blocks * block_size
-        Matrix to check.
-    n_blocks : int
-        Number of diagonal blocks.
-    block_size : int
-        Size of each block (matching block size across all blocks).
-    atol : float, default=1e-10
-        Absolute tolerance for zero off-diagonal blocks, applied to
-        ``max|off_block_entries|``. The default is conservative for f64;
-        callers on f32 should pass a larger value.
-
-    Returns
-    -------
-    bool
-        True if the off-diagonal blocks are all zero within tolerance.
-        False otherwise (including shape mismatches — non-square or wrong
-        total size returns False, not an error).
+    Raises on non-PSD ``init_covariance_params`` and warns on f32 + long T +
+    ill-conditioned configs (see :func:`_validate_filter_numerics`).
+    ``stacklevel`` is interpreted as if the caller had called
+    :func:`_validate_filter_numerics` directly.
     """
-    if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
-        return False
-    expected = n_blocks * block_size
-    if mat.shape[0] != expected:
-        return False
-    if n_blocks == 1:
-        # Trivially block-diagonal: single block IS the whole matrix.
-        return True
-
-    # Materialize an off-block mask (n, n) that is True outside the
-    # block-diagonal structure. This is cheap vs the alternative of
-    # iterating over all (n_blocks choose 2) off-block positions.
-    #
-    # jnp.kron rejects bool dtype, so we build the mask with int32
-    # and convert to bool for jnp.where.
-    eye_blocks = jnp.eye(n_blocks, dtype=jnp.int32)
-    ones_block = jnp.ones((block_size, block_size), dtype=jnp.int32)
-    # Kronecker-expand: entries are 1 where the block-diagonal structure
-    # allows, 0 elsewhere. Convert to bool for masked-where.
-    block_mask = jnp.kron(eye_blocks, ones_block).astype(bool)
-    off_block_max = float(jnp.max(jnp.abs(jnp.where(block_mask, 0.0, mat))))
-    return off_block_max <= atol
+    if contains_tracer(
+        dt,
+        init_mean_params,
+        init_covariance_params,
+        design_matrix,
+        spike_indicator,
+        transition_matrix,
+        process_cov,
+    ):
+        warn_if_not_positive_definite_in_graph(
+            init_covariance_params,
+            name="init_covariance_params",
+            filter_name=filter_name,
+        )
+        return
+    with jax.ensure_compile_time_eval():
+        validate_scalar(dt, "dt", positive=True)
+        validate_count_array(spike_indicator, "spike_indicator")
+        _validate_filter_numerics(
+            init_covariance_params,
+            n_time=spike_indicator.shape[0],
+            stacklevel=stacklevel + 1,
+        )
 
 
 class BlockDiagonalStructure(NamedTuple):
@@ -136,8 +166,21 @@ class BlockDiagonalStructure(NamedTuple):
 
     Holds the per-neuron components of a point-process filter problem
     where ``A``, ``Q``, ``init_cov``, and the design matrix ``Z`` are all
-    block-diagonal across neurons with the same per-neuron block size,
-    AND the ``A`` and ``Q`` diagonal blocks are identical across neurons.
+    block-diagonal across neurons with the same per-neuron block size.
+    Each neuron keeps its own diagonal blocks of ``A``, ``Q`` and
+    ``init_cov``; only the design basis is shared.
+
+    The block-diagonal contract, for ``n_neurons`` blocks of ``block_size``:
+
+    1. Design: every neuron row ``Z[t, j]`` is zero outside its own state
+       slice ``[j*block_size : (j+1)*block_size]`` and the in-slice part is
+       the same shared basis ``Z_base[t]`` for all neurons, with the default
+       linear log-intensity ``Z_base[t] @ x_j``. Not checked by the library:
+       it holds by construction for ``PlaceFieldModel``, which builds every
+       neuron's row from one spline basis.
+    2. Parameters: ``init_cov``, ``A`` and ``Q`` are block-diagonal (zero
+       off-block entries). Their diagonal blocks may differ per neuron.
+       Checked by :func:`_block_diagonal_parameters_ok`.
 
     The dense-form filter can be replaced by a vmapped per-neuron scan
     using these components — see ``_stochastic_point_process_filter_
@@ -147,29 +190,25 @@ class BlockDiagonalStructure(NamedTuple):
 
     Attributes
     ----------
-    A_block : Array, shape (block_size, block_size)
-        Per-neuron transition matrix (same across neurons — verified
-        at detection time).
-    Q_block : Array, shape (block_size, block_size)
-        Per-neuron process noise covariance (same across neurons —
-        verified at detection time).
+    A_blocks : Array, shape (n_neurons, block_size, block_size)
+        Per-neuron transition matrices, the diagonal blocks of ``A``.
+    Q_blocks : Array, shape (n_neurons, block_size, block_size)
+        Per-neuron process noise covariances, the diagonal blocks of ``Q``.
     init_means_per_neuron : Array, shape (n_neurons, block_size)
         Per-neuron initial mean, sliced out of the concatenated state vector.
     init_covs_per_neuron : Array, shape (n_neurons, block_size, block_size)
         Per-neuron initial covariance, sliced out of the block-diagonal
         init_cov.
     Z_base : Array, shape (n_time, block_size)
-        Shared spline basis. Identical across neurons because the
-        upstream design_matrix was built by block-diagonalizing a
-        single Z_base — verified at detection time.
+        Shared spline basis, identical across neurons (contract item 1).
     n_neurons : int
         Number of neurons.
     block_size : int
         Per-neuron state dimension.
     """
 
-    A_block: Array
-    Q_block: Array
+    A_blocks: Array
+    Q_blocks: Array
     init_means_per_neuron: Array
     init_covs_per_neuron: Array
     Z_base: Array
@@ -177,185 +216,229 @@ class BlockDiagonalStructure(NamedTuple):
     block_size: int
 
 
-def _detect_block_diagonal_problem(
-    init_mean: Array,
+def _assemble_block_diagonal_matrix(blocks: Array) -> Array:
+    """Scatter ``(n_blocks, nb, nb)`` diagonal blocks into a dense matrix.
+
+    Returns the ``(n_blocks * nb, n_blocks * nb)`` block-diagonal matrix
+    whose off-block entries are exact zeros.
+    """
+    n_blocks, nb = blocks.shape[0], blocks.shape[-1]
+    n_state = n_blocks * nb
+    idx = (jnp.arange(n_blocks) * nb)[:, None] + jnp.arange(nb)[None, :]
+    dense = jnp.zeros((n_state, n_state), dtype=blocks.dtype)
+    return dense.at[idx[:, :, None], idx[:, None, :]].set(blocks)
+
+
+class BlockDiagonalCovariance:
+    """Per-neuron diagonal blocks of a block-diagonal covariance sequence.
+
+    On a block-diagonal problem the filter / smoother covariance at every
+    time bin is block-diagonal across neurons::
+
+        dense[t] = blockdiag(blocks[0, t], ..., blocks[n_neurons - 1, t])
+
+    with ``dense`` of shape ``(n_time, n_state, n_state)`` and
+    ``n_state = n_neurons * block_size``. This container keeps only the
+    ``(n_neurons, n_time, block_size, block_size)`` blocks -- ``n_neurons``
+    times less memory than the zero-padded dense array -- and exposes the
+    block-local reductions its consumers need without materialising it:
+    :meth:`sum` over time and integer time indexing (the EM M-step
+    sufficient statistics), :meth:`neuron_blocks` (per-neuron rate maps) and
+    :meth:`diagonal` (marginal variances / confidence intervals).
+
+    ``shape``, ``ndim`` and ``len`` report the dense geometry so shape checks
+    written against the dense array keep working. Integer time indexing
+    follows ndarray rules (negative indices allowed, out-of-range raises
+    ``IndexError``, a bool is rejected with ``TypeError``); any other index
+    expression (slices, tuples, masks) is applied to the dense array.
+    Operations whose ndarray meaning the container does not implement raise
+    rather than return something different (e.g. ``sum`` requires
+    ``axis=0``).
+
+    This is not a ``jax.Array``: ``jax.numpy`` functions (``jnp.sum(cov)``,
+    ``jnp.diagonal(cov)``, arithmetic) and ``jax.jit`` raise when handed the
+    container. ``jnp.asarray(cov)``, ``np.asarray(cov)`` and
+    :meth:`to_dense` are the supported ways to materialise the dense array;
+    the hot paths use the block-local methods instead. ``blocks`` is
+    read-only.
+    """
+
+    __slots__ = ("_blocks",)
+
+    def __init__(self, blocks: ArrayLike):
+        blocks = jnp.asarray(blocks)
+        if blocks.ndim != 4 or blocks.shape[-1] != blocks.shape[-2]:
+            raise ValueError(
+                "blocks must have shape (n_neurons, n_time, block_size, "
+                f"block_size), got {blocks.shape}."
+            )
+        self._blocks = blocks
+
+    @property
+    def blocks(self) -> Array:
+        """The ``(n_neurons, n_time, block_size, block_size)`` diagonal blocks."""
+        return self._blocks
+
+    @property
+    def n_neurons(self) -> int:
+        return self._blocks.shape[0]
+
+    @property
+    def n_time(self) -> int:
+        return self._blocks.shape[1]
+
+    @property
+    def block_size(self) -> int:
+        return self._blocks.shape[-1]
+
+    @property
+    def n_state(self) -> int:
+        return self.n_neurons * self.block_size
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """Shape of the equivalent dense array, ``(n_time, n_state, n_state)``."""
+        return (self.n_time, self.n_state, self.n_state)
+
+    @property
+    def ndim(self) -> int:
+        return 3
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return self._blocks.dtype
+
+    def __len__(self) -> int:
+        return self.n_time
+
+    def __repr__(self) -> str:
+        return (
+            f"BlockDiagonalCovariance(n_neurons={self.n_neurons}, "
+            f"n_time={self.n_time}, block_size={self.block_size})"
+        )
+
+    def neuron_blocks(self, neuron_idx: int, time_slice: slice = slice(None)) -> Array:
+        """One neuron's ``(n_t, block_size, block_size)`` diagonal blocks.
+
+        Equals ``dense[time_slice, s, s]`` for that neuron's state slice
+        ``s``, read with a single gather from the block storage.
+        """
+        return self._blocks[neuron_idx, time_slice]
+
+    def diagonal(self) -> Array:
+        """Marginal variances, shape ``(n_time, n_state)``.
+
+        Takes no arguments; equals ``dense.diagonal(axis1=1, axis2=2)``.
+        """
+        var = jnp.diagonal(self._blocks, axis1=-2, axis2=-1)  # (n_neurons, T, nb)
+        return jnp.transpose(var, (1, 0, 2)).reshape(self.n_time, self.n_state)
+
+    def sum(self, axis: int) -> Array:
+        """Sum over time, a dense ``(n_state, n_state)`` matrix (``dense.sum(0)``).
+
+        Only the time axis is supported (``axis=0``, or ``-3``), and it must
+        be passed explicitly: it is the reduction the EM M-step needs, and it
+        stays block-local (one small dense matrix is built, never the
+        ``(n_time, n_state, n_state)`` sequence).
+        """
+        if axis not in (0, -3):
+            raise ValueError("BlockDiagonalCovariance.sum only supports axis=0 (time).")
+        return _assemble_block_diagonal_matrix(self._blocks.sum(axis=1))
+
+    def _time_index(self, t: Any) -> int:
+        """Normalise an integer time index; ndarray bounds, bool rejected."""
+        if isinstance(t, (bool, np.bool_)):
+            raise TypeError(
+                "BlockDiagonalCovariance time index must be an integer, not a bool."
+            )
+        idx = operator.index(t)
+        if not -self.n_time <= idx < self.n_time:
+            raise IndexError(
+                f"time index {idx} is out of bounds for n_time={self.n_time}."
+            )
+        return idx
+
+    def at_time(self, t: int) -> Array:
+        """Dense ``(n_state, n_state)`` covariance of one time bin (``dense[t]``)."""
+        return _assemble_block_diagonal_matrix(self._blocks[:, self._time_index(t)])
+
+    def __getitem__(self, index: Any) -> Array:
+        if not isinstance(index, (bool, np.bool_)):
+            try:
+                operator.index(index)
+            except TypeError:
+                # Any non-integer indexing (slices, tuples, masks) goes through
+                # the dense array -- correct for every index expression, at
+                # the dense cost.
+                return self.to_dense()[index]
+        return self.at_time(index)
+
+    def to_dense(self) -> Array:
+        """Materialise the dense ``(n_time, n_state, n_state)`` array."""
+        return jax.vmap(_assemble_block_diagonal_matrix, in_axes=1)(self._blocks)
+
+    def __array__(
+        self, dtype: DTypeLike | None = None, copy: bool | None = None
+    ) -> np.ndarray:
+        return np.asarray(self.to_dense(), dtype=dtype)
+
+    def __jax_array__(self) -> Array:
+        return self.to_dense()
+
+
+def _matrix_blocks(mat: Array, n_blocks: int, block_size: int) -> Array:
+    """View an ``(n, n)`` matrix as ``(n_blocks, n_blocks, nb, nb)`` blocks."""
+    return mat.reshape(n_blocks, block_size, n_blocks, block_size).transpose(0, 2, 1, 3)
+
+
+def _diagonal_blocks(mat: Array, n_blocks: int, block_size: int) -> Array:
+    """The ``(n_blocks, nb, nb)`` diagonal blocks of a square matrix."""
+    idx = jnp.arange(n_blocks)
+    return _matrix_blocks(mat, n_blocks, block_size)[idx, idx]
+
+
+def _scaled_atol(mat: Array, atol: float) -> Array:
+    """Relative-absolute tolerance ``atol * max(1, max|mat|)``."""
+    return atol * jnp.maximum(1.0, jnp.max(jnp.abs(mat)))
+
+
+@functools.partial(typed_jit, static_argnames=("n_neurons", "block_size", "atol"))
+def _block_diagonal_parameters_ok(
     init_cov: Array,
     transition_matrix: Array,
     process_cov: Array,
-    design_matrix: Array,
+    *,
+    n_neurons: int,
+    block_size: int,
     atol: float = 1e-10,
-) -> Optional[BlockDiagonalStructure]:
-    """Detect whether a filter problem has block-diagonal structure.
+) -> Array:
+    """Vectorised check of the parameter half of the block-diagonal contract.
 
-    Returns a ``BlockDiagonalStructure`` with the per-neuron factors if
-    the problem is block-diagonal, or ``None`` otherwise. Call sites use
-    a non-None return as a green light to dispatch to the block-diagonal
-    filter path.
+    True iff ``init_cov``, ``transition_matrix`` and ``process_cov`` are
+    block-diagonal with ``n_neurons`` blocks of ``block_size`` (all
+    off-block entries zero) -- item 2 of the :class:`BlockDiagonalStructure`
+    contract. The diagonal blocks may differ per neuron.
+    One fused device computation returning a boolean scalar, so a caller
+    pays a single host sync (``bool(...)``) instead of a Python loop of
+    ``float()`` syncs; ``PlaceFieldModel`` runs it at fit entry and after
+    every EM M-step.
 
-    Requirements for detection to succeed:
-
-    1. ``design_matrix`` has shape ``(n_time, n_neurons, n_state)`` with
-       ``n_state = n_neurons * block_size`` — i.e., the multi-neuron
-       block-diagonal shape produced by
-       ``PlaceFieldModel._build_block_diagonal``.
-    2. For every time bin, each neuron row ``design_matrix[t, j]`` is
-       zero outside the slice ``[j*block_size : (j+1)*block_size]``, and
-       the non-zero slice is identical *across neurons* (same shared
-       spline basis used by every neuron).
-    3. ``transition_matrix``, ``process_cov``, and ``init_cov`` are all
-       block-diagonal with matching ``block_size``.
-    4. All neurons share the same per-neuron transition and process
-       matrices — i.e., every diagonal block of ``A`` (and of ``Q``) is
-       equal to the block-0 slice. Heterogeneous per-neuron dynamics
-       are not detected as block-diagonal even though they technically
-       qualify — that case would require storing
-       ``(n_neurons, block_size, block_size)`` A/Q arrays and is deferred
-       until there's a caller that needs it.
-
-    This is pure detection logic with no side effects — always safe to
-    call, returns None on any shape mismatch or non-block-diagonal input.
-
-    Tolerance model
-    ---------------
-    The off-block-zero and block-equality checks use a relative-absolute
-    mix: ``effective_atol = atol * max(1, max|mat|)``. This scales the
-    absolute ``atol`` (default ``1e-10``) up for matrices with large
-    entries (e.g. transition matrices with O(1) entries still use the
-    absolute floor, while covariance matrices with O(1e6) entries get a
-    proportionally larger tolerance). For f32 callers, pass a larger
-    ``atol`` — typical values are ``1e-6`` to ``1e-5``.
-
-    Parameters
-    ----------
-    init_mean : Array, shape (n_state,)
-    init_cov : Array, shape (n_state, n_state)
-    transition_matrix : Array, shape (n_state, n_state)
-    process_cov : Array, shape (n_state, n_state)
-    design_matrix : Array
-        If ndim == 2, treated as single-neuron ``(n_time, n_state)`` and
-        returns ``None`` (no block structure to exploit).
-        If ndim == 3, must be ``(n_time, n_neurons, n_state)``.
-    atol : float, default=1e-10
-        Absolute tolerance floor; scaled by ``max(1, max|mat|)`` per-check
-        for relative robustness to matrix magnitude.
-
-    Returns
-    -------
-    BlockDiagonalStructure or None
+    Tolerance model: the off-block-zero check for each matrix uses
+    ``atol * max(1, max|mat|)``, so matrices with O(1) entries
+    use the absolute floor while large-magnitude covariances get a
+    proportionally larger tolerance. For f32 inputs pass a larger ``atol``
+    (typically ``1e-6`` to ``1e-5``).
     """
-    # Single-neuron design matrices are (n_time, n_state), not
-    # (n_time, 1, n_state). The block-diagonal filter gives no benefit
-    # at n_neurons=1 (block_size == n_state, same as the dense filter),
-    # so return None to dispatch to dense.
-    if design_matrix.ndim != 3:
-        return None
+    off_block = ~jnp.eye(n_neurons, dtype=bool)
 
-    _n_time, n_neurons, n_state = design_matrix.shape
-    if n_neurons < 2:
-        # Genuinely single-neuron problem — dense filter is optimal.
-        return None
-    if n_state % n_neurons != 0:
-        return None
-    block_size = n_state // n_neurons
+    def off_block_max(mat: Array) -> Array:
+        blocks = _matrix_blocks(mat, n_neurons, block_size)
+        return jnp.max(jnp.where(off_block[:, :, None, None], jnp.abs(blocks), 0.0))
 
-    def _scaled_atol(mat: Array) -> float:
-        """Relative-absolute tolerance scaled by matrix magnitude."""
-        max_abs = float(jnp.max(jnp.abs(mat))) if mat.size > 0 else 0.0
-        return atol * max(1.0, max_abs)
-
-    # Check state-level arrays are block-diagonal with the inferred size.
-    if not _is_block_diagonal(
-        init_cov, n_neurons, block_size, atol=_scaled_atol(init_cov)
-    ):
-        return None
-    if not _is_block_diagonal(
-        transition_matrix,
-        n_neurons,
-        block_size,
-        atol=_scaled_atol(transition_matrix),
-    ):
-        return None
-    if not _is_block_diagonal(
-        process_cov, n_neurons, block_size, atol=_scaled_atol(process_cov)
-    ):
-        return None
-
-    # Check the design matrix: for each neuron j, design_matrix[:, j, :]
-    # must be zero outside the slice [j*block_size : (j+1)*block_size].
-    dm_atol = _scaled_atol(design_matrix)
-    for j in range(n_neurons):
-        start = j * block_size
-        end = start + block_size
-        # All columns except the neuron's own slice
-        if start > 0:
-            left_cols = design_matrix[:, j, :start]
-            if float(jnp.max(jnp.abs(left_cols))) > dm_atol:
-                return None
-        if end < n_state:
-            right_cols = design_matrix[:, j, end:]
-            if float(jnp.max(jnp.abs(right_cols))) > dm_atol:
-                return None
-
-    # Extract A_block and Q_block from the (0, 0) slice of the full matrices.
-    A_block = transition_matrix[:block_size, :block_size]
-    Q_block = process_cov[:block_size, :block_size]
-
-    # CRITICAL: verify that ALL diagonal blocks of A and Q equal the block-0
-    # slice. Without this check, the block-diagonal filter would silently
-    # apply block-0's A and Q to every neuron, even if the EM M-step wrote
-    # back per-neuron-different diagonal blocks (e.g. due to floating-point
-    # non-associativity in the sufficient statistics). Such a mismatch
-    # would not show up as "not block-diagonal" in the earlier check —
-    # it would pass _is_block_diagonal and then produce wrong results in
-    # the vmap.
-    a_atol = _scaled_atol(transition_matrix)
-    q_atol = _scaled_atol(process_cov)
-    for j in range(1, n_neurons):
-        s, e = j * block_size, (j + 1) * block_size
-        a_block_j = transition_matrix[s:e, s:e]
-        q_block_j = process_cov[s:e, s:e]
-        if float(jnp.max(jnp.abs(a_block_j - A_block))) > a_atol:
-            return None
-        if float(jnp.max(jnp.abs(q_block_j - Q_block))) > q_atol:
-            return None
-
-    # Per-neuron init_mean: split the concatenated mean into n_neurons
-    # slices of length block_size.
-    init_means_per_neuron = init_mean.reshape(n_neurons, block_size)
-
-    # Per-neuron init_cov: extract the diagonal blocks. Unlike A and Q,
-    # init_cov is allowed to have DIFFERENT diagonal blocks per neuron
-    # (the warm-start fits a separate stationary GLM per neuron and
-    # produces a block-diagonal cov where each block is that neuron's
-    # Laplace posterior).
-    init_covs_per_neuron = jnp.stack(
-        [
-            init_cov[
-                j * block_size : (j + 1) * block_size,
-                j * block_size : (j + 1) * block_size,
-            ]
-            for j in range(n_neurons)
-        ]
-    )
-
-    # Z_base: neuron 0's own slice is (n_time, block_size). Verify that
-    # all other neurons share the same basis. If they differ (e.g.,
-    # per-neuron custom basis), fall back to the dense filter.
-    Z_base = design_matrix[:, 0, 0:block_size]
-    for j in range(1, n_neurons):
-        neuron_slice = design_matrix[:, j, j * block_size : (j + 1) * block_size]
-        if float(jnp.max(jnp.abs(neuron_slice - Z_base))) > dm_atol:
-            return None
-
-    return BlockDiagonalStructure(
-        A_block=A_block,
-        Q_block=Q_block,
-        init_means_per_neuron=init_means_per_neuron,
-        init_covs_per_neuron=init_covs_per_neuron,
-        Z_base=Z_base,
-        n_neurons=n_neurons,
-        block_size=block_size,
-    )
+    ok = off_block_max(init_cov) <= _scaled_atol(init_cov, atol)
+    ok &= off_block_max(transition_matrix) <= _scaled_atol(transition_matrix, atol)
+    ok &= off_block_max(process_cov) <= _scaled_atol(process_cov, atol)
+    return ok
 
 
 def _build_block_structure_from_traced(
@@ -369,31 +452,37 @@ def _build_block_structure_from_traced(
 ) -> BlockDiagonalStructure:
     """Build a BlockDiagonalStructure from traced arrays using pure slicing.
 
-    Unlike ``_detect_block_diagonal_problem`` — which uses host-side
-    ``float()`` conversions for tolerance scaling and thus cannot run
-    inside ``jax.jit`` / ``jax.grad`` — this helper assumes the caller
-    has ALREADY verified block-diagonal structure (at fit entry time,
-    with concrete arrays) and simply extracts the per-neuron factors
-    via static slicing. It runs safely inside the jit boundary because
-    ``n_neurons`` and ``block_size`` are Python integers (not traced
-    values) and all slicing indices are compile-time constants.
+    Unlike :func:`_block_diagonal_parameters_ok` -- whose verdict must be
+    read back on the host (``bool(...)``) and which therefore cannot gate a
+    branch inside ``jax.jit`` / ``jax.grad`` -- this helper assumes the
+    caller has ALREADY verified block-diagonal structure (at fit entry time,
+    with concrete arrays) and simply extracts the per-neuron factors -- the
+    diagonal blocks of ``A``, ``Q`` and ``init_cov`` -- via static slicing.
+    Off-block entries are ignored. It runs
+    safely inside the jit boundary because ``n_neurons`` and ``block_size``
+    are Python integers (not traced values) and all slicing indices are
+    compile-time constants.
 
     Used by ``stochastic_point_process_filter``'s auto-dispatch path:
-    the caller runs ``_detect_block_diagonal_problem`` once at fit
-    entry to get ``n_neurons`` / ``block_size``, then passes those
-    integers into the jit-compiled loss function. Inside the loss
-    function, the traced (init_mean, init_cov, A, Q, Z) arrays may
-    differ from the detection-time values (e.g., the SGD optimizer
-    has updated them), but they're guaranteed to preserve the same
-    block-diagonal structure as long as:
-      - the caller uses a block-diagonal parameterization (e.g.,
-        ``process_noise_structure="diagonal"``), AND
-      - ``update_transition_matrix=False`` (no off-block entries
-        can be introduced by EM's M-step).
+    the caller verifies the structure once at fit entry
+    (``PlaceFieldModel._detect_block_structure``, which runs
+    ``_block_diagonal_parameters_ok``) to get
+    ``n_neurons`` / ``block_size``, then passes those integers into the
+    jit-compiled loss function. Inside the loss function, the traced
+    (init_mean, init_cov, A, Q, Z) arrays may differ from the
+    detection-time values (e.g., the SGD optimizer has updated them). The
+    result equals the dense filter only while they keep zero off-block
+    entries, so the caller must only take this path for parameterizations
+    that cannot leave the block-diagonal set: a diagonal or isotropic ``Q``
+    (per-neuron values are fine -- each neuron gets its own block) and a
+    ``transition_matrix`` that is not trained by gradient (a learned dense
+    ``A`` has off-block gradients the block filter never sees, so
+    ``PlaceFieldModel.fit_sgd`` dispatches dense when
+    ``update_transition_matrix=True``).
 
-    The model layer is responsible for calling _detect_block_diagonal_
-    problem at BOTH fit entry AND after each EM M-step to catch any
-    structural regression.
+    The EM M-step can write back a dense ``A``, so the model layer re-checks
+    the structure after each M-step (``PlaceFieldModel._detect_block_structure``)
+    and falls back to dense when it breaks.
 
     Parameters
     ----------
@@ -401,7 +490,10 @@ def _build_block_structure_from_traced(
     init_cov : Array, shape (n_state, n_state)
     transition_matrix : Array, shape (n_state, n_state)
     process_cov : Array, shape (n_state, n_state)
-    design_matrix : Array, shape (n_time, n_neurons, n_state)
+    design_matrix : Array, shape (n_time, n_neurons, n_state) or (n_time, block_size)
+        Either the block-expanded design matrix or, directly, the shared
+        per-neuron basis ``Z_base``. ``PlaceFieldModel`` passes ``Z_base``
+        so the expansion (>99% structural zeros) is never built.
     n_neurons : int
     block_size : int
 
@@ -410,44 +502,96 @@ def _build_block_structure_from_traced(
     BlockDiagonalStructure
     """
     nb = block_size
-    # A_block: extract the (0, 0) diagonal block of transition_matrix.
-    # Inside jit this is a static slice on the traced matrix.
-    A_block = transition_matrix[:nb, :nb]
-    Q_block = process_cov[:nb, :nb]
+    # Per-neuron A, Q and init_cov: the diagonal blocks, gathered with
+    # compile-time constant indices (``n_neurons`` and ``nb`` are Python
+    # ints), so this is static slicing of the traced matrices.
+    A_blocks = _diagonal_blocks(transition_matrix, n_neurons, nb)
+    Q_blocks = _diagonal_blocks(process_cov, n_neurons, nb)
+    init_covs_per_neuron = _diagonal_blocks(init_cov, n_neurons, nb)
 
     # Per-neuron init_mean: reshape the concatenated state vector.
     init_means_per_neuron = init_mean.reshape(n_neurons, nb)
 
-    # Per-neuron init_cov: extract the diagonal blocks via static slicing.
-    # ``n_neurons`` and ``nb`` are Python ints (compile-time constants),
-    # so ``init_cov[j*nb:(j+1)*nb, ...]`` resolves to a static slice at
-    # trace time. Using a Python for-loop over ``range(n_neurons)``
-    # produces one slice op per neuron — fine for realistic n_neurons
-    # (up to ~64) because the loop is unrolled at trace time.
-    init_covs_per_neuron = jnp.stack(
-        [
-            init_cov[
-                j * nb : (j + 1) * nb,
-                j * nb : (j + 1) * nb,
-            ]
-            for j in range(n_neurons)
-        ]
-    )
-
-    # Z_base: neuron 0's own slice is (n_time, block_size). All neurons
-    # share the same Z_base by the block-diagonal contract, so neuron 0
-    # is representative.
-    Z_base = design_matrix[:, 0, 0:nb]
+    # Z_base: the shared basis itself when passed directly, else neuron 0's
+    # own slice of the expanded design (all neurons share it by contract).
+    Z_base = design_matrix if design_matrix.ndim == 2 else design_matrix[:, 0, 0:nb]
 
     return BlockDiagonalStructure(
-        A_block=A_block,
-        Q_block=Q_block,
+        A_blocks=A_blocks,
+        Q_blocks=Q_blocks,
         init_means_per_neuron=init_means_per_neuron,
         init_covs_per_neuron=init_covs_per_neuron,
         Z_base=Z_base,
         n_neurons=n_neurons,
         block_size=nb,
     )
+
+
+def _validated_dispatch_block_structure(
+    init_mean: Array,
+    init_cov: Array,
+    transition_matrix: Array,
+    process_cov: Array,
+    design_matrix: Array,
+    spike_indicator: Array,
+    block_n_neurons: int | None,
+    block_size: int | None,
+) -> BlockDiagonalStructure:
+    """Check the block-dispatch request and extract its per-neuron factors.
+
+    Shared entry of the block-diagonal dispatch in
+    :func:`stochastic_point_process_filter` and
+    :func:`stochastic_point_process_smoother`, called only when both
+    ``block_n_neurons`` and ``block_size`` are set.
+
+    Raises
+    ------
+    ValueError
+        If ``spike_indicator`` is 1-D (single neuron), or if
+        ``block_n_neurons * block_size`` does not match the state dimension
+        of ``init_cov``.
+    """
+    # The callers only dispatch when both are set; assert so mypy narrows
+    # block_n_neurons / block_size from int | None to int.
+    assert block_n_neurons is not None and block_size is not None
+    if spike_indicator.ndim == 1:
+        raise ValueError(
+            "block_n_neurons / block_size can only be passed for "
+            "multi-neuron (2D spike_indicator) inputs."
+        )
+    # Shape guard: block_n_neurons * block_size must match the total state
+    # dimension. A mismatch means the caller passed wrong detection integers
+    # or the model state shape changed between detection and dispatch.
+    expected_state_dim = block_n_neurons * block_size
+    if init_cov.shape[-1] != expected_state_dim:
+        raise ValueError(
+            f"block dispatch shape mismatch: block_n_neurons="
+            f"{block_n_neurons} * block_size={block_size} = "
+            f"{expected_state_dim}, but init_cov has shape "
+            f"{init_cov.shape}. Pass the block "
+            f"structure of the current problem (PlaceFieldModel "
+            f"re-derives it with _detect_block_structure)."
+        )
+    return _build_block_structure_from_traced(
+        init_mean,
+        init_cov,
+        transition_matrix,
+        process_cov,
+        design_matrix,
+        block_n_neurons,
+        block_size,
+    )
+
+
+def _common_float_dtype(*arrays: Array) -> jnp.dtype:
+    """Common floating dtype of the floating-point ``arrays``.
+
+    Integer / boolean arrays (e.g. spike counts) do not take part, so they
+    cannot promote a float32 problem; with no floating array at all the
+    default float dtype is returned.
+    """
+    floating = [a for a in arrays if jnp.issubdtype(a.dtype, jnp.inexact)]
+    return jnp.result_type(float, *floating)
 
 
 def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Array:
@@ -513,10 +657,7 @@ def _logdet_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
     Array
         Scalar log-determinant.
     """
-    n = mat.shape[-1]
-    stabilized = symmetrize(mat) + diagonal_boost * jnp.eye(n, dtype=mat.dtype)
-    chol = jnp.linalg.cholesky(stabilized)
-    return 2.0 * jnp.sum(jnp.log(jnp.diag(chol)))
+    return psd_logdet(psd_cholesky(mat, diagonal_boost, relative_boost=0.0))
 
 
 def _safe_expected_count(
@@ -656,19 +797,309 @@ def _soft_expected_count_and_log(
     return count, log_count_out
 
 
+#: Armijo sufficient-decrease constant of the Fisher-scoring line search.
+_ARMIJO_C = 1e-4
+#: Number of trial step sizes ``1, beta, ..., beta**(N - 1)`` (``beta`` is
+#: ``line_search_beta``) evaluated per Fisher iteration.
+_LINE_SEARCH_MAX_BACKTRACKS = 10
+#: Fraction of time bins whose backtracking may be exhausted before the public
+#: filters log a warning.
+_LINE_SEARCH_FAIL_WARN_FRAC = 0.1
+
+
+def _fisher_scoring_line_search(
+    x0: Array,
+    prior_factor: Array,
+    fisher_step_at: Callable[[Array], tuple[Array, Array, Array]],
+    neg_log_posterior: Callable[[Array], Array],
+    max_newton_iter: int,
+    line_search_beta: float,
+) -> tuple[Array, Array, Array]:
+    """Iterated Fisher scoring with an Armijo backtracking line search.
+
+    Shared by :func:`_point_process_laplace_update` and
+    :func:`glm_laplace_update`. ``fisher_step_at(x)`` returns
+    ``(delta, post_factor, gradient)`` -- the Fisher direction
+    ``delta = post_prec^{-1} gradient`` and the Cholesky factor (as returned
+    by :func:`~state_space_practice.utils.psd_cholesky`) of the posterior
+    precision ``post_prec`` at ``x``, with ``gradient`` the gradient of the
+    log-posterior -- and ``neg_log_posterior(x)`` the objective ``f`` the
+    line search decreases. The factor is only carried and returned, so the
+    callers reuse the factorization the last Fisher step already did.
+
+    The trial step sizes are ``alpha = 1, beta, ..., beta^(N-1)`` with
+    ``N = _LINE_SEARCH_MAX_BACKTRACKS``; the largest is accepted that
+    satisfies the Armijo condition ``f(x + alpha delta) <= f(x) - c alpha gradient'
+    delta`` with ``c = _ARMIJO_C``, up to a round-off slack of
+    ``1e-12 (1 + |f(x)|)`` so a converged point still takes its (negligible)
+    full step instead of freezing. Because ``post_prec`` is positive definite,
+    ``gradient' delta >= 0`` and ``delta`` is a descent direction. When the
+    full step is accepted the result is the same as without the Armijo
+    condition. If no step size qualifies, ``x`` is kept (an uphill or
+    insufficient step is never taken). The backtracking stops at the first
+    accepted step size, so an accepted full step costs one objective
+    evaluation; it is differentiable in reverse mode because only the
+    accepted point ``x + alpha delta`` carries derivatives (``alpha`` is a
+    constant power of ``beta``).
+
+    With ``max_newton_iter == 0`` no measurement update is made: the prior
+    ``(x0, prior_factor)`` is returned unchanged.
+
+    The scan carries ``(x, delta, post_factor, loss, slope, n_failed)``, i.e.
+    the Fisher step, the objective and the directional derivative *at the
+    current point*. They are computed exactly once, when a point is accepted,
+    and reused as the next iteration's search direction and references; the
+    factor at the last accepted point is the returned posterior factor.
+
+    Returns
+    -------
+    x : Array
+        The accepted point after ``max_newton_iter`` iterations.
+    post_factor : Array
+        Cholesky factor of the Fisher posterior precision evaluated at ``x``.
+    n_failed : Array
+        Number of iterations (int32 scalar) whose backtracking was exhausted
+        although the Fisher step predicted a decrease above roundoff
+        (``0.5 gradient' delta > sqrt(eps) (1 + |f|)``). Exhaustion at an
+        already-converged point is not counted.
+    """
+    eps_sqrt = float(jnp.finfo(x0.dtype).eps) ** 0.5
+
+    def _line_search_step(
+        carry: tuple[Array, Array, Array, Array, Array, Array], _: Array | None
+    ) -> tuple[tuple[Array, Array, Array, Array, Array, Array], None]:
+        x, delta, _, current_loss, slope, n_failed = carry
+
+        # Backtracking line search, stopped at the first accepted step size
+        # (usually the full step) instead of always evaluating all
+        # ``_LINE_SEARCH_MAX_BACKTRACKS`` trials. The loss at the evaluated
+        # step size rides along in the carry, so the winning loss is known
+        # without a second evaluation at the accepted point.
+        #
+        # The search only *selects* a step size: alpha is a power of beta and
+        # the accept flag is boolean, so the result has zero derivative with
+        # respect to every input, and the loss is used only in comparisons.
+        # Everything entering or produced by the loop is therefore cut from
+        # differentiation with ``stop_gradient``; that makes the
+        # ``while_loop`` a primal-only computation, so reverse-mode AD
+        # (fit_sgd differentiates through the filters) works through it, and
+        # the gradient -- which flows through ``x + alpha * delta`` below --
+        # is the same as through a fixed-length search.
+        x_sg = jax.lax.stop_gradient(x)
+        delta_sg = jax.lax.stop_gradient(delta)
+        loss_sg = jax.lax.stop_gradient(current_loss)
+        slope_sg = jax.lax.stop_gradient(slope)
+        # The slack admits steps that change f only at round-off level, so at
+        # a converged mode the (tiny) full step is still taken: rejecting it
+        # would freeze x, and reverse-mode gradients through the iterations
+        # would then miss the Fisher map's contraction and carry the error of
+        # an earlier, unconverged iterate.
+        slack = 1e-12 * (1.0 + jnp.abs(loss_sg))
+
+        def _not_accepted(
+            alpha_carry: tuple[Array, Array, Array, Array],
+        ) -> Array:
+            n_tried, _, improved, _ = alpha_carry
+            return ~improved & (n_tried < _LINE_SEARCH_MAX_BACKTRACKS)
+
+        def _backtrack(
+            alpha_carry: tuple[Array, Array, Array, Array],
+        ) -> tuple[Array, Array, Array, Array]:
+            n_tried, alpha, _, _ = alpha_carry
+            new_loss = jax.lax.stop_gradient(neg_log_posterior(x_sg + alpha * delta_sg))
+            improved = new_loss <= loss_sg - _ARMIJO_C * alpha * slope_sg + slack
+            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
+            return n_tried + 1, new_alpha, improved, new_loss
+
+        _, final_alpha, line_search_improved, final_loss = jax.lax.while_loop(
+            _not_accepted,
+            _backtrack,
+            (
+                jnp.zeros((), dtype=jnp.int32),
+                jnp.ones((), dtype=x.dtype),
+                jnp.array(False),
+                loss_sg,
+            ),
+        )
+        candidate_x = x + final_alpha * delta
+
+        # Reject uphill / insufficient steps: reuse the improved flag from
+        # the backtracking loop rather than re-evaluating neg_log_posterior.
+        # If improved is False, no step size qualified -- keep current x and
+        # count the failure unless the step was already negligible (a
+        # converged point legitimately exhausts the backtracking).
+        new_x = jnp.where(line_search_improved, candidate_x, x)
+        new_loss = jnp.where(line_search_improved, final_loss, current_loss)
+        exhausted = ~line_search_improved & (
+            0.5 * slope > eps_sqrt * (1.0 + jnp.abs(current_loss))
+        )
+
+        # Fisher step at the accepted point: its precision factor is the
+        # posterior factor if this was the last iteration, and its direction
+        # is the next iteration's step.
+        new_delta, new_post_factor, new_gradient = fisher_step_at(new_x)
+        new_slope = new_gradient @ new_delta
+        return (
+            new_x,
+            new_delta,
+            new_post_factor,
+            new_loss,
+            new_slope,
+            n_failed + exhausted.astype(jnp.int32),
+        ), None
+
+    if max_newton_iter == 0:
+        return x0, prior_factor, jnp.zeros((), dtype=jnp.int32)
+    delta0, post_factor0, gradient0 = fisher_step_at(x0)
+    (x, _, post_factor, _, _, n_failed), _ = jax.lax.scan(
+        _line_search_step,
+        (
+            x0,
+            delta0,
+            post_factor0,
+            neg_log_posterior(x0),
+            gradient0 @ delta0,
+            jnp.zeros((), dtype=jnp.int32),
+        ),
+        None,
+        length=max_newton_iter,
+    )
+    return x, post_factor, n_failed
+
+
+def _log_line_search_failures(
+    n_failed: Array, *, n_units: int, max_newton_iter: int, name: str, unit: str
+) -> None:
+    """Host-side logger for :func:`_warn_line_search_failures`."""
+    n = int(np.sum(np.asarray(n_failed)))
+    frac = n / n_units
+    if frac > _LINE_SEARCH_FAIL_WARN_FRAC:
+        logger.warning(
+            "%s: the Fisher-scoring line search rejected all %d trial step "
+            "sizes in %d/%d (%.1f%%) %s with max_newton_iter=%d; those "
+            "updates kept a non-converged posterior mode. This usually means a "
+            "poorly scaled or misspecified intensity (check the design matrix "
+            "and max_log_count).",
+            name,
+            _LINE_SEARCH_MAX_BACKTRACKS,
+            n,
+            n_units,
+            100.0 * frac,
+            unit,
+            max_newton_iter,
+        )
+
+
+def _warn_line_search_failures(
+    n_failed_bins: Array,
+    n_bins: int,
+    max_newton_iter: int,
+    filter_name: str,
+    unit: str = "time bins",
+) -> None:
+    """Log (host side, jit-safe) when many updates exhausted the line search.
+
+    ``n_failed_bins`` counts the updates (time bins, summed over neurons on
+    the block path; or independent regressions) in which at least one Fisher
+    iteration exhausted its backtracking with a non-negligible predicted
+    decrease. A warning is logged when ``n_failed_bins / n_bins`` exceeds
+    ``_LINE_SEARCH_FAIL_WARN_FRAC``. The check runs through
+    :func:`jax.debug.callback`, so it reports eagerly and from inside
+    ``jax.jit`` / ``jax.grad`` (e.g. an SGD loss) alike. Silent for
+    ``max_newton_iter <= 1`` (no line search runs).
+
+    Parameters
+    ----------
+    n_failed_bins : Array
+        Integer scalar count of failed updates.
+    n_bins : int
+        Number of updates the count is out of (static).
+    max_newton_iter : int
+        Fisher-scoring iterations per update (static).
+    filter_name : str
+        Name of the calling routine, used in the log message.
+    unit : str, default="time bins"
+        What one update is, used in the log message.
+    """
+    if max_newton_iter <= 1 or n_bins == 0:
+        return
+    jax.debug.callback(
+        functools.partial(
+            _log_line_search_failures,
+            n_units=n_bins,
+            max_newton_iter=max_newton_iter,
+            name=filter_name,
+            unit=unit,
+        ),
+        n_failed_bins,
+    )
+
+
+@overload
 def _point_process_laplace_update(
     one_step_mean: Array,
     one_step_cov: Array,
     spike_indicator_t: Array,
     dt: float,
     log_intensity_func: Callable[[Array], Array],
-    diagonal_boost: float = 1e-9,
-    grad_log_intensity_func: Optional[Callable[[Array], Array]] = None,
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: Literal[True] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: bool = ...,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]: ...
+
+
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = 0.0,
+    grad_log_intensity_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
     max_log_count: float = 20.0,
-) -> tuple[Array, Array, Array]:
+    return_line_search_failures: bool = False,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
     Performs a Bayesian update of the latent state posterior given observed
@@ -719,8 +1150,15 @@ def _point_process_laplace_update(
     log_intensity_func : Callable[[Array], Array]
         Function mapping state (n_latent,) to log-intensities (n_neurons,).
         Should return log(lambda) where lambda is firing rate in Hz.
-    diagonal_boost : float, default=1e-9
-        Small value added to precision matrix diagonal for numerical stability.
+    diagonal_boost : float, default=0.0
+        Absolute floor of the diagonal shift added before each Cholesky
+        factorization (prior covariance, posterior precision). The default
+        leaves only the scale-relative shift of
+        :func:`~state_space_practice.utils.psd_cholesky` (``1e-12 * |A_ii|``
+        in float64), which keeps the update scale-equivariant: rescaling the
+        latent state by ``c`` (all covariances by ``c**2``, the design by
+        ``1/c``) rescales the output exactly. A positive value breaks that
+        for covariances below ``~diagonal_boost / 1e-12`` in scale.
     grad_log_intensity_func : Callable[[Array], Array] | None, optional
         Pre-computed gradient function (Jacobian) of log_intensity_func.
         If None, computed via jax.jacfwd(log_intensity_func).
@@ -730,15 +1168,19 @@ def _point_process_laplace_update(
         If True, include the Laplace normalization and prior terms to approximate
         log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
         at the posterior mode without normalization.
-    max_newton_iter : int, default=1
+    max_newton_iter : int, default=3
         Maximum number of Fisher scoring iterations. Use > 1 with line search
         for numerical stability with large spike counts (e.g., many neurons).
         (Named ``max_newton_iter`` for backwards compatibility; the inner
         iterations are Fisher steps, not full Newton.)
     line_search_beta : float, default=0.5
-        Step size reduction factor for backtracking line search. Only used
-        when max_newton_iter > 1. At each iteration, step size is halved
-        until the negative log-posterior decreases or minimum alpha reached.
+        Step size reduction factor for the backtracking line search. Only
+        used when max_newton_iter > 1. Each iteration tries the step sizes
+        ``1, beta, ..., beta**(N - 1)`` (``N = _LINE_SEARCH_MAX_BACKTRACKS``)
+        and takes the largest that satisfies the Armijo sufficient-decrease
+        condition on the negative log-posterior, up to a relative round-off
+        slack; if none does, the iterate is kept (see
+        :func:`_fisher_scoring_line_search`).
     max_log_count : float, default=20.0
         Ceiling on ``log(rate * dt)`` applied inside ``_safe_expected_count``
         to prevent overflow when the Fisher step produces implausibly large
@@ -747,6 +1189,12 @@ def _point_process_laplace_update(
         corresponds to ~2.4e9 Hz at dt=0.2s, which is high enough to mask
         pathological outlier bins; tighter ceilings (e.g. ``log(500 * dt)``)
         catch them.
+    return_line_search_failures : bool, default=False
+        If True, also return the number of Fisher iterations whose Armijo
+        backtracking was exhausted (see :func:`_fisher_scoring_line_search`;
+        always 0 for ``max_newton_iter <= 1``). The filters aggregate it to
+        warn once per call.
+
     Returns
     -------
     posterior_mean : Array, shape (n_latent,)
@@ -755,12 +1203,15 @@ def _point_process_laplace_update(
         Updated state covariance after incorporating spike observations
     log_likelihood : Array
         Approximate log p(y_t | y_{1:t-1}) using a Laplace expansion (scalar array).
+    n_line_search_failures : Array, optional
+        Only with ``return_line_search_failures=True`` (int32 scalar).
 
     Notes
     -----
-    The Laplace approximation uses the predicted mean as the expansion point
-    for a single Fisher scoring step. For multiple neurons, the gradients
-    and Jacobians are summed across neurons.
+    The Fisher-scoring iteration starts at the predicted mean; with
+    ``max_newton_iter == 1`` it is a single step from there, otherwise up to
+    ``max_newton_iter`` line-searched steps toward the posterior mode. For
+    multiple neurons, the gradients and Jacobians are summed across neurons.
 
     For Poisson likelihood with log-link:
         log p(y | x) = sum_n [y_n * log(lambda_n * dt) - lambda_n * dt - log(y_n!)]
@@ -792,10 +1243,14 @@ def _point_process_laplace_update(
         grad_log_intensity_func = jax.jacfwd(log_intensity_func)
     grad_log_intensity = grad_log_intensity_func
 
-    # Prior precision via psd_solve for numerical stability
     n_latent = one_step_mean.shape[0]
-    identity = jnp.eye(n_latent)
-    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
+    identity = jnp.eye(n_latent, dtype=one_step_cov.dtype)
+    # Factor the prior covariance once: the precision (used by the Fisher
+    # steps and the quadratic form) and the log-determinant of the Laplace
+    # normaliser both come from this factor, so they see the same jittered
+    # matrix (psd_cholesky's scale-relative diagonal shift).
+    prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
+    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
 
     def _neg_log_posterior(x: Array) -> Array:
         """Negative log-posterior for line search."""
@@ -845,47 +1300,11 @@ def _point_process_laplace_update(
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         post_prec = symmetrize(prior_precision + fisher_info)
 
-        # Fisher-scoring direction
-        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
-        return delta, post_prec, gradient
-
-    def _line_search_step(carry, _):
-        """One iteration of Fisher scoring with backtracking line search."""
-        x, _ = carry
-        delta, _, _ = _fisher_step_at(x)
-        current_loss = _neg_log_posterior(x)
-
-        # Backtracking line search
-        def _backtrack(alpha_carry, _):
-            alpha, _ = alpha_carry
-            new_x = x + alpha * delta
-            new_loss = _neg_log_posterior(new_x)
-            improved = new_loss < current_loss
-            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
-            return (new_alpha, improved), None
-
-        (final_alpha, line_search_improved), _ = jax.lax.scan(
-            _backtrack, (jnp.array(1.0), jnp.array(False)), None, length=10
-        )
-        candidate_x = x + final_alpha * delta
-
-        # Reject uphill steps: reuse the improved flag from the backtracking
-        # scan rather than re-evaluating _neg_log_posterior. If improved is
-        # False, no step size decreased the loss — keep current x. Note
-        # that on realistic position-decoding data many time bins
-        # legitimately exhaust the 10-step backtrack (the no-op step is
-        # absorbed by the next bin), so a per-step print here would spam.
-        # Aggregating a fail-count across the time-bin scan and warning
-        # once host-side is the right design but requires plumbing through
-        # two nested scans; tracked as future work.
-        new_x = jnp.where(line_search_improved, candidate_x, x)
-
-        # Recompute precision at accepted point for consistency
-        _, new_post_prec, _ = _fisher_step_at(new_x)
-        return (new_x, new_post_prec), None
-
-    # Initialize at prior mean
-    x = one_step_mean
+        # Fisher-scoring direction. The factor is returned too: at the last
+        # iterate it is the posterior factor, so it is not refactored below.
+        post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
+        delta = jax.scipy.linalg.cho_solve(post_cho, gradient[:, None])[:, 0]
+        return delta, post_cho[0], gradient
 
     if max_newton_iter == 1:
         # Single-step Fisher scoring (no line search overhead).
@@ -902,22 +1321,30 @@ def _point_process_laplace_update(
         gradient = likelihood_gradient + prior_gradient
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         posterior_precision = symmetrize(prior_precision + fisher_info)
-        posterior_mean = one_step_mean + psd_solve(
-            posterior_precision, gradient, diagonal_boost=diagonal_boost
-        )
+        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
+        n_line_search_failures = jnp.zeros((), dtype=jnp.int32)
     else:
-        # Iterative Fisher scoring with line search
-        (posterior_mean, posterior_precision), _ = jax.lax.scan(
-            _line_search_step, (x, prior_precision), None, length=max_newton_iter
+        # Iterative Fisher scoring with line search, started at the prior mean
+        # (zero iterations return the prior unchanged). It returns the
+        # posterior-precision factor of the last Fisher step; the factor and
+        # lower flag follow psd_cholesky's convention, as prior_cho does.
+        posterior_mean, posterior_factor, n_line_search_failures = (
+            _fisher_scoring_line_search(
+                one_step_mean,
+                psd_cholesky(prior_precision, diagonal_boost=diagonal_boost)[0],
+                _fisher_step_at,
+                _neg_log_posterior,
+                max_newton_iter,
+                line_search_beta,
+            )
         )
+        post_cho = (posterior_factor, prior_cho[1])
 
-    # Posterior covariance via psd_solve. No post-hoc stabilization needed
-    # because posterior_precision is PSD by construction (sum of two PSD
-    # matrices). psd_solve itself adds a small diagonal boost for Cholesky
-    # conditioning.
-    posterior_cov = symmetrize(
-        psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
-    )
+    # Posterior covariance from the same factor. No post-hoc stabilization
+    # needed because posterior_precision is PSD by construction (sum of two
+    # PSD matrices); psd_cholesky adds a small diagonal boost for conditioning.
+    posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
@@ -934,13 +1361,20 @@ def _point_process_laplace_update(
         #                   - 0.5 log|P_prior| + 0.5 log|P_post|
         # The Gaussian +/- d/2 log(2*pi) terms cancel between the normalized
         # prior density and the Laplace integral.
+        #
+        # Both log-determinants come from factors already computed: the prior
+        # factor that gave prior_precision, and the posterior-precision factor
+        # that gave posterior_cov (log|P_post| = -log|Lambda_post|), so the
+        # normaliser is exact for the matrices the update actually used.
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
-        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
-        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
+        logdet_prior = psd_logdet(prior_cho)
+        logdet_post = -psd_logdet(post_cho)
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
+    if return_line_search_failures:
+        return posterior_mean, posterior_cov, log_likelihood, n_line_search_failures
     return posterior_mean, posterior_cov, log_likelihood
 
 
@@ -1029,18 +1463,52 @@ BERNOULLI_LOGIT_FAMILY = GLMFamily(
 )
 
 
+@overload
 def glm_laplace_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    observations: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
-    diagonal_boost: float = 1e-9,
-    grad_eta_func: Optional[Callable[[Array], Array]] = None,
+    diagonal_boost: float = ...,
+    grad_eta_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    return_line_search_failures: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def glm_laplace_update(
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
+    eta_func: Callable[[Array], Array],
+    family: GLMFamily,
+    diagonal_boost: float = ...,
+    grad_eta_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    *,
+    return_line_search_failures: Literal[True],
+) -> tuple[Array, Array, Array, Array]: ...
+
+
+def glm_laplace_update(
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
+    eta_func: Callable[[Array], Array],
+    family: GLMFamily,
+    diagonal_boost: float = 0.0,
+    grad_eta_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array]:
+    return_line_search_failures: bool = False,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
     """Family-generic Laplace measurement update via Fisher scoring.
 
     Generalizes :func:`_point_process_laplace_update` to any :class:`GLMFamily`
@@ -1051,11 +1519,11 @@ def glm_laplace_update(
 
     Parameters
     ----------
-    one_step_mean : Array, shape (n_latent,)
+    one_step_mean : ArrayLike, shape (n_latent,)
         Predicted mean ``A @ m_{t-1}``.
-    one_step_cov : Array, shape (n_latent, n_latent)
+    one_step_cov : ArrayLike, shape (n_latent, n_latent)
         Predicted covariance ``A @ P_{t-1} @ A.T + Q``.
-    observations : Array, shape (n_obs,)
+    observations : ArrayLike, shape (n_obs,)
         Observed counts (Poisson) or 0/1 indicators (Bernoulli) at this bin.
     eta_func : callable ``x -> eta``
         Maps state (n_latent,) to the linear predictor (n_obs,). May be nonlinear;
@@ -1064,7 +1532,7 @@ def glm_laplace_update(
     family : GLMFamily
         Observation family (e.g. :data:`BERNOULLI_LOGIT_FAMILY`).
     diagonal_boost, grad_eta_func, include_laplace_normalization, max_newton_iter,
-    line_search_beta
+    line_search_beta, return_line_search_failures
         As in :func:`_point_process_laplace_update`.
 
     Returns
@@ -1073,14 +1541,26 @@ def glm_laplace_update(
     posterior_cov : Array, shape (n_latent, n_latent)
     log_likelihood : Array
         Approximate ``log p(y_t | y_{1:t-1})`` (Laplace expansion) if normalized.
+    n_line_search_failures : Array, optional
+        Only with ``return_line_search_failures=True`` (int32 scalar): the
+        Fisher iterations whose backtracking was exhausted (see
+        :func:`_fisher_scoring_line_search`).
     """
+    one_step_mean = jnp.asarray(one_step_mean)
+    one_step_cov = jnp.asarray(one_step_cov)
+    observations = jnp.asarray(observations)
     if grad_eta_func is None:
         grad_eta_func = jax.jacfwd(eta_func)
     grad_eta = grad_eta_func
 
     n_latent = one_step_mean.shape[0]
-    identity = jnp.eye(n_latent)
-    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
+    identity = jnp.eye(n_latent, dtype=one_step_cov.dtype)
+    # Factor the prior covariance once: the precision (used by the Fisher
+    # steps and the quadratic form) and the log-determinant of the Laplace
+    # normaliser both come from this factor, so they see the same jittered
+    # matrix (psd_cholesky's scale-relative diagonal shift).
+    prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
+    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
 
     def _neg_log_posterior(x: Array) -> Array:
         eta = eta_func(x)
@@ -1101,31 +1581,11 @@ def glm_laplace_update(
         weight = family.fisher_weight(eta, mu)
         fisher_info = jacobian.T @ (weight[:, None] * jacobian)
         post_prec = symmetrize(prior_precision + fisher_info)
-        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
-        return delta, post_prec, gradient
+        # Return the factor too (see _point_process_laplace_update).
+        post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
+        delta = jax.scipy.linalg.cho_solve(post_cho, gradient[:, None])[:, 0]
+        return delta, post_cho[0], gradient
 
-    def _line_search_step(carry, _):
-        x, _ = carry
-        delta, _, _ = _fisher_step_at(x)
-        current_loss = _neg_log_posterior(x)
-
-        def _backtrack(alpha_carry, _):
-            alpha, _ = alpha_carry
-            new_x = x + alpha * delta
-            new_loss = _neg_log_posterior(new_x)
-            improved = new_loss < current_loss
-            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
-            return (new_alpha, improved), None
-
-        (final_alpha, line_search_improved), _ = jax.lax.scan(
-            _backtrack, (jnp.array(1.0), jnp.array(False)), None, length=10
-        )
-        candidate_x = x + final_alpha * delta
-        new_x = jnp.where(line_search_improved, candidate_x, x)
-        _, new_post_prec, _ = _fisher_step_at(new_x)
-        return (new_x, new_post_prec), None
-
-    x = one_step_mean
     if max_newton_iter == 1:
         # Single Fisher step from the prior mean (prior gradient is zero there).
         eta = eta_func(one_step_mean)
@@ -1138,31 +1598,105 @@ def glm_laplace_update(
         weight = family.fisher_weight(eta, mu)
         fisher_info = jacobian.T @ (weight[:, None] * jacobian)
         posterior_precision = symmetrize(prior_precision + fisher_info)
-        posterior_mean = one_step_mean + psd_solve(
-            posterior_precision, gradient, diagonal_boost=diagonal_boost
-        )
+        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
+        n_line_search_failures = jnp.zeros((), dtype=jnp.int32)
     else:
-        (posterior_mean, posterior_precision), _ = jax.lax.scan(
-            _line_search_step, (x, prior_precision), None, length=max_newton_iter
+        posterior_mean, posterior_factor, n_line_search_failures = (
+            _fisher_scoring_line_search(
+                one_step_mean,
+                psd_cholesky(prior_precision, diagonal_boost=diagonal_boost)[0],
+                _fisher_step_at,
+                _neg_log_posterior,
+                max_newton_iter,
+                line_search_beta,
+            )
         )
+        post_cho = (posterior_factor, prior_cho[1])
 
-    posterior_cov = symmetrize(
-        psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
-    )
+    posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
 
     eta_mode = eta_func(posterior_mean)
     mu_mode = family.mean(eta_mode)
     log_likelihood = family.loglik_normalized(observations, eta_mode, mu_mode)
 
     if include_laplace_normalization:
+        # Log-determinants from the prior / posterior-precision factors, as
+        # in _point_process_laplace_update.
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
-        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
-        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
+        logdet_prior = psd_logdet(prior_cho)
+        logdet_post = -psd_logdet(post_cho)
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
+    if return_line_search_failures:
+        return posterior_mean, posterior_cov, log_likelihood, n_line_search_failures
     return posterior_mean, posterior_cov, log_likelihood
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    *,
+    return_block_covariances: Literal[True],
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]: ...
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: bool = ...,
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]: ...
 
 
 def stochastic_point_process_filter(
@@ -1177,11 +1711,12 @@ def stochastic_point_process_filter(
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
     validate_inputs: bool = True,
-    block_n_neurons: Optional[int] = None,
-    block_size: Optional[int] = None,
+    block_n_neurons: int | None = None,
+    block_size: int | None = None,
     force_dense: bool = False,
-    max_newton_iter: int = 1,
-) -> tuple[Array, Array, Array]:
+    max_newton_iter: int = 3,
+    return_block_covariances: bool = False,
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
     This filter estimates a time-varying latent state ($x_k$) based on
@@ -1194,8 +1729,8 @@ def stochastic_point_process_filter(
     $$ y_{n,k} \\sim \\text{Poisson}(\\lambda_{n,k} \\Delta t) $$
 
     The filter uses a local Gaussian approximation (Laplace-EKF approach)
-    at each update step. It implements a single Fisher-scoring step per
-    time bin: the update uses the *expected* Hessian
+    at each update step, built by ``max_newton_iter`` Fisher-scoring
+    iterations per time bin (default 3): the update uses the *expected* Hessian
     $E[\\nabla^2 \\log p]$ of the Poisson log-likelihood (equivalently, the
     negative of the inverse-intensity-weighted outer product) rather than
     the observed Hessian, which is what makes this Fisher scoring rather
@@ -1203,8 +1738,10 @@ def stochastic_point_process_filter(
     negative semidefinite, so no damping or trust-region safeguarding is
     needed for PSD of the covariance update.
 
-    If ``max_newton_iter > 1`` the same Fisher-scoring step is iterated
-    per time bin with a fixed-length backtracking scan. For a true Newton
+    With ``max_newton_iter > 1`` each iteration is gated by an Armijo
+    backtracking line search (:func:`_fisher_scoring_line_search`); when more
+    than 10% of the bins exhaust it, one warning is logged per call.
+    ``max_newton_iter == 1`` is a single Fisher step without line search. For a true Newton
     step with observed Hessian + Armijo line search, see
     :func:`switching_point_process._single_neuron_glm_step_second_order`.
 
@@ -1240,6 +1777,13 @@ def stochastic_point_process_filter(
         Design matrix ($Z_k$) used in the intensity function.
         Shape depends on the log_conditional_intensity function.
         For multi-neuron with default linear intensity, use (n_time, n_neurons, n_params).
+        On the block-diagonal path -- ``block_n_neurons`` / ``block_size``
+        given, ``force_dense=False`` and the default linear
+        :func:`log_conditional_intensity` -- the shared per-neuron basis
+        ``Z_base`` of shape ``(n_time, block_size)`` may be passed instead of
+        the block-expanded matrix; the block filter works from ``Z_base``
+        directly. Any other configuration takes the dense path, which needs
+        the design matrix in the form ``log_conditional_intensity`` expects.
     spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
         Observed spike counts or indicators ($y_k$).
         For single neuron: (n_time,)
@@ -1266,13 +1810,22 @@ def stochastic_point_process_filter(
         otherwise drive the Fisher step into a catastrophic region. The
         default of 20.0 corresponds to ~2.4e9 Hz at dt=0.2s and is kept
         for backwards compatibility with existing callers.
+    return_block_covariances : bool, default=False
+        Block-diagonal path only. If True, return the filtered covariance as
+        a :class:`BlockDiagonalCovariance` holding the per-neuron
+        ``(n_neurons, n_time, block_size, block_size)`` blocks instead of
+        materialising the dense ``(n_time, n_params, n_params)`` array
+        (``n_neurons`` times larger, >99% structural zeros). Ignored on the
+        dense path, which always returns dense arrays.
 
     Returns
     -------
     posterior_mean : Array, shape (n_time, n_params)
         Filtered posterior means ($x_{k|k}$).
     posterior_variance : Array, shape (n_time, n_params, n_params)
-        Filtered posterior covariances ($P_{k|k}$).
+        Filtered posterior covariances ($P_{k|k}$); a
+        :class:`BlockDiagonalCovariance` of the same dense shape when
+        ``return_block_covariances`` applies.
     marginal_log_likelihood : Array
         Total log-likelihood of the observations given the model (scalar array).
 
@@ -1317,30 +1870,36 @@ def stochastic_point_process_filter(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
+    # Numerical sanity check BEFORE the block dispatch below. The block path
+    # (large-state / long-T) is exactly where these checks matter, so they
+    # must run before dispatch, not only on the dense path. Gated behind
+    # ``validate_inputs`` so tight inner loops (e.g. SGD) can pass False after
+    # a single validation at the top of fit_sgd. stacklevel=4 so the warning
+    # points at the user's call site: user -> fit_sgd -> _sgd_loss_fn ->
+    # stochastic_point_process_filter -> _validate. Shape handling below is
+    # static and always runs.
     if validate_inputs:
-        validate_scalar(dt, "dt", positive=True)
-        validate_count_array(spike_indicator, "spike_indicator")
-        # Numerical sanity check BEFORE the block dispatch below: raises on
-        # non-PSD init_cov, warns on f32 + long T + ill-conditioned configs.
-        # The block path (large-state / long-T) is exactly where these matter,
-        # so the check must run before dispatch, not only on the dense path.
-        # Gated behind ``validate_inputs`` so tight inner loops (e.g. SGD) can
-        # pass False after a single validation at the top of fit_sgd.
-        # stacklevel=4 so the warning points at the user's call site:
-        # user -> fit_sgd -> _sgd_loss_fn -> stochastic_point_process_filter
-        # -> _validate.
-        _validate_filter_numerics(
-            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=4
+        _validate_public_inputs(
+            dt,
+            init_mean_params,
+            init_covariance_params,
+            design_matrix,
+            spike_indicator,
+            transition_matrix,
+            process_cov,
+            filter_name="stochastic_point_process_filter",
+            stacklevel=4,
         )
 
     # Block-diagonal dispatch (opt-in via block_n_neurons / block_size).
-    # The caller is responsible for calling _detect_block_diagonal_problem
-    # ONCE at fit entry time (outside jax.jit / jax.grad) to determine
-    # these integers. Inside the jit boundary they are Python constants,
-    # not traced, so we can use them for static slicing of the traced
-    # (init_mean, init_cov, A, Q, design_matrix) arrays into per-neuron
-    # factors. This is safe because block extraction is pure array
-    # slicing — no host-side float() conversions.
+    # The caller is responsible for verifying the block structure ONCE at
+    # fit entry time (outside jax.jit / jax.grad; see the
+    # BlockDiagonalStructure contract and _block_diagonal_parameters_ok) to
+    # determine these integers. Inside
+    # the jit boundary they are Python constants, not traced, so we can use
+    # them for static slicing of the traced (init_mean, init_cov, A, Q,
+    # design_matrix-or-Z_base) arrays into per-neuron factors. This is safe
+    # because block extraction is pure array slicing — no host syncs.
     use_block_dispatch = (
         block_n_neurons is not None
         and block_size is not None
@@ -1348,34 +1907,13 @@ def stochastic_point_process_filter(
         and _uses_default_linear_log_intensity(log_conditional_intensity)
     )
     if use_block_dispatch:
-        # use_block_dispatch is only True when both are set (see its definition);
-        # assert so mypy narrows block_n_neurons / block_size from int | None to int.
-        assert block_n_neurons is not None and block_size is not None
-        if spike_indicator.ndim == 1:
-            raise ValueError(
-                "block_n_neurons / block_size can only be passed for "
-                "multi-neuron (2D spike_indicator) inputs."
-            )
-        # Shape guard: block_n_neurons * block_size must match the total
-        # state dimension. A mismatch means the caller passed wrong
-        # detection integers or the model state shape changed between
-        # detection and dispatch.
-        expected_state_dim = block_n_neurons * block_size
-        if init_covariance_params.shape[-1] != expected_state_dim:
-            raise ValueError(
-                f"block dispatch shape mismatch: block_n_neurons="
-                f"{block_n_neurons} * block_size={block_size} = "
-                f"{expected_state_dim}, but init_cov has shape "
-                f"{init_covariance_params.shape}. Re-run "
-                f"_detect_block_diagonal_problem to refresh the "
-                f"dispatch integers."
-            )
-        structure = _build_block_structure_from_traced(
+        structure = _validated_dispatch_block_structure(
             init_mean_params,
             init_covariance_params,
             transition_matrix,
             process_cov,
             design_matrix,
+            spike_indicator,
             block_n_neurons,
             block_size,
         )
@@ -1386,6 +1924,7 @@ def stochastic_point_process_filter(
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
             max_newton_iter=max_newton_iter,
+            return_block_covariances=return_block_covariances,
         )
 
     # (Numerical sanity check already ran above, before block dispatch.)
@@ -1395,9 +1934,7 @@ def stochastic_point_process_filter(
     if single_neuron:
         spike_indicator = spike_indicator[:, None]
 
-    # jax.jit erases the wrapped function's return type to Any; the typed
-    # binding restores it so the declared return type is honored.
-    result: tuple[Array, Array, Array] = _stochastic_point_process_filter_impl(
+    result = _stochastic_point_process_filter_impl(
         init_mean_params,
         init_covariance_params,
         design_matrix,
@@ -1410,11 +1947,44 @@ def stochastic_point_process_filter(
         max_log_count=max_log_count,
         max_newton_iter=max_newton_iter,
     )
-    return result
+    filtered_mean, filtered_cov, marginal_log_likelihood, n_failed_bins = result
+    _warn_line_search_failures(
+        n_failed_bins,
+        spike_indicator.shape[0],
+        max_newton_iter,
+        "stochastic_point_process_filter",
+    )
+    return filtered_mean, filtered_cov, marginal_log_likelihood
+
+
+_StepFn = TypeVar("_StepFn", bound=Callable[..., Any])
+
+
+def _remat_filter_step(step: _StepFn) -> _StepFn:
+    """Rematerialize a filter's per-time-step function under reverse-mode AD.
+
+    ``fit_sgd`` differentiates the marginal log-likelihood through the
+    forward filters. Without rematerialization reverse mode keeps, for every
+    time step, the residuals of the whole Laplace update -- each Fisher
+    iteration's Cholesky factors, triangular solves and iterates -- about 20
+    state-covariance-sized arrays per step (3 GB for the block-diagonal
+    filter at 5000 bins, 10 neurons and 20 basis functions per neuron).
+    Under :func:`jax.checkpoint` only the step's inputs (the scan carry,
+    about one covariance per step) are kept, and the step is recomputed in
+    the backward pass, which costs one extra forward step per time step.
+
+    Forward evaluation runs the same operations, so the filter's outputs
+    are bit-identical. The Fisher-scoring line search's ``while_loop`` is
+    primal-only (see :func:`_fisher_scoring_line_search`), so it is simply
+    re-run in the recomputation. ``prevent_cse=False`` is safe because the
+    step runs inside ``lax.scan``: the recomputation sits in the backward
+    loop, where XLA cannot merge it with the forward loop's copy.
+    """
+    return cast(_StepFn, jax.checkpoint(step, prevent_cse=False))
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=[
         "log_conditional_intensity",
         "include_laplace_normalization",
@@ -1433,9 +2003,14 @@ def _stochastic_point_process_filter_impl(
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
-    max_newton_iter: int = 1,
-) -> tuple[Array, Array, Array]:
-    """JIT-compiled inner implementation of the point process filter."""
+    max_newton_iter: int = 3,
+) -> tuple[Array, Array, Array, Array]:
+    """JIT-compiled inner implementation of the point process filter.
+
+    Returns the filtered means, covariances and marginal log-likelihood, plus
+    the number of time bins whose Fisher-scoring line search was exhausted
+    (always 0 for ``max_newton_iter <= 1``).
+    """
     # Coerce the ArrayLike inputs to Array (identity on the arrays the public
     # entry point already passes) so the array algebra and the scan carry below
     # type as Array rather than the ArrayLike scalar union.
@@ -1446,19 +2021,39 @@ def _stochastic_point_process_filter_impl(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
+    # The scan carry must keep one dtype, so run in the common floating dtype
+    # of everything that enters the state update (e.g. float32 init moments
+    # with float64 dynamics run in float64). The design matrix and spikes are
+    # left as given -- a custom log-intensity may index with them -- but
+    # their floating dtypes take part in the promotion.
+    dtype = _common_float_dtype(
+        init_mean_params,
+        init_covariance_params,
+        transition_matrix,
+        process_cov,
+        design_matrix,
+        spike_indicator,
+    )
+    init_mean_params = init_mean_params.astype(dtype)
+    init_covariance_params = init_covariance_params.astype(dtype)
+    transition_matrix = transition_matrix.astype(dtype)
+    process_cov = process_cov.astype(dtype)
+
     # Pre-compute gradient function outside the scan.
-    def _log_intensity_with_design(design_matrix_t, x):
+    def _log_intensity_with_design(design_matrix_t: Array, x: Array) -> Array:
         log_lambda = log_conditional_intensity(design_matrix_t, x)
         return jnp.atleast_1d(log_lambda)
 
-    _grad_log_intensity = jax.jacfwd(_log_intensity_with_design, argnums=1)
+    _grad_log_intensity: Callable[[Array, Array], Array] = jax.jacfwd(
+        _log_intensity_with_design, argnums=1
+    )
 
     def _step(
-        params_prev: tuple[Array, Array, Array],
+        params_prev: tuple[Array, Array, Array, Array],
         args: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array]]:
+    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step."""
-        mean_prev, variance_prev, marginal_log_likelihood = params_prev
+        mean_prev, variance_prev, marginal_log_likelihood, n_failed_bins = params_prev
         design_matrix_t, spike_indicator_t = args
 
         one_step_mean = transition_matrix @ mean_prev
@@ -1467,89 +2062,121 @@ def _stochastic_point_process_filter_impl(
             transition_matrix @ variance_prev_sym @ transition_matrix.T + process_cov
         )
 
-        def log_intensity_func(x):
+        def log_intensity_func(x: Array) -> Array:
             return _log_intensity_with_design(design_matrix_t, x)
 
-        def grad_log_intensity_func(x):
+        def grad_log_intensity_func(x: Array) -> Array:
             return _grad_log_intensity(design_matrix_t, x)
 
-        posterior_mean, posterior_covariance, log_lik = _point_process_laplace_update(
-            one_step_mean,
-            one_step_covariance,
-            spike_indicator_t,
-            dt,
-            log_intensity_func,
-            grad_log_intensity_func=grad_log_intensity_func,
-            include_laplace_normalization=include_laplace_normalization,
-            max_log_count=max_log_count,
-            max_newton_iter=max_newton_iter,
+        posterior_mean, posterior_covariance, log_lik, n_failed = (
+            _point_process_laplace_update(
+                one_step_mean,
+                one_step_covariance,
+                spike_indicator_t,
+                dt,
+                log_intensity_func,
+                grad_log_intensity_func=grad_log_intensity_func,
+                include_laplace_normalization=include_laplace_normalization,
+                max_log_count=max_log_count,
+                max_newton_iter=max_newton_iter,
+                return_line_search_failures=True,
+            )
         )
 
         marginal_log_likelihood += log_lik
+        n_failed_bins += (n_failed > 0).astype(jnp.int32)
 
-        return (posterior_mean, posterior_covariance, marginal_log_likelihood), (
+        return (
+            posterior_mean,
+            posterior_covariance,
+            marginal_log_likelihood,
+            n_failed_bins,
+        ), (
             posterior_mean,
             posterior_covariance,
         )
 
-    marginal_log_likelihood = jnp.array(0.0)
+    marginal_log_likelihood = jnp.zeros((), dtype=dtype)
+    # Each time step is rematerialized under reverse-mode AD (see
+    # _remat_filter_step).
     (
-        (_, _, marginal_log_likelihood),
+        (_, _, marginal_log_likelihood, n_failed_bins),
         (
             filtered_mean,
             filtered_cov,
         ),
     ) = jax.lax.scan(
-        _step,
-        (init_mean_params, init_covariance_params, marginal_log_likelihood),
+        _remat_filter_step(_step),
+        (
+            init_mean_params,
+            init_covariance_params,
+            marginal_log_likelihood,
+            jnp.zeros((), dtype=jnp.int32),
+        ),
         (design_matrix, spike_indicator),
     )
 
-    return filtered_mean, filtered_cov, marginal_log_likelihood
+    return filtered_mean, filtered_cov, marginal_log_likelihood, n_failed_bins
 
 
-def _run_forward_block_diagonal(
-    structure: BlockDiagonalStructure,
+@functools.partial(
+    typed_jit,
+    static_argnames=("include_laplace_normalization", "max_newton_iter"),
+)
+def _block_diagonal_forward_core(
+    A_blocks: Array,
+    Q_blocks: Array,
+    init_means_per_neuron: Array,
+    init_covs_per_neuron: Array,
+    Z_base: Array,
     spike_indicator: Array,
     dt: float,
-    include_laplace_normalization: bool = True,
-    max_log_count: float = 20.0,
-    max_newton_iter: int = 1,
-) -> tuple[Array, Array, Array]:
-    """Run the per-neuron forward Laplace-EKF filter in block form.
+    *,
+    include_laplace_normalization: bool,
+    max_log_count: float,
+    max_newton_iter: int,
+) -> tuple[Array, Array, Array, Array]:
+    """JIT-compiled per-neuron forward Laplace-EKF scan.
 
-    Shared helper for ``_stochastic_point_process_filter_block_diagonal``
-    and ``_stochastic_point_process_smoother_block_diagonal``. Both
-    consumers need access to the per-neuron forward posteriors —
-    the filter reassembles them into dense form immediately, while
-    the smoother feeds them to the backward pass before reassembly.
+    Takes the array fields of a :class:`BlockDiagonalStructure` explicitly,
+    so its Python-int fields never become traced, and the option flags as
+    static arguments. One ``lax.scan`` over time runs every neuron's step
+    (vmapped over neurons), each with its own ``A_blocks[j]`` and
+    ``Q_blocks[j]``, initial state and spikes. The scan is therefore traced
+    and compiled once per (shapes, dtypes, options) and reused across calls --
+    every EM iteration of ``PlaceFieldModel.fit`` -- instead of being
+    re-traced on each call. ``dt`` and ``max_log_count`` are ordinary
+    (traced) scalars, so changing their values does not recompile.
 
-    Parameters
-    ----------
-    structure : BlockDiagonalStructure
-    spike_indicator : Array, shape (n_time, n_neurons)
-    dt : float
-    include_laplace_normalization : bool, default=True
-    max_log_count : float, default=20.0
-
-    Returns
-    -------
-    fwd_means : Array, shape (n_neurons, n_time, block_size)
-        Per-neuron forward posterior means at each time step.
-    fwd_covs : Array, shape (n_neurons, n_time, block_size, block_size)
-        Per-neuron forward posterior covariances.
-    lls_per_neuron : Array, shape (n_neurons,)
-        Per-neuron marginal log-likelihood (sum over time steps).
+    See :func:`_run_forward_block_diagonal` for the returned arrays.
     """
-    A_block = structure.A_block
-    Q_block = structure.Q_block
+    # One carry dtype for every neuron's scan (see
+    # _stochastic_point_process_filter_impl).
+    dtype = _common_float_dtype(
+        A_blocks,
+        Q_blocks,
+        init_means_per_neuron,
+        init_covs_per_neuron,
+        Z_base,
+        spike_indicator,
+    )
+    A_blocks = A_blocks.astype(dtype)
+    Q_blocks = Q_blocks.astype(dtype)
+    init_means_per_neuron = init_means_per_neuron.astype(dtype)
+    init_covs_per_neuron = init_covs_per_neuron.astype(dtype)
+    Z_base = Z_base.astype(dtype)
 
-    def _step_one_neuron(carry, args: tuple[Array, Array]):
-        mean_prev, cov_prev, ll_acc = carry
+    def _step_one_neuron(
+        A_j: Array,
+        Q_j: Array,
+        carry: tuple[Array, Array, Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array]]:
+        mean_prev, cov_prev, ll_acc, n_failed_bins = carry
         z_row_t, y_t = args
-        one_step_mean = A_block @ mean_prev
+        one_step_mean = A_j @ mean_prev
         cov_prev_sym = symmetrize(cov_prev)
-        one_step_cov = symmetrize(A_block @ cov_prev_sym @ A_block.T + Q_block)
+        one_step_cov = symmetrize(A_j @ cov_prev_sym @ A_j.T + Q_j)
         spike_as_vec = jnp.atleast_1d(y_t)
 
         def _lin(x_block: Array) -> Array:
@@ -1557,14 +2184,14 @@ def _run_forward_block_diagonal(
 
         def _grad(_x_block: Array) -> Array:
             # Analytical gradient: d(log_intensity)/dx = z_row_t.
-            # Safe because _detect_block_diagonal_problem's contract
-            # requires a Z_base-block design matrix, which produces a
-            # strictly linear log_intensity. The block-diagonal path
-            # cannot receive a nonlinear intensity (e.g. PositionDecoder's
-            # KDE rate map) — detection rejects ndim==2 design matrices.
+            # Safe because the public filter / smoother only dispatch to
+            # the block path when the log-intensity is the default linear
+            # one (the ``_uses_default_linear_log_intensity`` term of
+            # ``use_block_dispatch``); a nonlinear intensity (e.g.
+            # PositionDecoder's KDE rate map) always takes the dense path.
             return z_row_t[None, :]
 
-        post_mean, post_cov, log_lik_step = _point_process_laplace_update(
+        post_mean, post_cov, log_lik_step, n_failed = _point_process_laplace_update(
             one_step_mean,
             one_step_cov,
             spike_as_vec,
@@ -1574,54 +2201,264 @@ def _run_forward_block_diagonal(
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
             max_newton_iter=max_newton_iter,
+            return_line_search_failures=True,
         )
         return (
-            (post_mean, post_cov, ll_acc + log_lik_step),
+            (
+                post_mean,
+                post_cov,
+                ll_acc + log_lik_step,
+                n_failed_bins + (n_failed > 0).astype(jnp.int32),
+            ),
             (post_mean, post_cov),
         )
 
-    def _run_one_neuron(init_mean_j: Array, init_cov_j: Array, spikes_j: Array):
-        init_carry = (init_mean_j, init_cov_j, jnp.array(0.0, dtype=init_mean_j.dtype))
-        (_, _, ll_j), (means_j, covs_j) = jax.lax.scan(
-            _step_one_neuron,
-            init_carry,
-            (structure.Z_base, spikes_j),
-        )
-        return means_j, covs_j, ll_j
+    # Scan over time with the per-neuron step vmapped inside it, writing the
+    # filtered moments into neuron-major buffers carried through the scan
+    # (updated in place). Stacking them as scan outputs would lay them out
+    # time-major, and the transpose to the per-neuron layout is a full-size
+    # copy.
+    n_neurons = init_means_per_neuron.shape[0]
+    n_time = Z_base.shape[0]
+    # Each time step is rematerialized under reverse-mode AD (see
+    # _remat_filter_step). The buffer writes below stay outside the
+    # checkpoint: they need no residuals.
+    step_all = _remat_filter_step(
+        jax.vmap(_step_one_neuron, in_axes=(0, 0, 0, (None, 0)))
+    )
 
-    # jax.vmap erases the return type to Any; the typed binding restores it.
-    fwd: tuple[Array, Array, Array] = jax.vmap(_run_one_neuron, in_axes=(0, 0, 1))(
+    def _step_all_neurons(
+        carry: tuple[tuple[Array, Array, Array, Array], Array, Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[tuple[Array, Array, Array, Array], Array, Array, Array], None]:
+        neuron_carry, means_buffer, covs_buffer, t = carry
+        neuron_carry, (post_means, post_covs) = step_all(
+            A_blocks, Q_blocks, neuron_carry, args
+        )
+        # The step is still traced when n_time == 0 (a zero-length scan),
+        # where the buffers are empty and there is nothing to write.
+        if n_time > 0:
+            means_buffer = jax.lax.dynamic_update_index_in_dim(
+                means_buffer, post_means, t, axis=1
+            )
+            covs_buffer = jax.lax.dynamic_update_index_in_dim(
+                covs_buffer, post_covs, t, axis=1
+            )
+        return (neuron_carry, means_buffer, covs_buffer, t + 1), None
+
+    init_carry = (
+        (
+            init_means_per_neuron,
+            init_covs_per_neuron,
+            jnp.zeros((n_neurons,), dtype),
+            jnp.zeros((n_neurons,), dtype=jnp.int32),
+        ),
+        jnp.zeros((n_neurons, n_time, *init_means_per_neuron.shape[1:]), dtype),
+        jnp.zeros((n_neurons, n_time, *init_covs_per_neuron.shape[1:]), dtype),
+        jnp.asarray(0),
+    )
+    ((_, _, lls_per_neuron, n_failed_per_neuron), means, covs, _), _ = jax.lax.scan(
+        _step_all_neurons, init_carry, (Z_base, spike_indicator)
+    )
+    return means, covs, lls_per_neuron, n_failed_per_neuron
+
+
+def _run_forward_block_diagonal(
+    structure: BlockDiagonalStructure,
+    spike_indicator: Array,
+    dt: float,
+    include_laplace_normalization: bool = True,
+    max_log_count: float = 20.0,
+    max_newton_iter: int = 3,
+) -> tuple[Array, Array, Array, Array]:
+    """Run the per-neuron forward Laplace-EKF filter in block form.
+
+    Thin wrapper around the compiled :func:`_block_diagonal_forward_core`
+    that unpacks a ``BlockDiagonalStructure``. Shared by the block filter
+    and (through :func:`_block_diagonal_smoother_core`) the block smoother.
+
+    Parameters
+    ----------
+    structure : BlockDiagonalStructure
+    spike_indicator : Array, shape (n_time, n_neurons)
+    dt : float
+    include_laplace_normalization : bool, default=True
+    max_log_count : float, default=20.0
+    max_newton_iter : int, default=3
+
+    Returns
+    -------
+    fwd_means : Array, shape (n_neurons, n_time, block_size)
+        Per-neuron forward posterior means at each time step.
+    fwd_covs : Array, shape (n_neurons, n_time, block_size, block_size)
+        Per-neuron forward posterior covariances.
+    lls_per_neuron : Array, shape (n_neurons,)
+        Per-neuron marginal log-likelihood (sum over time steps).
+    n_failed_per_neuron : Array, shape (n_neurons,)
+        Per-neuron number of time bins whose Fisher-scoring line search was
+        exhausted (0 for ``max_newton_iter <= 1``).
+    """
+    fwd = _block_diagonal_forward_core(
+        structure.A_blocks,
+        structure.Q_blocks,
         structure.init_means_per_neuron,
         structure.init_covs_per_neuron,
+        structure.Z_base,
         spike_indicator,
+        dt,
+        include_laplace_normalization=include_laplace_normalization,
+        max_log_count=max_log_count,
+        max_newton_iter=max_newton_iter,
     )
     return fwd
 
 
-def _assemble_block_diagonal_covs(
-    covs_per_neuron: Array,
-    n_neurons: int,
-    block_size: int,
-) -> Array:
-    """Reassemble (n_neurons, n_time, nb, nb) blocks into a dense
-    (n_time, n_state, n_state) block-diagonal matrix via a single
-    broadcasted scatter.
+@functools.partial(
+    typed_jit,
+    static_argnames=("include_laplace_normalization", "max_newton_iter"),
+)
+def _block_diagonal_smoother_core(
+    A_blocks: Array,
+    Q_blocks: Array,
+    init_means_per_neuron: Array,
+    init_covs_per_neuron: Array,
+    Z_base: Array,
+    spike_indicator: Array,
+    dt: float,
+    *,
+    include_laplace_normalization: bool,
+    max_log_count: float,
+    max_newton_iter: int,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    """JIT-compiled per-neuron forward filter plus backward RTS pass.
 
-    Shared between the filter and smoother for cov / cross_cov reassembly.
+    Same compile-once contract as :func:`_block_diagonal_forward_core`:
+    the forward core is inlined, so the forward and backward passes run as
+    one executable, compiled once per (shapes, dtypes, options) and reused
+    on every call.
+
+    Returns ``(fwd_means, fwd_covs, lls_per_neuron, n_failed_per_neuron,
+    smoother_means, smoother_covs, smoother_cross_covs)``, all per neuron:
+    means are ``(n_neurons, n_time, nb)``, covariances
+    ``(n_neurons, n_time, nb, nb)`` and cross-covariances
+    ``(n_neurons, n_time - 1, nb, nb)``; ``n_failed_per_neuron`` counts the
+    bins whose line search was exhausted.
     """
-    n_state = n_neurons * block_size
-    block_offsets = jnp.arange(n_neurons) * block_size
-    within_block = jnp.arange(block_size)
-    row_idx = block_offsets[:, None] + within_block[None, :]
-    col_idx = row_idx
+    fwd_means, fwd_covs, lls_per_neuron, n_failed_per_neuron = (
+        _block_diagonal_forward_core(
+            A_blocks,
+            Q_blocks,
+            init_means_per_neuron,
+            init_covs_per_neuron,
+            Z_base,
+            spike_indicator,
+            dt,
+            include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
+        )
+    )
 
-    def _assemble_one(covs_at_t: Array) -> Array:
-        dense = jnp.zeros((n_state, n_state), dtype=covs_at_t.dtype)
-        return dense.at[row_idx[:, :, None], col_idx[:, None, :]].set(covs_at_t)
+    # Backward RTS smoother pass per neuron. _kalman_smoother_update is
+    # observation-model-agnostic — it uses only A, Q, and the filtered
+    # Gaussian moments. For block-diagonal A and Q, the backward pass
+    # decomposes into independent per-neuron smoothers (neuron j with its
+    # own A_j, Q_j), exactly matching the dense filter's backward pass on
+    # the block-diagonal problem.
+    #
+    # The outputs are written in place: _scan_with_boundary carries the
+    # smoothed mean/cov buffers (the terminal slot holds the filtered
+    # moments, which the smoother leaves unchanged) and reads the filtered
+    # moments by index, and the cross-covariances go into a buffer carried
+    # here. A scan-stacked output under vmap is laid out time-major and
+    # transposed to the per-neuron layout afterwards (a full-size copy), so
+    # none of the three outputs is stacked by the scan.
+    def _backward_step(
+        A_j: Array,
+        Q_j: Array,
+        carry: tuple[tuple[Array, Array], Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[
+        tuple[tuple[Array, Array], Array, Array], tuple[tuple[Array, Array], None]
+    ]:
+        (next_smoother_mean, next_smoother_cov), cross_cov_buffer, t = carry
+        filter_mean, filter_cov = args
+        sm, sc, scc = _kalman_smoother_update(
+            next_smoother_mean,
+            next_smoother_cov,
+            filter_mean,
+            filter_cov,
+            Q_j,
+            A_j,
+        )
+        # The step is still traced when n_time == 1 (a zero-length scan),
+        # where the buffer is empty and there is nothing to write.
+        if cross_cov_buffer.shape[0] > 0:
+            cross_cov_buffer = jax.lax.dynamic_update_index_in_dim(
+                cross_cov_buffer, scc, t, axis=0
+            )
+        return ((sm, sc), cross_cov_buffer, t - 1), ((sm, sc), None)
 
-    # Input: (n_neurons, n_time_dim, nb, nb). Transpose to put time first.
-    covs_time_first = jnp.transpose(covs_per_neuron, (1, 0, 2, 3))
-    return jax.vmap(_assemble_one)(covs_time_first)
+    def _run_backward_one_neuron(
+        A_j: Array, Q_j: Array, means_j: Array, covs_j: Array
+    ) -> tuple[Array, Array, Array]:
+        n_time = means_j.shape[0]
+        terminal = (means_j[-1], covs_j[-1])
+        init_carry = (
+            terminal,
+            jnp.zeros((n_time - 1, *covs_j.shape[1:]), covs_j.dtype),
+            jnp.asarray(n_time - 2),
+        )
+        (_, cross_covs, _), (means, covs), _ = _scan_with_boundary(
+            functools.partial(_backward_step, A_j, Q_j),
+            init_carry,
+            (means_j, covs_j),
+            (0, 0),
+            n_time - 1,
+            terminal,
+            reverse=True,
+        )
+        return means, covs, cross_covs
+
+    smoother_means, smoother_covs, smoother_cross_covs = jax.vmap(
+        _run_backward_one_neuron
+    )(A_blocks, Q_blocks, fwd_means, fwd_covs)
+    return (
+        fwd_means,
+        fwd_covs,
+        lls_per_neuron,
+        n_failed_per_neuron,
+        smoother_means,
+        smoother_covs,
+        smoother_cross_covs,
+    )
+
+
+def _assemble_block_diagonal_covs(covs_per_neuron: Array) -> Array:
+    """Reassemble ``(n_neurons, n_time, nb, nb)`` blocks into the dense
+    ``(n_time, n_state, n_state)`` block-diagonal array.
+
+    One scatter per time step (vmapped over the time axis of the block
+    storage directly, without an intermediate transposed copy). Used only
+    when a caller asks for dense covariances; the block path otherwise hands
+    out a :class:`BlockDiagonalCovariance`.
+    """
+    return jax.vmap(_assemble_block_diagonal_matrix, in_axes=1)(covs_per_neuron)
+
+
+def _concatenate_neuron_means(means_per_neuron: Array) -> Array:
+    """``(n_neurons, n_time, nb)`` per-neuron means -> ``(n_time, n_neurons * nb)``."""
+    n_neurons, n_time, nb = means_per_neuron.shape
+    return jnp.transpose(means_per_neuron, (1, 0, 2)).reshape(n_time, n_neurons * nb)
+
+
+def _package_block_covs(
+    covs_per_neuron: Array, return_block_covariances: bool
+) -> Array | BlockDiagonalCovariance:
+    """Per-neuron covariance blocks as a container or as the dense array."""
+    if return_block_covariances:
+        return BlockDiagonalCovariance(covs_per_neuron)
+    return _assemble_block_diagonal_covs(covs_per_neuron)
 
 
 def _stochastic_point_process_filter_block_diagonal(
@@ -1630,12 +2467,13 @@ def _stochastic_point_process_filter_block_diagonal(
     dt: float,
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
-    max_newton_iter: int = 1,
-) -> tuple[Array, Array, Array]:
+    max_newton_iter: int = 3,
+    return_block_covariances: bool = False,
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]:
     """Block-diagonal Laplace-EKF filter via vmapped per-neuron scans.
 
     Consumes a ``BlockDiagonalStructure`` (from
-    ``_detect_block_diagonal_problem``) and runs ``n_neurons`` independent
+    ``_build_block_structure_from_traced``) and runs ``n_neurons`` independent
     filters in parallel via ``jax.vmap``. Each per-neuron filter operates
     at ``d=block_size`` state dimension rather than ``d=n_neurons*block_size``,
     giving ~``n_neurons^2`` speedup on the per-step Cholesky.
@@ -1646,7 +2484,8 @@ def _stochastic_point_process_filter_block_diagonal(
     into ``n_neurons`` independent per-neuron posteriors. Specifically:
 
     - ``A @ P @ A^T + Q`` is block-diagonal → each block is
-      ``A_block @ P_j @ A_block^T + Q_block`` computed independently.
+      ``A_j @ P_j @ A_j^T + Q_j`` computed independently, with neuron
+      ``j``'s own diagonal blocks ``A_j``, ``Q_j``.
     - ``J^T diag(rate*dt) J`` (Fisher info) for neuron j depends only
       on that neuron's basis slice and its own weights, so it contributes
       only to block j of the posterior precision.
@@ -1661,25 +2500,26 @@ def _stochastic_point_process_filter_block_diagonal(
     Therefore: per-neuron ``log p(y_t^j | y_{1:t-1})`` contributions
     sum to the full-problem marginal log-likelihood.
 
-    This equivalence is exact for the default single Fisher step
-    (``max_newton_iter == 1``). For ``max_newton_iter > 1`` the two paths
-    differ: the dense update runs one *global* backtracking line search
+    This equivalence is exact for a single Fisher step
+    (``max_newton_iter == 1``). For ``max_newton_iter > 1`` (the default is
+    3) the two paths differ only when a line search backtracks: the dense update runs one *global* backtracking line search
     (a single step size gating all neurons on the summed neg-log-posterior),
     whereas this block path backtracks *per neuron* independently. The
     per-neuron search is arguably better conditioned, but the resulting
-    means and log-likelihoods are no longer bit-identical to the dense path.
+    means and log-likelihoods no longer agree with the dense path to
+    roundoff.
 
     Output shape compatibility
     --------------------------
-    To be a drop-in replacement for the dense filter, this function
-    returns ``filtered_mean`` of shape ``(n_time, n_state)`` and
-    ``filtered_cov`` of shape ``(n_time, n_state, n_state)`` — both
-    reassembled from the per-neuron trajectories. This materializes the
-    dense cov every time step, which is wasteful for very large
-    ``n_neurons``. A future optimization could return a ``BlockCovariance``
-    view that lazily materializes; for now the full dense form is
-    returned so downstream callers (``PlaceFieldModel.predict_rate_map``,
-    EM M-step, confidence intervals) work unchanged.
+    ``filtered_mean`` is always the concatenated ``(n_time, n_state)``
+    array. ``filtered_cov`` is, by default, the dense
+    ``(n_time, n_state, n_state)`` block-diagonal array reassembled from the
+    per-neuron blocks, so this is a drop-in replacement for the dense
+    filter; with ``return_block_covariances=True`` it is instead a
+    :class:`BlockDiagonalCovariance` holding the per-neuron blocks -- the
+    same dense ``shape``, but without the ``n_neurons``-fold zero padding.
+    ``PlaceFieldModel`` uses the container; its consumers (EM M-step,
+    rate maps, confidence intervals) only need block-local quantities.
 
     Parameters
     ----------
@@ -1693,50 +2533,49 @@ def _stochastic_point_process_filter_block_diagonal(
         Time bin width.
     include_laplace_normalization : bool, default=True
     max_log_count : float, default=20.0
+    max_newton_iter : int, default=3
+    return_block_covariances : bool, default=False
+        Return ``filtered_cov`` as a :class:`BlockDiagonalCovariance`
+        instead of the dense array.
 
     Returns
     -------
     filtered_mean : Array, shape (n_time, n_neurons * block_size)
         Concatenated per-neuron posterior means.
-    filtered_cov : Array, shape (n_time, n_neurons * block_size, n_neurons * block_size)
-        Block-diagonal posterior covariance (dense-form for API compat).
+    filtered_cov : Array or BlockDiagonalCovariance
+        Block-diagonal posterior covariance of dense shape
+        ``(n_time, n_neurons * block_size, n_neurons * block_size)``.
     marginal_log_likelihood : Array, scalar
         Total log-likelihood summed across neurons.
     """
-    n_neurons = structure.n_neurons
-    nb = structure.block_size
-    n_state = n_neurons * nb
-    n_time = structure.Z_base.shape[0]
-
-    # Forward pass via the shared per-neuron scan helper.
-    means_per_neuron, covs_per_neuron, lls_per_neuron = _run_forward_block_diagonal(
-        structure,
-        spike_indicator,
-        dt,
-        include_laplace_normalization=include_laplace_normalization,
-        max_log_count=max_log_count,
-        max_newton_iter=max_newton_iter,
+    means_per_neuron, covs_per_neuron, lls_per_neuron, n_failed_per_neuron = (
+        _run_forward_block_diagonal(
+            structure,
+            spike_indicator,
+            dt,
+            include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
+        )
+    )
+    _warn_line_search_failures(
+        jnp.sum(n_failed_per_neuron),
+        int(spike_indicator.size),
+        max_newton_iter,
+        "stochastic_point_process_filter (block-diagonal path)",
     )
     # means_per_neuron: (n_neurons, n_time, nb)
     # covs_per_neuron: (n_neurons, n_time, nb, nb)
     # lls_per_neuron: (n_neurons,)
-
-    # Reassemble concatenated filtered_mean of shape (n_time, n_state).
-    filtered_mean = jnp.transpose(means_per_neuron, (1, 0, 2)).reshape(n_time, n_state)
-
-    # Reassemble dense block-diagonal filtered_cov via the shared scatter
-    # helper. A future optimization could return a BlockCovariance view
-    # to avoid the O(n_state^2) zero-padding per time step.
-    filtered_cov = _assemble_block_diagonal_covs(covs_per_neuron, n_neurons, nb)
+    filtered_mean = _concatenate_neuron_means(means_per_neuron)
+    filtered_cov = _package_block_covs(covs_per_neuron, return_block_covariances)
 
     # Marginal log-likelihood: sum across neurons. For block-diagonal
     # problems, log p(y_t | y_{1:t-1}) decomposes as a sum of per-neuron
     # contributions — the Laplace normalization's logdet of a block-
     # diagonal matrix equals the sum of its blocks' logdets, and the
     # quadratic form similarly decomposes.
-    marginal_ll = jnp.sum(lls_per_neuron)
-
-    return filtered_mean, filtered_cov, marginal_ll
+    return filtered_mean, filtered_cov, jnp.sum(lls_per_neuron)
 
 
 def _stochastic_point_process_smoother_block_diagonal(
@@ -1746,14 +2585,14 @@ def _stochastic_point_process_smoother_block_diagonal(
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
     return_filtered: bool = False,
-    max_newton_iter: int = 1,
-) -> tuple[Array, ...]:
+    max_newton_iter: int = 3,
+    return_block_covariances: bool = False,
+) -> tuple[Array | BlockDiagonalCovariance, ...]:
     """Block-diagonal RTS smoother via vmapped per-neuron backward pass.
 
-    Runs the block-diagonal forward filter
-    (``_stochastic_point_process_filter_block_diagonal``) to get
-    per-neuron filtered posteriors, then runs the standard RTS backward
-    pass INDEPENDENTLY per neuron via jax.vmap. The smoother is
+    Runs the block-diagonal forward filter and the standard RTS backward
+    pass INDEPENDENTLY per neuron via jax.vmap, in one compiled call
+    (:func:`_block_diagonal_smoother_core`). The smoother is
     observation-model-agnostic — it operates only on Gaussian moments —
     so the block-diagonal decomposition propagates through the backward
     pass without any additional algebra.
@@ -1763,8 +2602,8 @@ def _stochastic_point_process_smoother_block_diagonal(
     The RTS backward step ``_kalman_smoother_update`` uses only:
 
     - Per-time-step filter mean and covariance (per-neuron in the block form)
-    - ``transition_matrix`` (per-neuron ``A_block``)
-    - ``process_cov`` (per-neuron ``Q_block``)
+    - ``transition_matrix`` (per-neuron ``A_blocks[j]``)
+    - ``process_cov`` (per-neuron ``Q_blocks[j]``)
 
     All of these are block-diagonal by construction. The smoother gain
     ``J_t = P_{t|t} A^T (A P_{t|t} A^T + Q)^{-1}`` has block-diagonal
@@ -1773,19 +2612,24 @@ def _stochastic_point_process_smoother_block_diagonal(
     backward pass per-neuron is mathematically identical to running it
     on the full dense state *given the same filtered inputs*. The forward
     filter it consumes carries the same caveat as
-    ``_stochastic_point_process_filter_block_diagonal``: the two paths are
-    bit-identical only for ``max_newton_iter == 1``; for
+    ``_stochastic_point_process_filter_block_diagonal``: the two paths
+    agree to roundoff only for ``max_newton_iter == 1``; for
     ``max_newton_iter > 1`` the per-neuron vs global line search makes the
     filtered moments (and hence the smoothed output) differ from the dense
     path.
 
     Output shape compatibility
     --------------------------
-    Returns dense ``(n_time, n_state, n_state)`` covariances and
-    ``(n_time - 1, n_state, n_state)`` cross-covariances, reassembled
-    from per-neuron blocks via the same scatter-into-zero-matrix pattern
-    as the forward filter. Downstream callers (EM M-step, confidence
-    intervals) see the same API as the dense smoother.
+    By default returns dense ``(n_time, n_state, n_state)`` covariances and
+    ``(n_time - 1, n_state, n_state)`` cross-covariances reassembled from
+    the per-neuron blocks, matching the dense smoother API. With
+    ``return_block_covariances=True`` every covariance output is a
+    :class:`BlockDiagonalCovariance` instead (same dense ``shape``, per-
+    neuron block storage), which is what ``PlaceFieldModel`` consumes.
+
+    Cross-cov index convention: ``_kalman_smoother_update`` returns
+    ``J_t @ P_{t+1|T}``, the smoothed lag-one cross-cov ``P_{t, t+1|T}``
+    (current-next). EM M-step consumers expect this convention.
 
     Parameters
     ----------
@@ -1796,114 +2640,187 @@ def _stochastic_point_process_smoother_block_diagonal(
     max_log_count : float, default=20.0
     return_filtered : bool, default=False
         If True, also return the filtered mean and covariance.
+    max_newton_iter : int, default=3
+    return_block_covariances : bool, default=False
 
     Returns
     -------
     smoother_mean : Array, shape (n_time, n_state)
-    smoother_cov : Array, shape (n_time, n_state, n_state)
-    smoother_cross_cov : Array, shape (n_time - 1, n_state, n_state)
+    smoother_cov : Array or BlockDiagonalCovariance
+        Dense shape ``(n_time, n_state, n_state)``.
+    smoother_cross_cov : Array or BlockDiagonalCovariance
+        Dense shape ``(n_time - 1, n_state, n_state)``.
     marginal_log_likelihood : Array, scalar
-    filtered_mean, filtered_cov : Array (optional, if return_filtered=True)
+    filtered_mean, filtered_cov : optional, if return_filtered=True
     """
-    n_neurons = structure.n_neurons
-    nb = structure.block_size
-    n_state = n_neurons * nb
-    A_block = structure.A_block
-    Q_block = structure.Q_block
-
-    # Forward pass via the shared per-neuron helper. Returns per-neuron
-    # moments (n_neurons, n_time, nb) that the backward pass can consume
-    # directly, without going through the dense reassembly.
-    fwd_means, fwd_covs, lls_per_neuron = _run_forward_block_diagonal(
-        structure,
+    (
+        fwd_means,
+        fwd_covs,
+        lls_per_neuron,
+        n_failed_per_neuron,
+        smoother_means_per_neuron,
+        smoother_covs_per_neuron,
+        smoother_cross_covs_per_neuron,
+    ) = _block_diagonal_smoother_core(
+        structure.A_blocks,
+        structure.Q_blocks,
+        structure.init_means_per_neuron,
+        structure.init_covs_per_neuron,
+        structure.Z_base,
         spike_indicator,
         dt,
         include_laplace_normalization=include_laplace_normalization,
         max_log_count=max_log_count,
         max_newton_iter=max_newton_iter,
     )
-    # fwd_means: (n_neurons, n_time, nb)
-    # fwd_covs: (n_neurons, n_time, nb, nb)
 
-    # Backward RTS smoother pass per neuron. _kalman_smoother_update is
-    # observation-model-agnostic — it uses only A, Q, and the filtered
-    # Gaussian moments. For block-diagonal A and Q, the backward pass
-    # decomposes into independent per-neuron smoothers, exactly matching
-    # the dense filter's backward pass on the block-diagonal problem.
-
-    def _backward_step(carry, args):
-        next_smoother_mean, next_smoother_cov = carry
-        filter_mean, filter_cov = args
-        sm, sc, scc = _kalman_smoother_update(
-            next_smoother_mean,
-            next_smoother_cov,
-            filter_mean,
-            filter_cov,
-            Q_block,
-            A_block,
-        )
-        return (sm, sc), (sm, sc, scc)
-
-    def _run_backward_one_neuron(means_j, covs_j):
-        # Initial carry: the last-time-step filtered posterior.
-        (_, _), (sm_rev, sc_rev, scc_rev) = jax.lax.scan(
-            _backward_step,
-            (means_j[-1], covs_j[-1]),
-            (means_j[:-1], covs_j[:-1]),
-            reverse=True,
-        )
-        # Append the last time step's filter posterior (no backward update)
-        sm_full = jnp.concatenate((sm_rev, means_j[-1][None]))
-        sc_full = jnp.concatenate((sc_rev, covs_j[-1][None]))
-        return sm_full, sc_full, scc_rev
-
-    (
-        smoother_means_per_neuron,
-        smoother_covs_per_neuron,
-        smoother_cross_covs_per_neuron,
-    ) = jax.vmap(_run_backward_one_neuron)(fwd_means, fwd_covs)
-    # smoother_means_per_neuron: (n_neurons, n_time, nb)
-    # smoother_covs_per_neuron:  (n_neurons, n_time, nb, nb)
-    # smoother_cross_covs_per_neuron: (n_neurons, n_time - 1, nb, nb)
-
-    n_time = structure.Z_base.shape[0]
-
-    # Reassemble concatenated smoother_mean (n_time, n_state).
-    smoother_mean = jnp.transpose(smoother_means_per_neuron, (1, 0, 2)).reshape(
-        n_time, n_state
+    _warn_line_search_failures(
+        jnp.sum(n_failed_per_neuron),
+        int(spike_indicator.size),
+        max_newton_iter,
+        "stochastic_point_process_smoother (block-diagonal path)",
     )
-
-    # Reassemble block-diagonal covariances (n_time, n_state, n_state)
-    # and cross-covariances (n_time-1, n_state, n_state) via the shared
-    # scatter helper. Matches the dense smoother API.
-    #
-    # Cross-cov index convention: _kalman_smoother_update returns
-    # ``J_t @ P_{t+1|T}``, which is the smoothed lag-one cross-cov
-    # ``P_{t, t+1|T}`` (current-next). EM M-step consumers expect this
-    # convention, so we preserve it in the block reassembly — see the
-    # dense smoother's "# Lag-one cross covariance P_{t, t+1|T}" comment
-    # in ``_kalman_smoother_update``.
-    smoother_cov = _assemble_block_diagonal_covs(
-        smoother_covs_per_neuron, n_neurons, nb
+    smoother_mean = _concatenate_neuron_means(smoother_means_per_neuron)
+    smoother_cov = _package_block_covs(
+        smoother_covs_per_neuron, return_block_covariances
     )
-    smoother_cross_cov = _assemble_block_diagonal_covs(
-        smoother_cross_covs_per_neuron, n_neurons, nb
+    smoother_cross_cov = _package_block_covs(
+        smoother_cross_covs_per_neuron, return_block_covariances
     )
-
     marginal_ll = jnp.sum(lls_per_neuron)
 
     if return_filtered:
-        filtered_mean = jnp.transpose(fwd_means, (1, 0, 2)).reshape(n_time, n_state)
-        filtered_cov = _assemble_block_diagonal_covs(fwd_covs, n_neurons, nb)
         return (
             smoother_mean,
             smoother_cov,
             smoother_cross_cov,
             marginal_ll,
-            filtered_mean,
-            filtered_cov,
+            _concatenate_neuron_means(fwd_means),
+            _package_block_covs(fwd_covs, return_block_covariances),
         )
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_ll
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[False] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[True] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array, Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[False] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[True] = ...,
+) -> tuple[
+    Array,
+    Array | BlockDiagonalCovariance,
+    Array | BlockDiagonalCovariance,
+    Array,
+]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[True] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[True] = ...,
+) -> tuple[
+    Array,
+    Array | BlockDiagonalCovariance,
+    Array | BlockDiagonalCovariance,
+    Array,
+    Array,
+    Array | BlockDiagonalCovariance,
+]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: bool = ...,
+) -> tuple[Array | BlockDiagonalCovariance, ...]: ...
 
 
 def stochastic_point_process_smoother(
@@ -1919,11 +2836,12 @@ def stochastic_point_process_smoother(
     return_filtered: bool = False,
     max_log_count: float = 20.0,
     validate_inputs: bool = True,
-    block_n_neurons: Optional[int] = None,
-    block_size: Optional[int] = None,
+    block_n_neurons: int | None = None,
+    block_size: int | None = None,
     force_dense: bool = False,
-    max_newton_iter: int = 1,
-) -> tuple[Array, ...]:
+    max_newton_iter: int = 3,
+    return_block_covariances: bool = False,
+) -> tuple[Array | BlockDiagonalCovariance, ...]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
     This smoother estimates a time-varying latent state ($x_k$) based on
@@ -1959,7 +2877,10 @@ def stochastic_point_process_smoother(
         for the predict-before-first-update convention.
     design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_params)
         Design matrix ($Z_k$) used in the intensity function.
-        Shape depends on the log_conditional_intensity function.
+        Shape depends on the log_conditional_intensity function. On the
+        block-diagonal path the shared per-neuron basis ``Z_base`` of shape
+        ``(n_time, block_size)`` may be passed instead (see
+        :func:`stochastic_point_process_filter`).
     spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
         Observed spike counts or indicators ($y_k$).
         For single neuron: (n_time,)
@@ -1977,18 +2898,32 @@ def stochastic_point_process_smoother(
         If True, include Laplace normalization and prior terms in the
         marginal log-likelihood. If False, return the plug-in log-likelihood
         at the posterior mode without normalization.
+    return_block_covariances : bool, default=False
+        Block-diagonal path only: return every covariance output (smoothed,
+        cross and, with ``return_filtered``, filtered) as a
+        :class:`BlockDiagonalCovariance` of per-neuron blocks instead of a
+        dense array. See :func:`stochastic_point_process_filter`.
 
     Returns
     -------
     smoother_mean : Array, shape (n_time, n_params)
         Smoothed posterior means ($x_{k|T}$).
-    smoother_cov : Array, shape (n_time, n_params, n_params)
-        Smoothed posterior covariances ($P_{k|T}$).
-    smoother_cross_cov : Array, shape (n_time - 1, n_params, n_params)
+    smoother_cov : Array or BlockDiagonalCovariance, shape (n_time, n_params, n_params)
+        Smoothed posterior covariances ($P_{k|T}$); a
+        :class:`BlockDiagonalCovariance` of the same dense shape when
+        ``return_block_covariances`` applies.
+    smoother_cross_cov : Array or BlockDiagonalCovariance, shape (n_time - 1, n_params, n_params)
         Smoothed lag-one cross-covariances, indexed as
-        ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``.
+        ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``; a
+        :class:`BlockDiagonalCovariance` when ``return_block_covariances``
+        applies.
     marginal_log_likelihood : Array
         Total log-likelihood of the observations given the model (scalar array).
+    filtered_mean, filtered_cov : Array, optional
+        Only with ``return_filtered=True``: the filter output, as returned by
+        :func:`stochastic_point_process_filter` (``filtered_cov`` is a
+        :class:`BlockDiagonalCovariance` when ``return_block_covariances``
+        applies).
 
     Notes
     -----
@@ -2010,16 +2945,21 @@ def stochastic_point_process_smoother(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
+    # Validate BEFORE the block dispatch below (the dense path would otherwise
+    # inherit this check from the inner filter call, but the block path
+    # returns early and would skip it). stacklevel=3: user -> smoother ->
+    # _validate.
     if validate_inputs:
-        validate_scalar(dt, "dt", positive=True)
-        validate_count_array(spike_indicator, "spike_indicator")
-        # Validate BEFORE the block dispatch below (the dense path would
-        # otherwise inherit this check from the inner filter call, but the
-        # block path returns early and would skip it). Raises on non-PSD
-        # init_cov, warns on f32 + long T. stacklevel=3: user -> smoother ->
-        # _validate.
-        _validate_filter_numerics(
-            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=3
+        _validate_public_inputs(
+            dt,
+            init_mean_params,
+            init_covariance_params,
+            design_matrix,
+            spike_indicator,
+            transition_matrix,
+            process_cov,
+            filter_name="stochastic_point_process_smoother",
+            stacklevel=3,
         )
 
     # Block-diagonal dispatch: same opt-in contract as the filter.
@@ -2035,30 +2975,13 @@ def stochastic_point_process_smoother(
         and _uses_default_linear_log_intensity(log_conditional_intensity)
     )
     if use_block_dispatch:
-        # use_block_dispatch is only True when both are set (see its definition);
-        # assert so mypy narrows block_n_neurons / block_size from int | None to int.
-        assert block_n_neurons is not None and block_size is not None
-        if spike_indicator.ndim == 1:
-            raise ValueError(
-                "block_n_neurons / block_size can only be passed for "
-                "multi-neuron (2D spike_indicator) inputs."
-            )
-        expected_state_dim = block_n_neurons * block_size
-        if init_covariance_params.shape[-1] != expected_state_dim:
-            raise ValueError(
-                f"block dispatch shape mismatch: block_n_neurons="
-                f"{block_n_neurons} * block_size={block_size} = "
-                f"{expected_state_dim}, but init_cov has shape "
-                f"{init_covariance_params.shape}. Re-run "
-                f"_detect_block_diagonal_problem to refresh the "
-                f"dispatch integers."
-            )
-        structure = _build_block_structure_from_traced(
+        structure = _validated_dispatch_block_structure(
             init_mean_params,
             init_covariance_params,
             transition_matrix,
             process_cov,
             design_matrix,
+            spike_indicator,
             block_n_neurons,
             block_size,
         )
@@ -2070,6 +2993,7 @@ def stochastic_point_process_smoother(
             max_log_count=max_log_count,
             return_filtered=return_filtered,
             max_newton_iter=max_newton_iter,
+            return_block_covariances=return_block_covariances,
         )
 
     filtered_mean, filtered_cov, marginal_log_likelihood = (
@@ -2091,13 +3015,8 @@ def stochastic_point_process_smoother(
         )
     )
 
-    smoother_mean, smoother_cov, smoother_cross_cov = (
-        _stochastic_point_process_smoother_backward(
-            filtered_mean,
-            filtered_cov,
-            process_cov,
-            transition_matrix,
-        )
+    smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
+        filtered_mean, filtered_cov, transition_matrix, process_cov
     )
 
     result = (smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood)
@@ -2106,51 +3025,12 @@ def stochastic_point_process_smoother(
     return result
 
 
-@jax.jit
-def _stochastic_point_process_smoother_backward(
-    filtered_mean: Array,
-    filtered_cov: Array,
-    process_cov: Array,
-    transition_matrix: Array,
-) -> tuple[Array, Array, Array]:
-    """JIT-compiled backward pass of the point process smoother."""
-
-    def _step(carry, args):
-        next_smoother_mean, next_smoother_cov = carry
-        filter_mean, filter_cov = args
-        smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
-            next_smoother_mean,
-            next_smoother_cov,
-            filter_mean,
-            filter_cov,
-            process_cov,
-            transition_matrix,
-        )
-        return (smoother_mean, smoother_cov), (
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
-        )
-
-    (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
-        _step,
-        (filtered_mean[-1], filtered_cov[-1]),
-        (filtered_mean[:-1], filtered_cov[:-1]),
-        reverse=True,
-    )
-
-    smoother_mean = jnp.concatenate((smoother_mean, filtered_mean[-1][None]))
-    smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
-
-    return smoother_mean, smoother_cov, smoother_cross_cov
-
-
-@jax.jit
 def dynamics_only_m_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,
     smoother_cross_cov: ArrayLike,
-    fixed_transition_matrix: Optional[ArrayLike] = None,
+    fixed_transition_matrix: ArrayLike | None = None,
+    initial_state_prior: InitialStatePrior | None = None,
 ) -> tuple[Array, Array, Array, Array]:
     """Dynamics-only M-step: update (A, Q, init_mean, init_cov) from smoother outputs.
 
@@ -2159,6 +3039,25 @@ def dynamics_only_m_step(
     dynamics (transition matrix, process covariance) and the initial state.
     Used by point-process / spike models whose observation model is a GLM
     fit separately, not a linear-Gaussian emission.
+
+    Exact EM (``initial_state_prior`` given)
+    ----------------------------------------
+    The filters start from ``x_0 ~ N(m_0, P_0)`` and observe ``x_1 .. x_T``,
+    so the complete-data log-likelihood has ``T`` transitions
+    ``x_{t-1} -> x_t``, ``t = 1..T``. With the prior, the smoothed moments of
+    ``x_0`` and ``Cov(x_0, x_1 | y)`` are recovered one RTS step behind the
+    smoother (:func:`~state_space_practice.kalman.smooth_initial_state_with_cross_cov`)
+    and the ``x_0 ->
+    x_1`` transition enters the ``A`` and ``Q`` sufficient statistics, so
+    ``A``, ``Q``, ``m_0`` and ``P_0`` jointly maximise the expected
+    complete-data log-likelihood ``Q(theta)`` given the E-step moments (the
+    M-step is exact; ``tests/test_oracle_point_process.py`` checks that the
+    gradient of ``Q(theta)`` vanishes at the returned values). ``Q`` is then
+    divided by ``T``.
+
+    Without the prior (deprecated), only the ``T - 1`` observed-to-observed
+    transitions are used (``Q`` divided by ``T - 1``) and the initial state is
+    set to the smoothed ``x_1``; that is not an exact EM step.
 
     Parameters
     ----------
@@ -2171,20 +3070,32 @@ def dynamics_only_m_step(
         ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``.
     fixed_transition_matrix : ArrayLike or None, optional
         If None (default), solve for the unconstrained ML transition matrix
-        ``A = beta gamma1^{-1}`` and use the Roweis-Ghahramani shortcut for
-        the process covariance ``Q = (gamma2 - A beta^T) / (T - 1)``, which is
-        exact only at that solved ``A``. If an array is supplied, ``A`` is held
-        fixed at it and returned unchanged, and ``Q`` is computed from the full
-        quadratic form ``(gamma2 - A beta^T - beta A^T + A gamma1 A^T)/(T-1)``,
-        which is the M-step optimum for the *given* (e.g. frozen) dynamics. The
-        two agree when ``A`` is the unconstrained solution.
+        ``A = beta gamma1^{-1}``. If an array is supplied, ``A`` is held fixed
+        at it and returned unchanged. Either way ``Q`` is the centred residual
+        form :func:`~state_space_practice.kalman.process_cov_residual_form`
+        at that ``A`` -- the M-step optimum for the given dynamics, PSD by
+        construction (at the solved ``A`` it equals the Roweis-Ghahramani
+        ``(gamma2 - A beta^T) / n_transitions`` up to roundoff).
+    initial_state_prior : InitialStatePrior or None, optional
+        The initial-state prior and dynamics the E-step ran with. If given,
+        the M-step is exact EM (see above): the ``x_0 -> x_1`` transition is
+        included in the ``A`` / ``Q`` statistics and the initial state is the
+        smoothed ``x_0``. If None, the smoothed moments of ``x_1`` are
+        returned as the initial state and only ``T - 1`` transitions are
+        used, which is not an EM step and can decrease the log-likelihood.
+
+        .. deprecated::
+            Passing ``None`` emits a ``DeprecationWarning`` and will be
+            removed in version 0.2.0; pass the prior the E-step ran with.
 
     Returns
     -------
     transition_matrix : Array, shape (n_cont_states, n_cont_states)
         Transition matrix (the unconstrained solve, or ``fixed_transition_matrix``).
     process_cov : Array, shape (n_cont_states, n_cont_states)
-        Process covariance.
+        Process covariance, eigenvalues floored at a scale-relative level
+        (:func:`~state_space_practice.utils.project_psd_relative`, which logs
+        a warning when the floor changes the estimate).
     mean_init : Array, shape (n_cont_states,)
         Initial mean.
     cov_init : Array, shape (n_cont_states, n_cont_states)
@@ -2195,55 +3106,92 @@ def dynamics_only_m_step(
     ... [1] Roweis, S. T., Ghahramani, Z., & Hinton, G. E. (1999). A unifying review of
     linear Gaussian models. Neural computation, 11(2), 305-345.
     """
+    if initial_state_prior is None:
+        warnings.warn(
+            "dynamics_only_m_step with initial_state_prior=None uses only the "
+            "T - 1 observed transitions, which is not an exact EM step. Pass the "
+            "InitialStatePrior the E-step ran with instead. "
+            "It will be removed in version 0.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return _dynamics_only_m_step(
+        smoother_mean,
+        smoother_cov,
+        smoother_cross_cov,
+        fixed_transition_matrix,
+        initial_state_prior,
+    )
+
+
+@typed_jit
+def _dynamics_only_m_step(
+    smoother_mean: ArrayLike,
+    smoother_cov: ArrayLike,
+    smoother_cross_cov: ArrayLike,
+    fixed_transition_matrix: ArrayLike | None,
+    initial_state_prior: InitialStatePrior | None,
+) -> tuple[Array, Array, Array, Array]:
+    """Jitted core of :func:`dynamics_only_m_step` (no deprecation check)."""
     smoother_mean = jnp.asarray(smoother_mean)
     smoother_cov = jnp.asarray(smoother_cov)
     smoother_cross_cov = jnp.asarray(smoother_cross_cov)
 
     n_time = smoother_mean.shape[0]
-    if n_time < 2:
+    if initial_state_prior is None and n_time < 2:
         raise ValueError(
             "dynamics_only_m_step requires at least 2 time steps to "
-            "estimate transition dynamics."
+            "estimate transition dynamics (or an initial_state_prior, which "
+            "adds the x_0 -> x_1 transition)."
         )
+    if n_time < 1:
+        raise ValueError("dynamics_only_m_step requires at least 1 time step.")
 
-    # Compute intermediate expectation terms
-    gamma = jnp.sum(smoother_cov, axis=0) + sum_of_outer_products(
-        smoother_mean, smoother_mean
-    )
-    gamma1 = gamma - jnp.outer(smoother_mean[-1], smoother_mean[-1]) - smoother_cov[-1]
-    gamma2 = gamma - jnp.outer(smoother_mean[0], smoother_mean[0]) - smoother_cov[0]
-    beta = (
-        smoother_cross_cov.sum(axis=0)
-        + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
-    ).T
+    sum_cov = jnp.sum(smoother_cov, axis=0)
+    sum_cross_cov = smoother_cross_cov.sum(axis=0)
+
+    if initial_state_prior is None:
+        # Deprecated: the T - 1 transitions x_t -> x_{t+1}, t = 1..T-1.
+        init_mean = smoother_mean[0]
+        init_cov = smoother_cov[0]
+        means = smoother_mean
+        sum_state_cov = sum_cov
+        first_cov = smoother_cov[0]
+    else:
+        # Exact EM: prepend the smoothed x_0 so the sums run over all T
+        # transitions x_{t-1} -> x_t, t = 1..T.
+        init_mean, init_cov, init_cross_cov = smooth_initial_state_with_cross_cov(
+            initial_state_prior, smoother_mean[0], smoother_cov[0]
+        )
+        means = jnp.concatenate((init_mean[None], smoother_mean), axis=0)
+        sum_state_cov = sum_cov + init_cov
+        sum_cross_cov = sum_cross_cov + init_cross_cov
+        first_cov = init_cov
+
+    # sum over the "previous" (x_{t-1}) and "next" (x_t) ends of the transitions.
+    sum_prev_cov = sum_state_cov - smoother_cov[-1]
+    sum_next_cov = sum_state_cov - first_cov
 
     if fixed_transition_matrix is None:
-        # Unconstrained ML transition matrix; the shortcut for Q below is
-        # exact at this A because the cross terms collapse.
+        # Unconstrained ML transition matrix A = beta gamma1^{-1}.
+        gamma1 = sum_prev_cov + sum_of_outer_products(means[:-1], means[:-1])
+        beta = (sum_cross_cov + sum_of_outer_products(means[:-1], means[1:])).T
         transition_matrix = psd_solve(gamma1, beta.T).T
-        process_cov_unnorm = gamma2 - transition_matrix @ beta.T
     else:
-        # Hold A fixed and compute Q from the full quadratic form. The
-        # shortcut (gamma2 - A beta^T) is only the optimum at the solved A;
-        # using it with a frozen A yields a biased (and possibly non-PSD)
-        # noise estimate.
         transition_matrix = jnp.asarray(fixed_transition_matrix)
-        process_cov_unnorm = (
-            gamma2
-            - transition_matrix @ beta.T
-            - beta @ transition_matrix.T
-            + transition_matrix @ gamma1 @ transition_matrix.T
-        )
 
-    # Process covariance
-    process_cov = stabilize_covariance(
-        process_cov_unnorm / (n_time - 1),
-        min_eigenvalue=1e-8,
+    # Process covariance: centred residual form at the chosen A (divides by
+    # the number of transitions, len(means) - 1).
+    process_cov = project_psd_relative(
+        process_cov_residual_form(
+            means,
+            sum_next_cov=sum_next_cov,
+            sum_prev_cov=sum_prev_cov,
+            sum_cross_cov=sum_cross_cov,
+            transition_matrix=transition_matrix,
+        ),
+        name="dynamics_only_m_step process_cov",
     )
-
-    # Initial mean and covariance
-    init_mean = smoother_mean[0]
-    init_cov = smoother_cov[0]
 
     return (
         transition_matrix,
@@ -2254,14 +3202,19 @@ def dynamics_only_m_step(
 
 
 def get_confidence_interval(
-    posterior_mean: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.05
+    posterior_mean: ArrayLike,
+    posterior_covariance: ArrayLike | BlockDiagonalCovariance,
+    alpha: float = 0.05,
 ) -> Array:
     """Get the confidence interval from the posterior covariance
 
     Parameters
     ----------
     posterior_mean : ArrayLike, shape (n_time, n_params)
-    posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
+    posterior_covariance : ArrayLike or BlockDiagonalCovariance, shape (n_time, n_params, n_params)
+        Dense covariances, or a :class:`BlockDiagonalCovariance` (whose
+        marginal variances are read from the per-neuron blocks without
+        materialising the dense array).
     alpha : float, optional
         Significance level in ``(0, 1)``, by default ``0.05``. Returns a
         ``1 - alpha`` confidence interval (i.e. the default 0.05 gives a
@@ -2269,11 +3222,14 @@ def get_confidence_interval(
         :meth:`PointProcessModel.get_confidence_interval`.
     """
     posterior_mean = jnp.asarray(posterior_mean)
-    posterior_covariance = jnp.asarray(posterior_covariance)
+    if isinstance(posterior_covariance, BlockDiagonalCovariance):
+        # Block-diagonal path: the marginal variances come straight from the
+        # per-neuron blocks; no dense (n_time, n_params, n_params) array.
+        variances = posterior_covariance.diagonal()
+    else:
+        variances = jnp.diagonal(jnp.asarray(posterior_covariance), axis1=-2, axis2=-1)
     z = jax.scipy.stats.norm.ppf(1 - alpha / 2)
-    ci = z * jnp.sqrt(
-        jnp.diagonal(posterior_covariance, axis1=-2, axis2=-1)
-    )  # shape (n_time, n_params)
+    ci = z * jnp.sqrt(variances)  # shape (n_time, n_params)
 
     return jnp.stack((posterior_mean - ci, posterior_mean + ci), axis=-1)
 
@@ -2412,6 +3368,20 @@ class PointProcessModel(SGDFittableMixin):
         Smoothed state covariances after fitting.
     smoother_cross_cov : Array
         Smoothed cross-covariances after fitting.
+    filtered_mean, filtered_cov : Array
+        Filtered state estimates and covariances after fitting.
+    log_likelihood_ : float
+        Marginal log-likelihood at the fitted parameters (from the last
+        :meth:`fit` or :meth:`fit_sgd`).
+    log_likelihood_history_ : list[float]
+        Per-iteration EM log-likelihoods, or per-step SGD training objective,
+        of the last fit.
+    converged_ : bool
+        Whether the last fit met its convergence criterion.
+    n_iter_ : int or None
+        EM iterations of the last fit; ``None`` after :meth:`fit_sgd`.
+
+    Reading a fitted attribute before fitting raises ``NotFittedError``.
 
     References
     ----------
@@ -2420,19 +3390,36 @@ class PointProcessModel(SGDFittableMixin):
         Neural Computation 16, 971-998.
     """
 
+    # Results, set by fit / fit_sgd.
+    smoother_mean: FittedAttribute[Array] = FittedAttribute()
+    smoother_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_cross_cov: FittedAttribute[Array] = FittedAttribute()
+    filtered_mean: FittedAttribute[Array] = FittedAttribute()
+    filtered_cov: FittedAttribute[Array] = FittedAttribute()
+    _sgd_n_time: FittedAttribute[int] = FittedAttribute()
+
+    # The posteriors above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "smoother_mean",
+        "smoother_cov",
+        "smoother_cross_cov",
+        "filtered_mean",
+        "filtered_cov",
+    )
+
     def __init__(
         self,
         n_state_dims: int,
         dt: float,
-        transition_matrix: Optional[ArrayLike] = None,
-        process_cov: Optional[ArrayLike] = None,
-        init_mean: Optional[ArrayLike] = None,
-        init_cov: Optional[ArrayLike] = None,
-        log_intensity_func: Optional[Callable] = None,
+        transition_matrix: ArrayLike | None = None,
+        process_cov: ArrayLike | None = None,
+        init_mean: ArrayLike | None = None,
+        init_cov: ArrayLike | None = None,
+        log_intensity_func: Callable[[ArrayLike, ArrayLike], Array] | None = None,
         update_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_init_state: bool = True,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 3,
     ):
         validate_scalar(dt, "dt", positive=True)
         self.n_state_dims = n_state_dims
@@ -2476,7 +3463,9 @@ class PointProcessModel(SGDFittableMixin):
                 )
 
         if log_intensity_func is None:
-            self.log_intensity_func = log_conditional_intensity
+            self.log_intensity_func: Callable[[ArrayLike, ArrayLike], Array] = (
+                log_conditional_intensity
+            )
         else:
             self.log_intensity_func = log_intensity_func
 
@@ -2484,13 +3473,6 @@ class PointProcessModel(SGDFittableMixin):
         self.update_transition_matrix = update_transition_matrix
         self.update_process_cov = update_process_cov
         self.update_init_state = update_init_state
-
-        # Results (populated after fit)
-        self.smoother_mean: Optional[Array] = None
-        self.smoother_cov: Optional[Array] = None
-        self.smoother_cross_cov: Optional[Array] = None
-        self.filtered_mean: Optional[Array] = None
-        self.filtered_cov: Optional[Array] = None
 
     def _e_step(self, design_matrix: ArrayLike, spike_indicator: ArrayLike) -> float:
         """E-step: Run filter and smoother to estimate latent states.
@@ -2525,8 +3507,8 @@ class PointProcessModel(SGDFittableMixin):
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
-            # fit() validates once at entry; skip re-validation on each
-            # EM iteration's E-step.
+            # fit() / fit_sgd() validate once at entry; skip re-validation on
+            # each EM iteration's E-step and the post-SGD smoothing pass.
             validate_inputs=False,
             return_filtered=True,
             max_newton_iter=self.max_newton_iter,
@@ -2536,10 +3518,10 @@ class PointProcessModel(SGDFittableMixin):
 
     def _m_step(self) -> None:
         """M-step: Update model parameters based on smoothed estimates."""
-        if (
-            self.smoother_mean is None
-            or self.smoother_cov is None
-            or self.smoother_cross_cov is None
+        if not (
+            is_set(self, "smoother_mean")
+            and is_set(self, "smoother_cov")
+            and is_set(self, "smoother_cross_cov")
         ):
             raise RuntimeError("Must run E-step before M-step")
 
@@ -2549,19 +3531,28 @@ class PointProcessModel(SGDFittableMixin):
         fixed_transition_matrix = (
             None if self.update_transition_matrix else self.transition_matrix
         )
+        # The parameters the E-step ran with: the initial-state update is the
+        # smoothed x_0, one RTS step behind the smoother's x_1.
+        initial_state_prior = InitialStatePrior(
+            init_mean=self.init_mean,
+            init_cov=self.init_cov,
+            transition_matrix=self.transition_matrix,
+            process_cov=self.process_cov,
+        )
         transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
             self.smoother_mean,
             self.smoother_cov,
             self.smoother_cross_cov,
             fixed_transition_matrix=fixed_transition_matrix,
+            initial_state_prior=initial_state_prior,
         )
 
         if self.update_transition_matrix:
             self.transition_matrix = transition_matrix
 
         if self.update_process_cov:
-            # dynamics_only_m_step already applies stabilize_covariance
-            # with min_eigenvalue=1e-8
+            # dynamics_only_m_step already floors the eigenvalues at a
+            # scale-relative level (project_psd_relative).
             self.process_cov = process_cov
 
         if self.update_init_state:
@@ -2606,148 +3597,45 @@ class PointProcessModel(SGDFittableMixin):
             jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
         )
 
-        log_likelihoods: list[float] = []
-        last_accepted_state: dict[str, Any] | None = None
+        snapshot_keys = self._fit_output_attrs + (
+            "transition_matrix",
+            "process_cov",
+            "init_mean",
+            "init_cov",
+        )
 
-        def _snapshot_state() -> dict[str, Any]:
-            return {
-                "smoother_mean": self.smoother_mean,
-                "smoother_cov": self.smoother_cov,
-                "smoother_cross_cov": self.smoother_cross_cov,
-                "filtered_mean": self.filtered_mean,
-                "filtered_cov": self.filtered_cov,
-                "transition_matrix": self.transition_matrix,
-                "process_cov": self.process_cov,
-                "init_mean": self.init_mean,
-                "init_cov": self.init_cov,
-            }
-
-        def _restore_state(state: dict[str, Any]) -> None:
-            self.smoother_mean = state["smoother_mean"]
-            self.smoother_cov = state["smoother_cov"]
-            self.smoother_cross_cov = state["smoother_cross_cov"]
-            self.filtered_mean = state["filtered_mean"]
-            self.filtered_cov = state["filtered_cov"]
-            self.transition_matrix = state["transition_matrix"]
-            self.process_cov = state["process_cov"]
-            self.init_mean = state["init_mean"]
-            self.init_cov = state["init_cov"]
-
-        for iteration in range(max_iter):
-            current_log_likelihood = self._e_step(design_matrix, spike_indicator)
-            log_likelihoods.append(current_log_likelihood)
-
-            if not jnp.isfinite(current_log_likelihood):
-                # Drop the non-finite LL so callers never see NaN/inf in the
-                # returned history, and restore the last consistent
-                # (params, smoother) pair. Without the restore the diverged
-                # E-step's NaN posteriors stay installed on the model and
-                # get_rate_estimate / get_confidence_interval serve NaN.
-                bad_ll = log_likelihoods.pop()
-                if last_accepted_state is not None:
-                    _restore_state(last_accepted_state)
-                logger.warning(
-                    f"Non-finite log-likelihood ({bad_ll}) at iteration "
-                    f"{iteration + 1}; rolling back to previous E-step and "
-                    f"stopping EM."
-                )
-                break
-
-            if iteration > 0:
-                is_converged, is_increasing = check_converged(
-                    current_log_likelihood,
-                    log_likelihoods[-2],
-                    tolerance,
-                )
-
-                if not is_increasing:
-                    # Roll back to the accepted state from the prior iteration.
-                    # last_accepted_state was snapshotted *before* the M-step
-                    # that produced the current (worse) parameters, so it holds
-                    # the (params, smoother) pair consistent with
-                    # log_likelihoods[-1]. Restoring the top-of-loop snapshot
-                    # instead would keep the rejected M-step's parameters.
-                    bad_ll = log_likelihoods.pop()
-                    if last_accepted_state is not None:
-                        _restore_state(last_accepted_state)
-                    logger.warning(
-                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
-                        f"{bad_ll:.4f}; rolling back to previous E-step "
-                        f"and stopping EM."
-                    )
-                    break
-
-                if is_converged:
-                    logger.info(f"Converged after {iteration + 1} iterations.")
-                    break
-
-            # Snapshot the accepted E-step state before the M-step changes
-            # parameters. A later E-step (next iteration or the final sync
-            # below) may reveal that this M-step worsened the marginal LL; if
-            # so, restore this consistent state.
-            last_accepted_state = _snapshot_state()
-            self._m_step()
-
-            change = (
-                current_log_likelihood - log_likelihoods[-2]
-                if iteration > 0
-                else float("nan")
-            )
-            logger.info(
-                f"Iteration {iteration + 1}/{max_iter}\t"
-                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {change:.6f}"
-            )
-        else:
-            # for/else: reached only if the loop ran all max_iter iterations
-            # without breaking (no convergence, decrease, or non-finite exit).
-            # The last M-step ran without a following E-step, so sync the
-            # smoother to the current parameters — rolling back if that final
-            # E-step reveals the M-step worsened the marginal LL.
-            if log_likelihoods:
-                logger.warning("Reached maximum iterations without converging.")
-                final_ll = float(self._e_step(design_matrix, spike_indicator))
-                if not jnp.isfinite(final_ll):
-                    if last_accepted_state is not None:
-                        _restore_state(last_accepted_state)
-                    logger.warning(
-                        "Final E-step produced non-finite log-likelihood; "
-                        "rolling back to previous E-step."
-                    )
-                else:
-                    _, is_increasing = check_converged(
-                        final_ll,
-                        log_likelihoods[-1],
-                        tolerance,
-                    )
-                    if is_increasing:
-                        log_likelihoods.append(final_ll)
-                    else:
-                        if last_accepted_state is not None:
-                            _restore_state(last_accepted_state)
-                        logger.warning(
-                            f"Final E-step decreased LL: {log_likelihoods[-1]:.4f}"
-                            f" -> {final_ll:.4f}; rolling back to previous E-step."
-                        )
-
-        return log_likelihoods
+        # A rejected E-step (non-finite or decreasing LL) restores the last
+        # accepted (parameters, smoother) pair so get_rate_estimate /
+        # get_confidence_interval never serve a diverged posterior; a
+        # non-finite *first* E-step clears the posteriors it installed.
+        result = run_em(
+            lambda: float(self._e_step(design_matrix, spike_indicator)),
+            self._m_step,
+            lambda: snapshot_attributes(self, snapshot_keys),
+            lambda state: restore_attributes(self, state),
+            max_iter=max_iter,
+            tol=tolerance,
+            logger=logger,
+            on_first_nonfinite="clear",
+            clear_state=lambda: clear_attributes(self, self._fit_output_attrs),
+        )
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
+        return result.log_likelihoods
 
     # --- SGDFittableMixin protocol ---
 
-    # The mixin declares a generic ``fit_sgd(self, *args, **kwargs)`` that forwards
-    # to ``_sgd_loss_fn``; this concrete override names its two data arguments.
-    # mypy (correctly, per strict LSP) cannot see a fixed-arity signature as a
-    # substitute for ``*args, **kwargs``, and there is no signature that both
-    # keeps the explicit parameters and satisfies the check -- so the override
-    # is suppressed here, as in the sibling Hamiltonian models.
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         design_matrix: ArrayLike,
         spike_indicator: ArrayLike,
-        optimizer: Optional[object] = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -2770,23 +3658,6 @@ class PointProcessModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        design_matrix = jnp.asarray(design_matrix)
-        spike_indicator = jnp.asarray(spike_indicator)
-        validate_count_array(spike_indicator, "spike_indicator")
-        if spike_indicator.ndim == 1:
-            spike_indicator = spike_indicator[:, None]
-        self._sgd_n_time = spike_indicator.shape[0]
-        self._sgd_design_matrix = design_matrix
-        self._sgd_spike_indicator = spike_indicator
-
-        # Numerical sanity check once at the top: validate PSD and warn
-        # on f32 risk. The SGD loss_fn runs inside jax.jit, which cannot
-        # call eigvalsh's host-side float() conversion, so per-step
-        # re-validation is both wasteful and forbidden.
-        _validate_filter_numerics(
-            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
-        )
-
         return super().fit_sgd(
             design_matrix,
             spike_indicator,
@@ -2796,21 +3667,39 @@ class PointProcessModel(SGDFittableMixin):
             convergence_tol=convergence_tol,
         )
 
+    def _prepare_sgd_data(
+        self, design_matrix: ArrayLike, spike_indicator: ArrayLike
+    ) -> tuple[tuple[Array, Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` data and record its length.
+
+        Runs after ``fit_sgd`` has validated its settings, so a call rejected
+        for its settings or data leaves the model untouched.
+        """
+        design_matrix = jnp.asarray(design_matrix)
+        spike_indicator = jnp.asarray(spike_indicator)
+        validate_count_array(spike_indicator, "spike_indicator")
+        if spike_indicator.ndim == 1:
+            spike_indicator = spike_indicator[:, None]
+
+        # Numerical sanity check once at the top: validate PSD and warn
+        # on f32 risk. The SGD loss_fn runs inside jax.jit, which cannot
+        # call eigvalsh's host-side float() conversion, so per-step
+        # re-validation is both wasteful and forbidden. stacklevel=5: user
+        # -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook -> wrapper.
+        _validate_filter_numerics(
+            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0], stacklevel=5
+        )
+
+        self._sgd_n_time = spike_indicator.shape[0]
+        return (design_matrix, spike_indicator), {}
+
     @property
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
 
-    def _check_sgd_initialized(self) -> None:
-        pass  # Parameters allocated at construction time
-
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            UNCONSTRAINED,
-        )
-
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_transition_matrix:
             params["transition_matrix"] = self.transition_matrix
@@ -2829,12 +3718,12 @@ class PointProcessModel(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(
-        self, params: dict, design_matrix: Array, spike_indicator: Array
+        self, params: SGDParams, design_matrix: Array, spike_indicator: Array
     ) -> Array:
-        A = params.get("transition_matrix", self.transition_matrix)
-        Q = params.get("process_cov", self.process_cov)
-        m0 = params.get("init_mean", self.init_mean)
-        P0 = params.get("init_cov", self.init_cov)
+        A = self._sgd_param(params, "transition_matrix")
+        Q = self._sgd_param(params, "process_cov")
+        m0 = self._sgd_param(params, "init_mean")
+        P0 = self._sgd_param(params, "init_cov")
 
         _, _, marginal_ll = stochastic_point_process_filter(
             init_mean_params=m0,
@@ -2852,7 +3741,7 @@ class PointProcessModel(SGDFittableMixin):
         )
         return -marginal_ll
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "transition_matrix" in params:
             self.transition_matrix = params["transition_matrix"]
         if "process_cov" in params:
@@ -2862,30 +3751,8 @@ class PointProcessModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> None:
-        # Take the filtered moments from the smoother's single forward pass
-        # (return_filtered=True) rather than running a second forward filter.
-        (
-            self.smoother_mean,
-            self.smoother_cov,
-            self.smoother_cross_cov,
-            marginal_ll,
-            self.filtered_mean,
-            self.filtered_cov,
-        ) = stochastic_point_process_smoother(
-            init_mean_params=self.init_mean,
-            init_covariance_params=self.init_cov,
-            design_matrix=design_matrix,
-            spike_indicator=spike_indicator,
-            dt=self.dt,
-            transition_matrix=self.transition_matrix,
-            process_cov=self.process_cov,
-            log_conditional_intensity=self.log_intensity_func,
-            validate_inputs=False,  # validated at fit_sgd entry
-            return_filtered=True,
-            max_newton_iter=self.max_newton_iter,
-        )
-        self.log_likelihood_ = float(marginal_ll)
+    def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> float:
+        return self._e_step(design_matrix, spike_indicator)
 
     def get_rate_estimate(
         self,
@@ -2933,12 +3800,12 @@ class PointProcessModel(SGDFittableMixin):
         linear Z @ x.
         """
         if use_smoothed:
-            if self.smoother_mean is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not is_set(self, "smoother_mean"):
+                raise NotFittedError("Model has not been fitted yet.")
             state_estimate = self.smoother_mean
         else:
-            if self.filtered_mean is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not is_set(self, "filtered_mean"):
+                raise NotFittedError("Model has not been fitted yet.")
             state_estimate = self.filtered_mean
 
         design_matrix = jnp.asarray(design_matrix)
@@ -2947,7 +3814,7 @@ class PointProcessModel(SGDFittableMixin):
             # Evaluate rate at all positions for each time point
             # For each (time, position) pair, compute log_intensity_func(design[pos], state[time])
             # vmap over positions (inner), then over times (outer)
-            def rate_at_time(state_t):
+            def rate_at_time(state_t: Array) -> Array:
                 # For this time's state, evaluate at all positions
                 return jax.vmap(lambda dm: self.log_intensity_func(dm, state_t))(
                     design_matrix
@@ -2958,9 +3825,7 @@ class PointProcessModel(SGDFittableMixin):
             # Time-aligned evaluation: design_matrix[t] with state_estimate[t]
             log_rate = jax.vmap(self.log_intensity_func)(design_matrix, state_estimate)
 
-        rate = jnp.exp(log_rate)
-
-        return rate
+        return jnp.exp(log_rate)
 
     def get_confidence_interval(
         self, alpha: float = 0.05, use_smoothed: bool = True
@@ -2980,13 +3845,13 @@ class PointProcessModel(SGDFittableMixin):
             Lower and upper bounds of the confidence interval.
         """
         if use_smoothed:
-            if self.smoother_mean is None or self.smoother_cov is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not (is_set(self, "smoother_mean") and is_set(self, "smoother_cov")):
+                raise NotFittedError("Model has not been fitted yet.")
             mean = self.smoother_mean
             cov = self.smoother_cov
         else:
-            if self.filtered_mean is None or self.filtered_cov is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not (is_set(self, "filtered_mean") and is_set(self, "filtered_cov")):
+                raise NotFittedError("Model has not been fitted yet.")
             mean = self.filtered_mean
             cov = self.filtered_cov
 

@@ -7,12 +7,14 @@ module, covering helper functions, core vmapped functions, and integration
 tests comparing SKF to KF and verifying SKF behavior.
 """
 
+import contextlib
+from collections.abc import Callable, Iterator
+
 import jax
 
 # Enable 64-bit precision for tests that require it.
 jax.config.update("jax_enable_x64", True)
 
-from typing import Tuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -25,13 +27,16 @@ from state_space_practice.kalman import (
     kalman_filter,
     kalman_maximization_step,
     kalman_smoother,
+    psd_solve,
 )
 from state_space_practice.switching_kalman import (
-    _compute_expected_complete_log_likelihood_reference,
-    _compute_posterior_entropy_reference,
     _first_timestep_discrete_update,
     _kalman_filter_update_per_discrete_state_pair,
     _kalman_smoother_update_per_discrete_state_pair,
+    _optimize_dim_joint_core,
+    _optimize_dim_single_core,
+    _switching_kalman_filter_gpb1,
+    _switching_kalman_smoother_em_stats,
     _update_discrete_state_probabilities,
     _update_smoother_discrete_probabilities,
     collapse_gaussian_mixture,
@@ -48,9 +53,297 @@ from state_space_practice.switching_kalman import (
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
+    switching_kalman_smoother_gpb2,
     switching_kalman_viterbi,
     weighted_sum_of_outer_products,
 )
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
+from state_space_practice.utils import divide_safe as _divide_safe
+from state_space_practice.utils import safe_log as _safe_log
+from state_space_practice.utils import spectral_radius as _spectral_radius
+
+# JAX lowers every newly traced computation to MLIR (even when a persistent
+# compilation cache then skips the backend compile), so counting lowerings
+# and backend compiles detects re-tracing.
+_COMPILE_EVENTS = (
+    "/jax/core/compile/jaxpr_to_mlir_module_duration",
+    "/jax/core/compile/backend_compile_duration",
+)
+
+
+@contextlib.contextmanager
+def _count_compiles() -> Iterator[Callable[[], int]]:
+    """Count JAX lowerings/compiles inside the block; yields a getter."""
+    count = 0
+
+    def listener(event: str, duration: float, **kwargs: object) -> None:
+        nonlocal count
+        count += event in _COMPILE_EVENTS
+
+    with listen_to_jax_durations(listener):
+        yield lambda: count
+
+
+def kalman_maximization_step_x1_prior(*args):
+    """The (deprecated) x_1-prior Kalman M-step: the single-state reference
+    the switching M-step reduces to (its initial moments are those of x_1)."""
+    with pytest.warns(DeprecationWarning, match=r"initial_state_prior=None"):
+        return kalman_maximization_step(*args)
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python reference implementations of the ELBO terms. These triple-nested
+# loops are the oracle the vectorized ``compute_expected_complete_log_likelihood``
+# / ``compute_posterior_entropy`` are checked against; they are far too slow for
+# production use and live here rather than in the library.
+# ---------------------------------------------------------------------------
+
+
+def _compute_expected_complete_log_likelihood_reference(
+    obs: jax.Array,
+    state_cond_smoother_means: jax.Array,
+    state_cond_smoother_covs: jax.Array,
+    smoother_discrete_state_prob: jax.Array,
+    smoother_joint_discrete_state_prob: jax.Array,
+    pair_cond_smoother_cross_cov: jax.Array,
+    init_state_cond_mean: jax.Array,
+    init_state_cond_cov: jax.Array,
+    init_discrete_state_prob: jax.Array,
+    continuous_transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+    discrete_transition_matrix: jax.Array,
+    pair_cond_smoother_means: jax.Array | None = None,
+    pair_cond_smoother_covs: jax.Array | None = None,
+    next_pair_cond_smoother_means: jax.Array | None = None,
+) -> jax.Array:
+    """Compute the expected complete-data log-likelihood E_q[log p(y, x, s | θ)].
+
+    This is the Q-function that the EM algorithm maximizes for a fixed
+    approximate posterior. The optional pair-conditional inputs make the
+    transition term closer to the GPB2 approximation used by the M-step.
+
+    Parameters
+    ----------
+    obs : jax.Array, shape (n_time, n_obs_dim)
+    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
+    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
+    init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
+    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
+    discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
+        quantities for the transition Q-function term.
+    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j].
+    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j].
+
+    Returns
+    -------
+    expected_complete_ll : jax.Array
+        E_q[log p(y, x, s | θ)] (scalar array)
+
+    Notes
+    -----
+    When GPB2 pair-conditional quantities are provided, the transition
+    Q-function term uses pair-conditional means and covariances for x_t.
+    Cov[x_{t+1} | S_t, S_{t+1}] is still approximated with the
+    state-conditional Cov[x_{t+1} | S_{t+1}] since the GPB2 smoother does
+    not produce that quantity directly. This affects only diagnostics, not
+    the closed-form parameter updates.
+    """
+    n_time = obs.shape[0]
+    n_discrete_states = smoother_discrete_state_prob.shape[1]
+    n_cont_states = state_cond_smoother_means.shape[1]
+
+    # 1. E_q[log p(s_1)] - initial discrete state
+    log_init_discrete = jnp.sum(
+        smoother_discrete_state_prob[0] * _safe_log(init_discrete_state_prob)
+    )
+
+    # 2. E_q[log p(x_1 | s_1)] - initial continuous state
+    log_init_cont = jnp.zeros(())
+    for j in range(n_discrete_states):
+        # E_q[log N(x_1; μ_0^j, Σ_0^j) | s_1=j]
+        # = -0.5 * (log|Σ_0^j| + tr(Σ_0^j^{-1} E_q[(x_1 - μ_0^j)(x_1 - μ_0^j)^T | s_1=j]))
+        mean_j = init_state_cond_mean[:, j]
+        cov_j = init_state_cond_cov[:, :, j]
+
+        # E_q[(x_1 - μ_0^j)(x_1 - μ_0^j)^T | s_1=j]
+        smoother_mean_j = state_cond_smoother_means[0, :, j]
+        smoother_cov_j = state_cond_smoother_covs[0, :, :, j]
+        diff = smoother_mean_j - mean_j
+        expected_outer = smoother_cov_j + jnp.outer(diff, diff)
+
+        log_det = jnp.linalg.slogdet(cov_j)[1]
+        trace_term = jnp.trace(psd_solve(cov_j, expected_outer))
+        log_prob_j = -0.5 * (n_cont_states * jnp.log(2 * jnp.pi) + log_det + trace_term)
+        log_init_cont += smoother_discrete_state_prob[0, j] * log_prob_j
+
+    # 3. E_q[sum_t log p(s_t | s_{t-1})] - discrete state transitions
+    log_discrete_trans = jnp.sum(
+        smoother_joint_discrete_state_prob * _safe_log(discrete_transition_matrix)
+    )
+
+    # 4. E_q[sum_t log p(x_t | x_{t-1}, s_t)] - continuous state transitions
+    log_cont_trans = jnp.zeros(())
+    for j in range(n_discrete_states):
+        A_j = continuous_transition_matrix[:, :, j]
+        Q_j = process_cov[:, :, j]
+        log_det_Q = jnp.linalg.slogdet(Q_j)[1]
+
+        for t in range(n_time - 1):
+            # Sum over source states i weighted by P(s_t=i, s_{t+1}=j | y_{1:T})
+            for i in range(n_discrete_states):
+                weight = smoother_joint_discrete_state_prob[t, i, j]
+
+                # E_q[(x_{t+1} - A_j x_t)(x_{t+1} - A_j x_t)^T | s_t=i, s_{t+1}=j]
+                # Use pair-conditional quantities when available (GPB2),
+                # otherwise fall back to state-conditional (GPB1 approximate).
+                if pair_cond_smoother_means is not None:
+                    m_t_ij = pair_cond_smoother_means[t, :, i, j]
+                else:
+                    m_t_ij = state_cond_smoother_means[t, :, i]
+
+                if next_pair_cond_smoother_means is not None:
+                    m_t1_ij = next_pair_cond_smoother_means[t, :, i, j]
+                else:
+                    m_t1_ij = state_cond_smoother_means[t + 1, :, j]
+
+                if pair_cond_smoother_covs is not None:
+                    V_t_ij = pair_cond_smoother_covs[t, :, :, i, j]
+                else:
+                    V_t_ij = state_cond_smoother_covs[t, :, :, i]
+
+                # For V_{t+1}, we don't have pair-conditional Cov[x_{t+1} | S_t, S_{t+1}]
+                # separately (only Cov[x_t | S_t, S_{t+1}]). Use state-conditional.
+                V_t1_j = state_cond_smoother_covs[t + 1, :, :, j]
+
+                # Stored as Cov[x_t, x_{t+1} | ...] by the RTS helper.
+                cross_cov_t_t1_ij = pair_cond_smoother_cross_cov[t, :, :, i, j]
+
+                # E[x_{t+1} x_{t+1}^T | ...]
+                E_xt1_xt1 = V_t1_j + jnp.outer(m_t1_ij, m_t1_ij)
+                # E[x_t x_t^T | ...]
+                E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
+                # E[x_{t+1} x_t^T | ...]
+                E_xt1_xt = cross_cov_t_t1_ij.T + jnp.outer(m_t1_ij, m_t_ij)
+
+                # E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]
+                # = E[x_{t+1} x_{t+1}^T] - A E[x_t x_{t+1}^T] - E[x_{t+1} x_t^T] A^T + A E[x_t x_t^T] A^T
+                expected_residual = (
+                    E_xt1_xt1
+                    - A_j @ E_xt1_xt.T
+                    - E_xt1_xt @ A_j.T
+                    + A_j @ E_xt_xt @ A_j.T
+                )
+
+                trace_term = jnp.trace(psd_solve(Q_j, expected_residual))
+                log_prob = -0.5 * (
+                    n_cont_states * jnp.log(2 * jnp.pi) + log_det_Q + trace_term
+                )
+                log_cont_trans += jnp.where(weight > 0, weight * log_prob, 0.0)
+
+    # 5. E_q[sum_t log p(y_t | x_t, s_t)] - observations
+    log_obs = jnp.zeros(())
+    for j in range(n_discrete_states):
+        H_j = measurement_matrix[:, :, j]
+        R_j = measurement_cov[:, :, j]
+        log_det_R = jnp.linalg.slogdet(R_j)[1]
+        n_obs = obs.shape[1]
+
+        for t in range(n_time):
+            weight = smoother_discrete_state_prob[t, j]
+
+            m_t_j = state_cond_smoother_means[t, :, j]
+            V_t_j = state_cond_smoother_covs[t, :, :, j]
+
+            # E[(y_t - H x_t)(y_t - H x_t)^T | s_t=j]
+            pred_mean = H_j @ m_t_j
+            diff = obs[t] - pred_mean
+            # E[x_t x_t^T | s_t=j]
+            E_xt_xt = V_t_j + jnp.outer(m_t_j, m_t_j)
+            # E[(y - Hx)(y - Hx)^T] = (y - H m)(y - H m)^T + H V H^T
+            expected_residual = jnp.outer(diff, diff) + H_j @ V_t_j @ H_j.T
+
+            trace_term = jnp.trace(psd_solve(R_j, expected_residual))
+            log_prob = -0.5 * (n_obs * jnp.log(2 * jnp.pi) + log_det_R + trace_term)
+            log_obs += jnp.where(weight > 0, weight * log_prob, 0.0)
+
+    return (
+        log_init_discrete
+        + log_init_cont
+        + log_discrete_trans
+        + log_cont_trans
+        + log_obs
+    )
+
+
+def _compute_posterior_entropy_reference(
+    smoother_discrete_state_prob: jax.Array,
+    smoother_joint_discrete_state_prob: jax.Array,
+    state_cond_smoother_covs: jax.Array,
+) -> jax.Array:
+    """Compute the entropy of the approximate posterior H(q).
+
+    For the switching Kalman filter with mixture collapse approximation:
+    H(q) = H(q(s)) + E_q(s)[H(q(x|s))]
+
+    Parameters
+    ----------
+    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
+    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+
+    Returns
+    -------
+    entropy : jax.Array
+        H(q(x, s)) (scalar array)
+    """
+    n_time = smoother_discrete_state_prob.shape[0]
+    n_discrete_states = smoother_discrete_state_prob.shape[1]
+    n_cont_states = state_cond_smoother_covs.shape[1]
+
+    # 1. Entropy of discrete state sequence
+    # H(q(s)) = -sum_t E_q[log q(s_t | s_{t-1})]
+    # For t=1: -sum_j q(s_1=j) log q(s_1=j)
+    discrete_entropy = -jnp.sum(
+        smoother_discrete_state_prob[0] * _safe_log(smoother_discrete_state_prob[0])
+    )
+
+    # For t>1: -sum_{t,i,j} q(s_{t-1}=i, s_t=j) log q(s_t=j | s_{t-1}=i)
+    # q(s_t=j | s_{t-1}=i) = q(s_{t-1}=i, s_t=j) / q(s_{t-1}=i)
+    for t in range(n_time - 1):
+        marginal_prev = smoother_discrete_state_prob[t]
+        joint = smoother_joint_discrete_state_prob[t]
+        cond = _divide_safe(joint, marginal_prev[:, None])
+        discrete_entropy -= jnp.sum(joint * _safe_log(cond))
+
+    # 2. Entropy of continuous states given discrete states
+    # H(q(x|s)) = sum_t sum_j q(s_t=j) * H(q(x_t | s_t=j))
+    # For Gaussian: H(N(μ, Σ)) = 0.5 * (k + k*log(2π) + log|Σ|)
+    cont_entropy = jnp.zeros(())
+    for j in range(n_discrete_states):
+        for t in range(n_time):
+            weight = smoother_discrete_state_prob[t, j]
+            cov_j = state_cond_smoother_covs[t, :, :, j]
+            log_det = jnp.linalg.slogdet(cov_j)[1]
+            gaussian_entropy = 0.5 * (
+                n_cont_states * (1 + jnp.log(2 * jnp.pi)) + log_det
+            )
+            cont_entropy += jnp.where(weight > 0, weight * gaussian_entropy, 0.0)
+
+    return discrete_entropy + cont_entropy
 
 
 def test_process_covariance_stats_use_the_fixed_transition_matrix() -> None:
@@ -89,7 +382,7 @@ def test_process_covariance_stats_use_the_fixed_transition_matrix() -> None:
 
 
 @pytest.fixture(scope="module")
-def simple_skf_model() -> Tuple[
+def simple_skf_model() -> tuple[
     Array, Array, Array, Array, Array, Array, Array, Array, Array
 ]:
     """
@@ -135,7 +428,7 @@ def simple_skf_model() -> Tuple[
     key, s_key, x_key, y_key = random.split(key, 4)
 
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -169,7 +462,7 @@ def simple_skf_model() -> Tuple[
 
 
 @pytest.fixture(scope="module")
-def simple_2_state_params() -> Tuple[Array, Array, Array, Array, int, int, int]:
+def simple_2_state_params() -> tuple[Array, Array, Array, Array, int, int, int]:
     """
     Provides parameters for a simple 1D, 2-state model without data.
 
@@ -404,6 +697,35 @@ def test_update_discrete_probs_impossible_lane_nan_does_not_poison() -> None:
     assert bool(jnp.isfinite(log_pred))
     # Supported row 0 reaches both destinations equally under the uniform Z.
     np.testing.assert_allclose(np.asarray(m_t), np.array([0.5, 0.5]), rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "nan_input", ["transition_entry", "supported_prev_prob"], ids=lambda s: s
+)
+def test_update_discrete_probs_nan_dynamics_input_fails_loud(nan_input: str) -> None:
+    """A NaN transition entry or supported previous probability propagates NaN.
+
+    ``zero_preserving_log`` maps only an exact zero to ``-inf``; NaN (and
+    negative) inputs give NaN. A NaN in the dynamics is malformed input, not a
+    structural zero, so it must not be silently treated as an impossible pair
+    (which would return a finite, plausible-looking posterior) -- it surfaces
+    as NaN in the posterior and the log-predictive.
+    """
+    log_likelihood = jnp.log(jnp.array([[0.9, 0.1], [0.2, 0.8]]))
+    Z = jnp.array([[0.95, 0.05], [0.1, 0.9]])
+    prev = jnp.array([0.7, 0.3])
+    support = jnp.array([True, True])
+    if nan_input == "transition_entry":
+        Z = Z.at[0, 1].set(jnp.nan)
+    else:
+        prev = prev.at[1].set(jnp.nan)
+
+    m_t, _, log_pred, _ = _update_discrete_state_probabilities(
+        log_likelihood, Z, prev, support
+    )
+
+    assert bool(jnp.all(jnp.isnan(m_t)))
+    assert bool(jnp.isnan(log_pred))
 
 
 def test_first_timestep_ruled_out_state_not_floored() -> None:
@@ -722,6 +1044,120 @@ def test_switching_kalman_filter_shapes(simple_skf_model: tuple) -> None:
     np.testing.assert_allclose(jnp.sum(filt_p, axis=1), 1.0, rtol=1e-5)
 
 
+def test_switching_kalman_filter_accepts_numpy_inputs(simple_skf_model: tuple) -> None:
+    """NumPy inputs (accepted by the ArrayLike signature) match JAX inputs."""
+    jax_outputs = switching_kalman_filter(*simple_skf_model)
+    numpy_inputs = [np.asarray(x) for x in simple_skf_model]
+    assert all(type(x) is np.ndarray for x in numpy_inputs)
+
+    numpy_outputs = switching_kalman_filter(*numpy_inputs)
+
+    assert len(numpy_outputs) == len(jax_outputs)
+    for from_numpy, from_jax in zip(numpy_outputs, jax_outputs, strict=True):
+        np.testing.assert_array_equal(from_numpy, from_jax)
+
+
+def test_gpb1_variants_match_public_filter_and_smoother(
+    simple_skf_model: tuple,
+) -> None:
+    """The GPB1 E-step variants skip outputs but change none they return."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    full = switching_kalman_filter(*simple_skf_model)
+    gpb1 = _switching_kalman_filter_gpb1(*simple_skf_model)
+    for name in gpb1._fields:
+        np.testing.assert_array_equal(getattr(gpb1, name), getattr(full, name))
+
+    smoother_args = (
+        full.state_cond_filter_mean,
+        full.state_cond_filter_cov,
+        full.filter_discrete_state_prob,
+        Q,
+        A,
+        Z,
+    )
+    full_smooth = switching_kalman_smoother(*smoother_args)
+    stats = _switching_kalman_smoother_em_stats(*smoother_args)
+    for name in stats._fields:
+        np.testing.assert_array_equal(getattr(stats, name), getattr(full_smooth, name))
+
+
+def test_switching_result_fields_name_the_right_outputs(
+    simple_skf_model: tuple,
+) -> None:
+    """Each NamedTuple field holds the quantity its name says (shape and
+    probability invariants), so field access cannot silently misbind."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    n_time = obs.shape[0]
+    n, n_s = init_mean.shape
+
+    filt = switching_kalman_filter(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
+    assert filt.state_cond_filter_mean.shape == (n_time, n, n_s)
+    assert filt.state_cond_filter_cov.shape == (n_time, n, n, n_s)
+    np.testing.assert_allclose(filt.filter_discrete_state_prob.sum(axis=1), 1.0)
+    assert filt.pair_cond_filter_mean.shape == (n_time, n, n_s, n_s)
+    assert filt.pair_cond_filter_cov.shape == (n_time, n, n, n_s, n_s)
+    np.testing.assert_allclose(filt.pair_cond_filter_prob.sum(axis=(1, 2)), 1.0)
+    assert filt.marginal_log_likelihood.shape == ()
+
+    smooth = switching_kalman_smoother(
+        filt.state_cond_filter_mean,
+        filt.state_cond_filter_cov,
+        filt.filter_discrete_state_prob,
+        Q,
+        A,
+        Z,
+    )
+    gpb2 = switching_kalman_smoother_gpb2(
+        filt.state_cond_filter_mean,
+        filt.state_cond_filter_cov,
+        filt.filter_discrete_state_prob,
+        filt.pair_cond_filter_mean,
+        filt.pair_cond_filter_cov,
+        filt.pair_cond_filter_prob,
+        Q,
+        A,
+    )
+    for result in (smooth, gpb2):
+        assert result.overall_smoother_mean.shape == (n_time, n)
+        assert result.overall_smoother_cov.shape == (n_time, n, n)
+        np.testing.assert_allclose(
+            result.smoother_discrete_state_prob.sum(axis=1), 1.0, rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            result.smoother_joint_discrete_state_prob.sum(axis=(1, 2)),
+            1.0,
+            rtol=1e-6,
+        )
+        assert result.overall_smoother_cross_cov.shape == (n_time - 1, n, n)
+        assert result.state_cond_smoother_means.shape == (n_time, n, n_s)
+        assert result.state_cond_smoother_covs.shape == (n_time, n, n, n_s)
+        assert result.pair_cond_smoother_cross_covs.shape == (
+            n_time - 1,
+            n,
+            n,
+            n_s,
+            n_s,
+        )
+        assert result.pair_cond_smoother_means.shape == (n_time - 1, n, n_s, n_s)
+    assert gpb2.pair_cond_smoother_covs.ndim == 5
+    assert gpb2.next_pair_cond_smoother_means.ndim == 4
+
+    params = switching_kalman_maximization_step(
+        obs,
+        smooth.state_cond_smoother_means,
+        smooth.state_cond_smoother_covs,
+        smooth.smoother_discrete_state_prob,
+        smooth.smoother_joint_discrete_state_prob,
+        smooth.pair_cond_smoother_cross_covs,
+        smooth.pair_cond_smoother_means,
+    )
+    assert params.init_mean.shape == (n, n_s)
+    assert params.init_cov.shape == (n, n, n_s)
+    np.testing.assert_allclose(params.discrete_transition_matrix.sum(axis=1), 1.0)
+    assert params.init_discrete_state_prob.shape == (n_s,)
+    np.testing.assert_allclose(params.init_discrete_state_prob.sum(), 1.0)
+
+
 def test_skf_reduces_to_kf_single_state(simple_1d_model: tuple) -> None:
     """Tests that a single-state SKF matches the standard KF."""
     (
@@ -834,7 +1270,6 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
         filter_discrete_state_prob=skf_fp,
-        last_filter_conditional_cont_mean=last_pair_m[-1],
         process_cov=skf_Q,
         continuous_transition_matrix=skf_A,
         discrete_state_transition_matrix=skf_Z,
@@ -948,7 +1383,7 @@ def test_m_step_one_state(
         kf_new_R,
         kf_new_init_mean,
         kf_new_init_cov,
-    ) = kalman_maximization_step(
+    ) = kalman_maximization_step_x1_prior(
         obs,
         kf_sm,
         kf_sc,
@@ -997,7 +1432,6 @@ def test_m_step_one_state(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
         filter_discrete_state_prob=skf_fp,
-        last_filter_conditional_cont_mean=last_pair_m[-1],
         process_cov=skf_Q,
         continuous_transition_matrix=skf_A,
         discrete_state_transition_matrix=skf_Z,
@@ -1057,7 +1491,7 @@ def test_m_step_two_identical_states(
         kf_new_R,
         kf_new_init_mean,
         kf_new_init_cov,
-    ) = kalman_maximization_step(
+    ) = kalman_maximization_step_x1_prior(
         obs,
         kf_sm,
         kf_sc,
@@ -1090,7 +1524,7 @@ def test_m_step_two_identical_states(
         skf_fm,  # state_cond_filter_mean
         skf_fc,  # state_cond_filter_cov
         skf_fp,  # filter_discrete_state_prob
-        last_pair_m,  # last_filter_conditional_cont_mean
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         _,  # mll
@@ -1122,7 +1556,6 @@ def test_m_step_two_identical_states(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
         filter_discrete_state_prob=skf_fp,
-        last_filter_conditional_cont_mean=last_pair_m[-1],
         process_cov=skf_Q,
         continuous_transition_matrix=skf_A,
         discrete_state_transition_matrix=skf_Z,
@@ -1698,7 +2131,6 @@ def test_em_monotonic_single_state() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -1803,7 +2235,6 @@ def test_em_monotonic_two_identical_states() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -1863,7 +2294,7 @@ def test_em_monotonic_distinguishable_states() -> None:
     key, s_key = random.split(key)
 
     true_states_list: list[int] = [0]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         true_states_list.append(
             int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states_list[-1]]))
@@ -1936,7 +2367,6 @@ def test_em_monotonic_distinguishable_states() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -2006,7 +2436,7 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
     current_R = R
     current_Z = Z
 
-    for iteration in range(n_iterations):
+    for _iteration in range(n_iterations):
         # E-step: Run filter and smoother
         (
             filter_mean,
@@ -2044,7 +2474,6 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -2156,7 +2585,6 @@ def test_elbo_monotonic_single_state() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -2233,7 +2661,7 @@ def test_elbo_monotonic_two_states() -> None:
     key, s_key = random.split(key)
 
     true_states_list: list[int] = [0]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         true_states_list.append(
             int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states_list[-1]]))
@@ -2306,7 +2734,6 @@ def test_elbo_monotonic_two_states() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -2676,7 +3103,6 @@ class TestSwitchingKalmanSmootherProperties:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -2710,7 +3136,6 @@ class TestSwitchingKalmanSmootherProperties:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -2736,25 +3161,26 @@ class TestWeightedSumOfOuterProductsProperties:
         st.integers(min_value=1, max_value=3),
         st.integers(min_value=1, max_value=3),
     )
-    @settings(max_examples=30, deadline=None)
     def test_matches_einsum_definition(
         self, n_time: int, n_dims: int, n_states: int
     ) -> None:
         """Result should match the einsum definition."""
-        key = random.PRNGKey(42)
-        x = random.normal(key, (n_time, n_dims, n_states))
-        y = random.normal(random.fold_in(key, 1), (n_time, n_dims, n_states))
-        weights = jnp.abs(random.normal(random.fold_in(key, 2), (n_time, n_states)))
+        rng = np.random.default_rng(42)
+        x = rng.normal(size=(n_time, n_dims, n_states))
+        y = rng.normal(size=(n_time, n_dims, n_states))
+        weights = np.abs(rng.normal(size=(n_time, n_states)))
         weights = weights / weights.sum(axis=0, keepdims=True)
 
-        result = weighted_sum_of_outer_products(x, y, weights)
+        result = weighted_sum_of_outer_products(
+            jnp.asarray(x), jnp.asarray(y), jnp.asarray(weights)
+        )
 
-        # Compute expected via loop
-        expected = jnp.zeros((n_dims, n_dims, n_states))
+        # Reference: explicit NumPy loop over time and state (eager JAX ops
+        # here would compile per shape and dominate the test's run time)
+        expected = np.zeros((n_dims, n_dims, n_states))
         for t in range(n_time):
             for s in range(n_states):
-                outer_prod = weights[t, s] * jnp.outer(x[t, :, s], y[t, :, s])
-                expected = expected.at[:, :, s].add(outer_prod)
+                expected[:, :, s] += weights[t, s] * np.outer(x[t, :, s], y[t, :, s])
 
         np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-10)
 
@@ -2868,7 +3294,7 @@ def test_discrete_state_recovery_easy() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -2953,7 +3379,7 @@ def test_discrete_state_recovery_moderate() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3033,7 +3459,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3067,7 +3493,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
-        last_filter_conditional_cont_mean,
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         marginal_log_likelihood,
@@ -3098,7 +3524,6 @@ def test_discrete_state_recovery_with_smoother() -> None:
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
         filter_discrete_state_prob=filter_discrete_state_prob,
-        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -3267,7 +3692,7 @@ def test_continuous_state_mse_filter() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3356,7 +3781,7 @@ def test_continuous_state_mse_smoother() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3390,7 +3815,7 @@ def test_continuous_state_mse_smoother() -> None:
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
-        last_filter_conditional_cont_mean,
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         _,
@@ -3421,7 +3846,6 @@ def test_continuous_state_mse_smoother() -> None:
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
         filter_discrete_state_prob=filter_discrete_state_prob,
-        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -3471,7 +3895,7 @@ def test_continuous_state_mse_vs_standard_kalman() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3599,7 +4023,7 @@ def test_continuous_state_mse_multivariate() -> None:
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
-        last_filter_conditional_cont_mean,
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         _,
@@ -3630,7 +4054,6 @@ def test_continuous_state_mse_multivariate() -> None:
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
         filter_discrete_state_prob=filter_discrete_state_prob,
-        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -3709,7 +4132,7 @@ def run_em(
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_filter_conditional_cont_mean,
+            _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
             _,  # last_pair_cond_filter_cov
             _,
             marginal_ll,
@@ -3742,7 +4165,6 @@ def run_em(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -4281,7 +4703,7 @@ def run_em_partial(
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_filter_conditional_cont_mean,
+            _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
             _,  # last_pair_cond_filter_cov
             _,
             marginal_ll,
@@ -4314,7 +4736,6 @@ def run_em_partial(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -4602,6 +5023,76 @@ class TestSwitchingMStepMathCorrectness:
     Uses asymmetric A and independent verification approaches.
     """
 
+    @pytest.mark.parametrize("rhs_dtype", [jnp.float32, jnp.float64])
+    def test_per_state_regression_solve_nearly_singular_float32(
+        self, rhs_dtype
+    ) -> None:
+        """The per-state H* / A* solve uses the Kalman M-step's stabilised solve.
+
+        State 0's float32 Gram matrix is singular to within 4 eps, so Cholesky
+        fails at an eps-relative shift; state 1 is well conditioned. Both must
+        give finite coefficients, state 1 must match the float64 solve, and
+        state 0 must still fit its identified direction (the Gram matrix's
+        leading eigenvector).
+        """
+        from state_space_practice.switching_kalman import (
+            psd_solve_per_discrete_state,
+        )
+
+        eps = float(np.finfo(np.float32).eps)
+        gamma = np.stack(
+            [[[1.0, 1.0], [1.0, 1.0 - 4 * eps]], [[3.0, 0.2], [0.2, 1.0]]], axis=-1
+        )  # (n_state, n_state, n_discrete_states)
+        delta = np.stack([[[1.0, 1.0]], [[1.0, 2.0]]], axis=-1)  # (n_obs, n_state, S)
+
+        coef = psd_solve_per_discrete_state(
+            jnp.asarray(gamma, dtype=jnp.float32), jnp.asarray(delta, dtype=rhs_dtype)
+        )
+
+        assert jnp.all(jnp.isfinite(coef))
+        np.testing.assert_allclose(
+            coef[..., 1],
+            np.linalg.solve(gamma[..., 1], delta[..., 1].T).T,
+            rtol=1e-5,
+        )
+        # State 0: delta lies along the leading eigenvector (1, 1) of gamma.
+        np.testing.assert_allclose(
+            coef[..., 0] @ gamma[..., 0], delta[..., 0], rtol=1e-3
+        )
+
+    @pytest.mark.parametrize(
+        "stat_dtype, obs_dtype",
+        [
+            (np.int64, np.int64),
+            # The solve runs in float32, so its stabilising shift must be
+            # float32-sized even though the Gram matrix is integer.
+            (np.int32, np.float32),
+        ],
+    )
+    def test_mstep_integer_statistics_singular_gram(self, stat_dtype, obs_dtype):
+        """Integer statistics with exactly singular Gram matrices.
+
+        Constant latent means m with zero covariance make the H* and A* Gram
+        matrices exactly rank-1, so the solves rely on their stabilising
+        shift. The estimates must be finite and fit the identified direction:
+        H m is the mean observation and A m = m.
+        """
+        n_time, n_state, n_disc = 6, 2, 1
+        mean = np.array([2, 1])
+        obs = np.arange(n_time * n_state).reshape(n_time, n_state) % 3
+        A, H, *rest = switching_kalman_maximization_step(
+            jnp.asarray(obs, dtype=obs_dtype),
+            jnp.asarray(np.tile(mean[:, None], (n_time, 1, 1)), dtype=stat_dtype),
+            jnp.zeros((n_time, n_state, n_state, n_disc), dtype=stat_dtype),
+            jnp.ones((n_time, n_disc), dtype=stat_dtype),
+            jnp.ones((n_time - 1, n_disc, n_disc), dtype=stat_dtype),
+            jnp.zeros((n_time - 1, n_state, n_state, n_disc, n_disc), dtype=stat_dtype),
+        )
+        for estimate in (A, H, *rest):
+            assert jnp.all(jnp.isfinite(estimate))
+        np.testing.assert_allclose(H[..., 0] @ mean, obs.mean(axis=0), rtol=1e-4)
+        np.testing.assert_allclose(A[..., 0] @ mean, mean, rtol=1e-4)
+
     def test_switching_mstep_matches_nonswitching_asymmetric_A(self) -> None:
         """S=1 switching M-step should match non-switching M-step.
 
@@ -4621,7 +5112,7 @@ class TestSwitchingMStepMathCorrectness:
 
         # Non-switching path
         kf_sm, kf_sc, kf_scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
-        kf_A, kf_H, kf_Q, kf_R, kf_im, kf_ic = kalman_maximization_step(
+        kf_A, kf_H, kf_Q, kf_R, kf_im, kf_ic = kalman_maximization_step_x1_prior(
             obs, kf_sm, kf_sc, kf_scc
         )
 
@@ -4656,7 +5147,6 @@ class TestSwitchingMStepMathCorrectness:
             filter_mean=skf_fm,
             filter_cov=skf_fc,
             filter_discrete_state_prob=skf_fp,
-            last_filter_conditional_cont_mean=last_pair_m[-1],
             process_cov=skf_Q,
             continuous_transition_matrix=skf_A,
             discrete_state_transition_matrix=Z,
@@ -4814,7 +5304,6 @@ class TestSwitchingEMMonotonicity:
                 filter_mean=fm,
                 filter_cov=fc,
                 filter_discrete_state_prob=fp,
-                last_filter_conditional_cont_mean=lpm[-1],
                 process_cov=Q,
                 continuous_transition_matrix=A,
                 discrete_state_transition_matrix=Z,
@@ -4904,7 +5393,6 @@ class TestSwitchingNumericalStability:
             filter_mean=fm,
             filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -5724,7 +6212,7 @@ class TestSwitchingSmootherCrossCovariance:
         fm, fc, fp, pcm, _, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
-        result = switching_kalman_smoother(fm, fc, fp, pcm[-1], Q, A, Z)
+        result = switching_kalman_smoother(fm, fc, fp, Q, A, Z)
 
         # GPB1 smooths x_t with state-conditional x_{t+1}|S_{t+1}=k.
         # Therefore the next-time means in the total covariance collapse are
@@ -6017,7 +6505,7 @@ class TestGPB2ExactAccuracy:
         fm, fc, fp, pcm, pcc, pcp, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
-        gpb1 = switching_kalman_smoother(fm, fc, fp, pcm[-1], Q, A, Z)
+        gpb1 = switching_kalman_smoother(fm, fc, fp, Q, A, Z)
         gpb2 = switching_kalman_smoother_gpb2(fm, fc, fp, pcm, pcc, pcp, Q, A)
 
         gpb1_mean_err = float(jnp.max(jnp.abs(gpb1[0] - exact_mean)))
@@ -6117,7 +6605,7 @@ class TestVectorizedELBOEquivalence:
         pi0 = jnp.array([0.5, 0.5])
 
         fm, fc, fdp, lfc = switching_kalman_filter(m0, P0, pi0, obs, Z, A, Q, H, R)[:4]
-        sm_result = switching_kalman_smoother(fm, fc, fdp, lfc[-1], Q, A, Z)
+        sm_result = switching_kalman_smoother(fm, fc, fdp, Q, A, Z)
         return {
             "obs": obs,
             "A": A,
@@ -6230,7 +6718,7 @@ class TestVectorizedELBOEquivalence:
         pi0 = jnp.array([0.5, 0.3, 0.2])
 
         fm, fc, fdp, lfc = switching_kalman_filter(m0, P0, pi0, obs, Z, A, Q, H, R)[:4]
-        r = switching_kalman_smoother(fm, fc, fdp, lfc[-1], Q, A, Z)
+        r = switching_kalman_smoother(fm, fc, fdp, Q, A, Z)
         sm_dp, sm_jdp = r[2], r[3]
         sc_means, sc_covs, pc_xcov = r[5], r[6], r[7]
 
@@ -6282,7 +6770,7 @@ class TestVectorizedELBOEquivalence:
         fm, fc, fp, lpm, _, _, mll = switching_kalman_filter(
             m0, P0, pi0, obs, Z, A, Q, H, R
         )
-        r = switching_kalman_smoother(fm, fc, fp, lpm[-1], Q, A, Z)
+        r = switching_kalman_smoother(fm, fc, fp, Q, A, Z)
 
         elbo = compute_elbo(
             obs=obs,
@@ -6358,14 +6846,21 @@ def test_optimize_dim_transition_params_bounds_freq_and_uses_max_iter(
         "coupling_strength": jnp.array([[2.0, 0.2], [-0.3, -4.0]]),
         "phase_diff": jnp.array([[99.0, 0.4], [-0.7, -99.0]]),
     }
-    opt = optimize_dim_transition_params(
-        gamma1=jnp.eye(4),
-        beta=0.8 * jnp.eye(4),
-        init_params=init_params,
-        sampling_freq=100.0,
-        max_iter=7,
-        tol=1e-5,
-    )
+    # The optimizer core is jitted: drop cached executables so the fake is
+    # traced now, and again afterwards so no later test reuses the fake.
+    _optimize_dim_single_core.clear_cache()
+    try:
+        # The unoptimized start is unstable, so the post-check clamps it.
+        opt = optimize_dim_transition_params(
+            gamma1=jnp.eye(4),
+            beta=0.8 * jnp.eye(4),
+            init_params=init_params,
+            sampling_freq=100.0,
+            max_iter=7,
+            tol=1e-5,
+        )
+    finally:
+        _optimize_dim_single_core.clear_cache()
 
     assert calls["method"] == "BFGS"
     assert calls["tol"] == 1e-5
@@ -6376,6 +6871,56 @@ def test_optimize_dim_transition_params_bounds_freq_and_uses_max_iter(
     assert jnp.all(opt["coupling_strength"] >= 0.0)
     np.testing.assert_allclose(jnp.diag(opt["coupling_strength"]), 0.0, atol=0.0)
     np.testing.assert_allclose(jnp.diag(opt["phase_diff"]), 0.0, atol=0.0)
+
+
+def test_optimize_dim_transition_params_clamps_only_the_offending_uncoupled_oscillator(
+    caplog,
+) -> None:
+    """With uncoupled input the spectral clamp reduces only the oscillator
+    whose damping exceeds the bound; the other rhythm keeps its damping."""
+    from state_space_practice.oscillator_utils import (
+        construct_directed_influence_transition_matrix,
+    )
+
+    A_true = construct_directed_influence_transition_matrix(
+        jnp.array([8.0, 20.0]),
+        jnp.array([0.999, 0.6]),
+        jnp.zeros((2, 2)),
+        jnp.zeros((2, 2)),
+        100.0,
+    )
+    init_params = {
+        "damping": jnp.array([0.9, 0.6]),
+        "freq": jnp.array([8.0, 20.0]),
+        "coupling_strength": jnp.zeros((2, 2)),
+        "phase_diff": jnp.zeros((2, 2)),
+    }
+    kwargs = dict(
+        gamma1=jnp.eye(4),
+        beta=A_true,
+        init_params=init_params,
+        sampling_freq=100.0,
+    )
+    unclamped = optimize_dim_transition_params(**kwargs, max_spectral_radius=0.999)
+    # guard: the optimum is unstable for the 0.99 bound, via oscillator 0 only.
+    assert float(unclamped["damping"][0]) > 0.99
+    assert float(unclamped["damping"][1]) < 0.9
+
+    with caplog.at_level("WARNING", logger="state_space_practice.switching_kalman"):
+        clamped = optimize_dim_transition_params(**kwargs, max_spectral_radius=0.99)
+    assert "clamped per block" in caplog.text
+    np.testing.assert_allclose(float(clamped["damping"][0]), 0.99, rtol=1e-12)
+    np.testing.assert_allclose(
+        clamped["damping"][1], unclamped["damping"][1], rtol=1e-12
+    )
+    A = construct_directed_influence_transition_matrix(
+        clamped["freq"],
+        clamped["damping"],
+        clamped["coupling_strength"],
+        clamped["phase_diff"],
+        100.0,
+    )
+    assert _spectral_radius(A) <= 0.99 + 1e-12
 
 
 def test_optimize_dim_transition_params_raises_on_nonfinite_solution(
@@ -6409,14 +6954,18 @@ def test_optimize_dim_transition_params_raises_on_nonfinite_solution(
         "coupling_strength": jnp.zeros((2, 2)),
         "phase_diff": jnp.zeros((2, 2)),
     }
-    with pytest.raises(RuntimeError, match="non-finite"):
-        optimize_dim_transition_params(
-            gamma1=jnp.eye(4),
-            beta=0.8 * jnp.eye(4),
-            init_params=init_params,
-            sampling_freq=100.0,
-            raise_on_failure=True,
-        )
+    _optimize_dim_single_core.clear_cache()  # trace the fake (jitted core)
+    try:
+        with pytest.raises(RuntimeError, match="non-finite"):
+            optimize_dim_transition_params(
+                gamma1=jnp.eye(4),
+                beta=0.8 * jnp.eye(4),
+                init_params=init_params,
+                sampling_freq=100.0,
+                raise_on_failure=True,
+            )
+    finally:
+        _optimize_dim_single_core.clear_cache()
 
 
 def test_joint_dim_optimizer_packs_shared_and_state_specific_params(
@@ -6451,14 +7000,20 @@ def test_joint_dim_optimizer_packs_shared_and_state_specific_params(
         "coupling_strength": jnp.zeros((2, 2, n_states)),
         "phase_diff": jnp.zeros((2, 2, n_states)),
     }
-    opt = optimize_dim_transition_params_joint(
-        gamma1=jnp.stack([jnp.eye(4)] * n_states, axis=-1),
-        beta=jnp.stack([0.8 * jnp.eye(4)] * n_states, axis=-1),
-        init_params=init_params,
-        sampling_freq=100.0,
-        max_iter=7,
-        tol=1e-5,
-    )
+    # The optimizer core is jitted: drop cached executables so the fake is
+    # traced now, and again afterwards so no later test reuses the fake.
+    _optimize_dim_joint_core.clear_cache()
+    try:
+        opt = optimize_dim_transition_params_joint(
+            gamma1=jnp.stack([jnp.eye(4)] * n_states, axis=-1),
+            beta=jnp.stack([0.8 * jnp.eye(4)] * n_states, axis=-1),
+            init_params=init_params,
+            sampling_freq=100.0,
+            max_iter=7,
+            tol=1e-5,
+        )
+    finally:
+        _optimize_dim_joint_core.clear_cache()
 
     assert calls == {
         "method": "BFGS",
@@ -6521,6 +7076,7 @@ def test_joint_dim_optimizer_improves_total_q_and_returns_stable_dynamics() -> N
             params["damping"],
             params["coupling_strength"],
             sampling_freq,
+            phase_difference=params["phase_diff"],
         )
         effective_damping = params["damping"] * scale
         effective_coupling = params["coupling_strength"] * scale
@@ -6557,7 +7113,11 @@ def test_joint_dim_optimizer_improves_total_q_and_returns_stable_dynamics() -> N
     assert opt["damping"].shape == (2,)
     assert opt["freq"].shape == (2,)
     scale = compute_directed_influence_stability_scale(
-        opt["freq"], opt["damping"], opt["coupling_strength"], sampling_freq
+        opt["freq"],
+        opt["damping"],
+        opt["coupling_strength"],
+        sampling_freq,
+        phase_difference=opt["phase_diff"],
     )
     for j in range(n_states):
         A = construct_directed_influence_transition_matrix(
@@ -6595,6 +7155,23 @@ def test_viterbi_handles_one_timestep(simple_skf_model: tuple) -> None:
     )
     assert states.shape == (1,)
     assert int(states[0]) == int(jnp.argmax(filter_result[2][0]))
+
+
+def test_viterbi_repeat_call_does_not_recompile(simple_skf_model: tuple) -> None:
+    """A second Viterbi call with the same shapes reuses the compiled core."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    reversed_obs = obs[::-1]
+    first = switching_kalman_viterbi(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
+    with _count_compiles() as n_compiles:
+        second = switching_kalman_viterbi(
+            init_mean, init_cov, init_prob, reversed_obs, Z, A, Q, H, R
+        )
+        again = switching_kalman_viterbi(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+    assert n_compiles() == 0
+    np.testing.assert_array_equal(again, first)
+    assert not np.array_equal(second, first)  # new data reached the cached core
 
 
 def test_viterbi_preserves_structural_zero_transitions() -> None:
@@ -6973,7 +7550,6 @@ def test_gpb1_smoother_recovers_filter_underflowed_state() -> None:
         filter_mean=fm,
         filter_cov=fc,
         filter_discrete_state_prob=fp,
-        last_filter_conditional_cont_mean=pcm[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -7088,7 +7664,6 @@ def _run_2state_smoother_probs(prior, Z) -> tuple:
         filter_mean=fm,
         filter_cov=fc,
         filter_discrete_state_prob=fp,
-        last_filter_conditional_cont_mean=pcm[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -7138,7 +7713,6 @@ def test_terminal_smoother_mean_guarded_against_overflow() -> None:
         filter_mean=filter_mean,
         filter_cov=filter_cov,
         filter_discrete_state_prob=filter_prob,
-        last_filter_conditional_cont_mean=pair_mean[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -7232,7 +7806,6 @@ def _run_single_state_gpb1_gpb2(im, ic, ip, A, Q, H, R, Z, obs) -> tuple:
         filter_mean=fm,
         filter_cov=fc,
         filter_discrete_state_prob=fp,
-        last_filter_conditional_cont_mean=pcm[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -7327,7 +7900,6 @@ def _psd_probe_smoother_moments():
     filter_cov = jnp.stack([interior[..., None], carry[..., None]], axis=0)
     filter_mean = jnp.zeros((2, n_cont, n_disc))
     filter_prob = jnp.ones((2, n_disc))
-    last_pair_mean = jnp.zeros((n_cont, n_disc, n_disc))
     Q = (jnp.eye(n_cont) * 1e-10)[..., None]
     A = (jnp.eye(n_cont) * 1e-3)[..., None]  # contractive -> large smoother gain
     Z = jnp.ones((n_disc, n_disc))
@@ -7336,7 +7908,6 @@ def _psd_probe_smoother_moments():
         filter_mean=filter_mean,
         filter_cov=filter_cov,
         filter_discrete_state_prob=filter_prob,
-        last_filter_conditional_cont_mean=last_pair_mean,
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -7427,3 +7998,279 @@ def test_filter_follows_dynamics_on_impossible_observation() -> None:
     assert bool(jnp.all(jnp.isfinite(fp)))  # no zero-lock / NaN
     np.testing.assert_allclose(np.asarray(fp.sum(axis=1)), 1.0, rtol=1e-6)
     assert bool(jnp.isfinite(mll))
+
+
+# ---------------------------------------------------------------------------
+# M-step residual forms, fixed H / A, relative floors, occupancy gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def random_mstep_stats() -> dict:
+    """Well-scaled synthetic smoother statistics for M-step identities."""
+    rng = np.random.default_rng(11)
+    T, n, n_obs, K = 300, 3, 2, 2
+    means = rng.normal(size=(T, n, K))
+    factors = 0.3 * rng.normal(size=(T, n, n, K))
+    covs = (
+        np.einsum("tabk,tcbk->tack", factors, factors)
+        + 0.05 * np.eye(n)[None, :, :, None]
+    )
+    prob = rng.dirichlet(np.ones(K), size=T)
+    joint = prob[:-1, :, None] * prob[1:, None, :]
+    cross = 0.05 * rng.normal(size=(T - 1, n, n, K, K))
+    obs = means[:, :2, 0] @ rng.normal(size=(2, n_obs)) + 0.3 * rng.normal(
+        size=(T, n_obs)
+    )
+    return {
+        "obs": jnp.asarray(obs),
+        "state_cond_smoother_means": jnp.asarray(means),
+        "state_cond_smoother_covs": jnp.asarray(covs),
+        "smoother_discrete_state_prob": jnp.asarray(prob),
+        "smoother_joint_discrete_state_prob": jnp.asarray(joint),
+        "pair_cond_smoother_cross_cov": jnp.asarray(cross),
+    }
+
+
+def _manual_mstep_moments(stats: dict) -> dict:
+    """Aggregated weighted moments with plain NumPy (the textbook shortcuts)."""
+    y = np.asarray(stats["obs"])
+    m = np.asarray(stats["state_cond_smoother_means"])
+    P = np.asarray(stats["state_cond_smoother_covs"])
+    w = np.asarray(stats["smoother_discrete_state_prob"])
+    gamma = np.einsum("tabk,tk->abk", P, w) + np.einsum("tak,tbk,tk->abk", m, m, w)
+    delta = np.einsum("ta,tbk,tk->abk", y, m, w)
+    alpha = np.einsum("ta,tb,tk->abk", y, y, w)
+    first = P[0] * w[0] + np.einsum("ak,bk,k->abk", m[0], m[0], w[0])
+    return {
+        "gamma": gamma,
+        "delta": delta,
+        "alpha": alpha,
+        "gamma2": gamma - first,
+        "n": w.sum(0),
+        "n1": w[1:].sum(0),
+        "sum_P": np.einsum("tabk,tk->abk", P, w),
+    }
+
+
+def test_mstep_residual_forms_match_shortcuts_and_are_psd(random_mstep_stats):
+    """At the solved H*/A* the residual (centred) forms equal the textbook
+    shortcuts R = (alpha - H* delta^T)/n and Q = (gamma2 - A* beta^T)/n."""
+    from state_space_practice.switching_kalman import (
+        compute_transition_sufficient_stats,
+    )
+
+    A, H, Q, R, *_ = switching_kalman_maximization_step(**random_mstep_stats)
+    mom = _manual_mstep_moments(random_mstep_stats)
+    gamma1, beta = compute_transition_sufficient_stats(
+        state_cond_smoother_means=random_mstep_stats["state_cond_smoother_means"],
+        state_cond_smoother_covs=random_mstep_stats["state_cond_smoother_covs"],
+        smoother_joint_discrete_state_prob=random_mstep_stats[
+            "smoother_joint_discrete_state_prob"
+        ],
+        pair_cond_smoother_cross_cov=random_mstep_stats["pair_cond_smoother_cross_cov"],
+    )
+    for k in range(2):
+        H_star = np.linalg.solve(mom["gamma"][..., k], mom["delta"][..., k].T).T
+        R_short = (mom["alpha"][..., k] - H_star @ mom["delta"][..., k].T) / mom["n"][k]
+        A_star = np.linalg.solve(
+            np.asarray(gamma1[..., k]), np.asarray(beta[..., k]).T
+        ).T
+        Q_short = (mom["gamma2"][..., k] - A_star @ np.asarray(beta[..., k]).T) / mom[
+            "n1"
+        ][k]
+        np.testing.assert_allclose(H[..., k], H_star, rtol=1e-9)
+        np.testing.assert_allclose(A[..., k], A_star, rtol=1e-9)
+        np.testing.assert_allclose(R[..., k], 0.5 * (R_short + R_short.T), rtol=1e-12)
+        np.testing.assert_allclose(Q[..., k], 0.5 * (Q_short + Q_short.T), rtol=1e-12)
+        assert np.linalg.eigvalsh(np.asarray(R[..., k])).min() > 0.0
+        assert np.linalg.eigvalsh(np.asarray(Q[..., k])).min() > 0.0
+
+
+def test_mstep_fixed_measurement_matrix_installs_fixed_h_optimum(random_mstep_stats):
+    """With H held fixed (misspecified), R is the optimum for that H -- the
+    full quadratic form -- not the shortcut that assumes the solved H*."""
+    mom = _manual_mstep_moments(random_mstep_stats)
+    H_fixed = jnp.stack([jnp.eye(2, 3), 0.5 * jnp.eye(2, 3)], axis=-1)
+    _, H, _, R, *_ = switching_kalman_maximization_step(
+        **random_mstep_stats, fixed_measurement_matrix=H_fixed
+    )
+    np.testing.assert_array_equal(np.asarray(H), np.asarray(H_fixed))
+
+    y = np.asarray(random_mstep_stats["obs"])
+    m = np.asarray(random_mstep_stats["state_cond_smoother_means"])
+    w = np.asarray(random_mstep_stats["smoother_discrete_state_prob"])
+    for k in range(2):
+        Hk = np.asarray(H_fixed[..., k])
+        resid = y - m[..., k] @ Hk.T
+        R_opt = (
+            np.einsum("ta,tb,t->ab", resid, resid, w[:, k])
+            + Hk @ mom["sum_P"][..., k] @ Hk.T
+        ) / mom["n"][k]
+        H_star = np.linalg.solve(mom["gamma"][..., k], mom["delta"][..., k].T).T
+        R_shortcut = (mom["alpha"][..., k] - Hk @ mom["delta"][..., k].T) / mom["n"][k]
+        np.testing.assert_allclose(R[..., k], R_opt, rtol=1e-11)
+        # Guard: the fixed H is genuinely misspecified, so the answers differ.
+        assert np.max(np.abs(Hk - H_star)) > 0.1
+        assert np.max(np.abs(np.asarray(R[..., k]) - R_shortcut)) > 1e-2
+
+
+def test_mstep_fixed_transition_matrix_matches_residual_scatter(random_mstep_stats):
+    """With A held fixed, Q equals the fixed-A residual scatter / counts used by
+    the constrained CNM update."""
+    A_fixed = jnp.stack([0.9 * jnp.eye(3), 0.5 * jnp.eye(3)], axis=-1)
+    A, _, Q, *_ = switching_kalman_maximization_step(
+        **random_mstep_stats, fixed_continuous_transition_matrix=A_fixed
+    )
+    scatter, counts = compute_process_covariance_sufficient_stats(
+        continuous_transition_matrix=A_fixed,
+        **{k: v for k, v in random_mstep_stats.items() if k != "obs"},
+    )
+    np.testing.assert_array_equal(np.asarray(A), np.asarray(A_fixed))
+    np.testing.assert_allclose(Q, scatter / counts[None, None, :], rtol=1e-12)
+
+
+def test_mstep_covariances_are_scale_equivariant(random_mstep_stats):
+    """Relative eigenvalue floors: rescaling the latent units by c rescales Q by
+    c^2 exactly (the old absolute 1e-8 floor distorted small-scale problems)."""
+    c = 1e-6
+    scaled = dict(random_mstep_stats)
+    scaled["state_cond_smoother_means"] = (
+        c * random_mstep_stats["state_cond_smoother_means"]
+    )
+    scaled["state_cond_smoother_covs"] = (
+        c**2 * random_mstep_stats["state_cond_smoother_covs"]
+    )
+    scaled["pair_cond_smoother_cross_cov"] = (
+        c**2 * random_mstep_stats["pair_cond_smoother_cross_cov"]
+    )
+    scaled["obs"] = c * random_mstep_stats["obs"]
+    _, _, Q, R, *_ = switching_kalman_maximization_step(**random_mstep_stats)
+    _, _, Q_s, R_s, *_ = switching_kalman_maximization_step(**scaled)
+    assert float(jnp.max(Q_s)) < 1e-8  # guard: below the old absolute floor
+    np.testing.assert_allclose(Q_s, c**2 * Q, rtol=1e-8)
+    np.testing.assert_allclose(R_s, c**2 * R, rtol=1e-8)
+
+
+def test_mstep_floor_engages_relatively_and_is_logged(random_mstep_stats, caplog):
+    """A genuinely singular Q (noise-free latent) is floored on its own
+    correlation scale and the floor is reported; a regular Q is left untouched."""
+    with caplog.at_level("WARNING"):
+        switching_kalman_maximization_step(**random_mstep_stats)
+    assert "relative eigenvalue floor" not in caplog.text
+
+    stats = dict(random_mstep_stats)
+    # Latent collapsed onto one direction: every Q_j is (numerically) rank one.
+    means = np.asarray(stats["state_cond_smoother_means"])
+    stats["state_cond_smoother_means"] = jnp.asarray(
+        means[:, :1, :] * np.array([1.0, 2.0, -1.0])[None, :, None]
+    )
+    stats["state_cond_smoother_covs"] = jnp.zeros_like(
+        stats["state_cond_smoother_covs"]
+    )
+    stats["pair_cond_smoother_cross_cov"] = jnp.zeros_like(
+        stats["pair_cond_smoother_cross_cov"]
+    )
+    with caplog.at_level("WARNING"):
+        _, _, Q, *_ = switching_kalman_maximization_step(**stats)
+    assert "relative eigenvalue floor" in caplog.text
+    for k in range(2):
+        Q_k = np.asarray(Q[..., k])
+        d = np.sqrt(np.diag(Q_k))
+        eig = np.linalg.eigvalsh(Q_k / np.outer(d, d))
+        np.testing.assert_allclose(eig[0], 1e-10 * eig[-1], rtol=1e-4)
+
+
+def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats, caplog):
+    """A state with expected occupancy ~1e-7 keeps its previous A/Q/H/R, the
+    occupied state is still updated, and a warning names the gated state."""
+    stats = dict(random_mstep_stats)
+    T = stats["smoother_discrete_state_prob"].shape[0]
+    prob = jnp.stack([jnp.ones(T) - 1e-7 / T, jnp.full(T, 1e-7 / T)], axis=-1)
+    stats["smoother_discrete_state_prob"] = prob
+    stats["smoother_joint_discrete_state_prob"] = prob[:-1, :, None] * prob[1:, None, :]
+    previous = {
+        "continuous_transition_matrix": jnp.stack([0.3 * jnp.eye(3)] * 2, axis=-1),
+        "measurement_matrix": jnp.stack([jnp.eye(2, 3)] * 2, axis=-1),
+        "process_cov": jnp.stack([0.7 * jnp.eye(3)] * 2, axis=-1),
+        "measurement_cov": jnp.stack([0.2 * jnp.eye(2)] * 2, axis=-1),
+    }
+    with caplog.at_level("WARNING"):
+        A, H, Q, R, *_ = switching_kalman_maximization_step(
+            **stats, previous_params=previous
+        )
+    assert "discrete state(s) [1] have expected occupancy" in caplog.text
+    for name, value in zip(
+        [
+            "continuous_transition_matrix",
+            "measurement_matrix",
+            "process_cov",
+            "measurement_cov",
+        ],
+        [A, H, Q, R],
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(value[..., 1]), np.asarray(previous[name][..., 1])
+        )
+        assert not np.allclose(
+            np.asarray(value[..., 0]), np.asarray(previous[name][..., 0])
+        )
+
+
+def test_mstep_warns_for_near_empty_state_without_previous_params(
+    random_mstep_stats, caplog
+):
+    """Without previous_params the gate cannot keep anything: the unidentified
+    parameters of the near-empty state are installed, and that is reported."""
+    stats = dict(random_mstep_stats)
+    T = stats["smoother_discrete_state_prob"].shape[0]
+    prob = jnp.stack([jnp.ones(T) - 1e-7 / T, jnp.full(T, 1e-7 / T)], axis=-1)
+    stats["smoother_discrete_state_prob"] = prob
+    stats["smoother_joint_discrete_state_prob"] = prob[:-1, :, None] * prob[1:, None, :]
+    with caplog.at_level("WARNING"):
+        switching_kalman_maximization_step(**stats)
+    assert "discrete state(s) [1] have expected occupancy" in caplog.text
+    assert "unidentified" in caplog.text
+    assert "kept their previous values" not in caplog.text
+
+
+def test_posterior_entropy_fails_loud_on_indefinite_covariance() -> None:
+    """The entropy uses a Cholesky log-determinant: it agrees with slogdet on
+    PSD input and returns NaN (not |det| of an indefinite matrix) otherwise."""
+    T, n, K = 4, 2, 1
+    prob = jnp.ones((T, K))
+    joint = jnp.ones((T - 1, K, K))
+    covs = jnp.stack([jnp.diag(jnp.array([0.5, 2.0]))] * T)[..., None]
+    H = compute_posterior_entropy(prob, joint, covs)
+    expected = T * 0.5 * (n * (1 + np.log(2 * np.pi)) + np.log(1.0))
+    np.testing.assert_allclose(H, expected, rtol=1e-8)
+
+    indefinite = covs.at[1, :, :, 0].set(jnp.diag(jnp.array([0.5, -2.0])))
+    assert bool(jnp.isnan(compute_posterior_entropy(prob, joint, indefinite)))
+
+
+def test_joint_dim_optimizer_compiles_once_across_em_iterations() -> None:
+    """The jitted BFGS core is reused by later calls with new statistics and a
+    new sampling rate (only shapes and iteration limits are static)."""
+    rng = np.random.default_rng(5)
+    n_osc, n_states = 2, 2
+    n_cont = 2 * n_osc
+
+    def stats(seed_shift):
+        X = rng.normal(size=(400, n_cont))
+        gamma1 = np.stack([X[:-1].T @ X[:-1]] * n_states, axis=-1)
+        beta = np.stack([(0.9 + seed_shift) * X[1:].T @ X[:-1]] * n_states, axis=-1)
+        return jnp.asarray(gamma1), jnp.asarray(beta)
+
+    init = {
+        "damping": jnp.array([0.9, 0.85]),
+        "freq": jnp.array([8.0, 12.0]),
+        "coupling_strength": jnp.zeros((n_osc, n_osc, n_states)).at[0, 1].set(0.05),
+        "phase_diff": jnp.zeros((n_osc, n_osc, n_states)),
+    }
+    g1, b1 = stats(0.0)
+    optimize_dim_transition_params_joint(g1, b1, init, 100.0, max_iter=5)
+    size_after_first = _optimize_dim_joint_core._cache_size()
+    g2, b2 = stats(0.01)
+    optimize_dim_transition_params_joint(g2, b2, init, 125.0, max_iter=5)
+    assert _optimize_dim_joint_core._cache_size() == size_after_first

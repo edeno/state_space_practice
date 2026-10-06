@@ -159,7 +159,9 @@ process_covs = jnp.stack([Q_off, Q_on], axis=-1)
 
 print(f"Transition matrices shape: {transition_matrices.shape}")
 print(f"Process covariances shape: {process_covs.shape}")
-print(f"\nState 0 (theta-off): damping={float(damping_off[0])}, var={float(var_off[0])}")
+print(
+    f"\nState 0 (theta-off): damping={float(damping_off[0])}, var={float(var_off[0])}"
+)
 print(f"State 1 (theta-on): damping={float(damping_on[0])}, var={float(var_on[0])}")
 
 # %%
@@ -269,7 +271,9 @@ print(f"  True discrete states shape: {true_discrete_states.shape}")
 print(f"  Number of state transitions: {n_transitions}")
 print(f"  Total spike count: {total_spikes}")
 print(f"  Mean firing rate: {mean_rate:.2f} Hz")
-print(f"  Time in state 0 (theta-off): {jnp.mean(true_discrete_states == 0) * 100:.1f}%")
+print(
+    f"  Time in state 0 (theta-off): {jnp.mean(true_discrete_states == 0) * 100:.1f}%"
+)
 print(f"  Time in state 1 (theta-on): {jnp.mean(true_discrete_states == 1) * 100:.1f}%")
 
 # %% [markdown]
@@ -495,7 +499,9 @@ ax.set_ylim(-0.1, 1.1)
 ax.set_yticks([0, 1])
 ax.set_yticklabels(["Theta-off", "Theta-on"])
 ax.legend(loc="upper right")
-ax.set_title(f"Discrete State Inference: Theta-On vs Theta-Off (Accuracy: {accuracy:.1%})")
+ax.set_title(
+    f"Discrete State Inference: Theta-On vs Theta-Off (Accuracy: {accuracy:.1%})"
+)
 
 # Panel 2: Inferred state probability
 ax = axes[1]
@@ -549,7 +555,9 @@ for dim in range(n_latent):
 mean_raw_corr = np.mean(raw_correlations)
 sign_flip = False
 if mean_raw_corr < 0:
-    print("Note: Oscillator sign flipped (x -> -x symmetry); correcting for comparison.")
+    print(
+        "Note: Oscillator sign flipped (x -> -x symmetry); correcting for comparison."
+    )
     smoother_mean = -smoother_mean
     sign_flip = True
 
@@ -586,9 +594,7 @@ ax.fill_between(
     color="C0",
     label="True (theta-on=1)",
 )
-ax.plot(
-    time, smoother_discrete_prob[:, 1], "k-", alpha=0.8, label="P(theta-on)"
-)
+ax.plot(time, smoother_discrete_prob[:, 1], "k-", alpha=0.8, label="P(theta-on)")
 ax.set_ylabel("State / P(theta-on)")
 ax.set_ylim(-0.1, 1.1)
 ax.legend(loc="upper right")
@@ -696,7 +702,9 @@ if not np.array_equal(state_perm, [0, 1]):
 
 print("Learned vs True Spectral Radius:")
 for state, name in enumerate(["theta-off", "theta-on"]):
-    true_sr = float(jnp.max(jnp.abs(jnp.linalg.eigvals(transition_matrices[:, :, state]))))
+    true_sr = float(
+        jnp.max(jnp.abs(jnp.linalg.eigvals(transition_matrices[:, :, state])))
+    )
     learned_sr = float(jnp.max(jnp.abs(jnp.linalg.eigvals(learned_A[:, :, state]))))
     print(f"  State {state} ({name}):")
     print(f"    True: {true_sr:.4f}")
@@ -843,19 +851,25 @@ for l2_val in l2_values:
         amp_ratio = np.nan
 
     # Weight magnitude
-    weight_norm = float(jnp.mean(jnp.linalg.norm(model_test.spike_params.weights, axis=1)))
+    weight_norm = float(
+        jnp.mean(jnp.linalg.norm(model_test.spike_params.weights, axis=1))
+    )
 
-    results.append({
-        'l2': l2_val,
-        'accuracy': test_accuracy,
-        'amp_corr': test_amp_corr,
-        'amp_ratio': amp_ratio,
-        'weight_norm': weight_norm,
-    })
+    results.append(
+        {
+            "l2": l2_val,
+            "accuracy": test_accuracy,
+            "amp_corr": test_amp_corr,
+            "amp_ratio": amp_ratio,
+            "weight_norm": weight_norm,
+        }
+    )
 
-    print(f"L2={l2_val:.2f}: Acc={test_accuracy:.1%}, "
-          f"AmpCorr={test_amp_corr:.3f}, AmpRatio={amp_ratio:.3f}, "
-          f"|weights|={weight_norm:.3f}")
+    print(
+        f"L2={l2_val:.2f}: Acc={test_accuracy:.1%}, "
+        f"AmpCorr={test_amp_corr:.3f}, AmpRatio={amp_ratio:.3f}, "
+        f"|weights|={weight_norm:.3f}"
+    )
 
 print("-" * 70)
 
@@ -863,46 +877,46 @@ print("-" * 70)
 # Plot comparison
 fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-l2_vals = [r['l2'] for r in results]
+l2_vals = [r["l2"] for r in results]
 
 # Accuracy vs L2
 ax = axes[0, 0]
-ax.plot(l2_vals, [r['accuracy'] for r in results], 'bo-', markersize=8)
+ax.plot(l2_vals, [r["accuracy"] for r in results], "bo-", markersize=8)
 ax.set_xlabel("L2 Regularization")
 ax.set_ylabel("Discrete State Accuracy")
-ax.set_xscale('symlog', linthresh=0.01)
-ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xscale("symlog", linthresh=0.01)
+ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5)
 ax.set_ylim(0.8, 1.02)
 ax.set_title("State Classification Accuracy")
 
 # Amplitude correlation vs L2
 ax = axes[0, 1]
-ax.plot(l2_vals, [r['amp_corr'] for r in results], 'go-', markersize=8)
+ax.plot(l2_vals, [r["amp_corr"] for r in results], "go-", markersize=8)
 ax.set_xlabel("L2 Regularization")
 ax.set_ylabel("Amplitude Correlation")
-ax.set_xscale('symlog', linthresh=0.01)
-ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xscale("symlog", linthresh=0.01)
+ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5)
 ax.set_ylim(0.8, 1.02)
 ax.set_title("Amplitude Tracking (correlation)")
 
 # Amplitude ratio vs L2
 ax = axes[1, 0]
-ax.plot(l2_vals, [r['amp_ratio'] for r in results], 'ro-', markersize=8)
+ax.plot(l2_vals, [r["amp_ratio"] for r in results], "ro-", markersize=8)
 ax.set_xlabel("L2 Regularization")
 ax.set_ylabel("Amplitude Ratio (inferred / true)")
-ax.set_xscale('symlog', linthresh=0.01)
-ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='Perfect recovery')
+ax.set_xscale("symlog", linthresh=0.01)
+ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5, label="Perfect recovery")
 ax.set_ylim(0, 1.5)
 ax.set_title("Amplitude Scale Recovery")
 ax.legend()
 
 # Weight magnitude vs L2
 ax = axes[1, 1]
-ax.plot(l2_vals, [r['weight_norm'] for r in results], 'mo-', markersize=8)
-ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='True |c|=1.0')
+ax.plot(l2_vals, [r["weight_norm"] for r in results], "mo-", markersize=8)
+ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5, label="True |c|=1.0")
 ax.set_xlabel("L2 Regularization")
 ax.set_ylabel("Mean Weight Magnitude")
-ax.set_xscale('symlog', linthresh=0.01)
+ax.set_xscale("symlog", linthresh=0.01)
 ax.set_title("Learned Weight Magnitude")
 ax.legend()
 
@@ -915,11 +929,15 @@ plt.show()
 # Summary of L2 comparison
 print("\nL2 Regularization Comparison Summary:")
 print("=" * 70)
-print(f"{'L2':<8} {'Accuracy':<10} {'Amp Corr':<10} {'Amp Ratio':<12} {'|weights|':<10}")
+print(
+    f"{'L2':<8} {'Accuracy':<10} {'Amp Corr':<10} {'Amp Ratio':<12} {'|weights|':<10}"
+)
 print("-" * 70)
 for r in results:
-    print(f"{r['l2']:<8.2f} {r['accuracy']:<10.1%} {r['amp_corr']:<10.3f} "
-          f"{r['amp_ratio']:<12.3f} {r['weight_norm']:<10.3f}")
+    print(
+        f"{r['l2']:<8.2f} {r['accuracy']:<10.1%} {r['amp_corr']:<10.3f} "
+        f"{r['amp_ratio']:<12.3f} {r['weight_norm']:<10.3f}"
+    )
 print("=" * 70)
 print("\nNote: Amp Ratio < 1 means underestimating amplitude")
 print("      True weight magnitude |c| = 1.0")

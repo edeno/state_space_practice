@@ -26,6 +26,10 @@ Sarkka, S. & Solin, A. (2019). Applied Stochastic Differential Equations.
     Cambridge University Press. (Ch. 12.)
 """
 
+from __future__ import annotations
+
+from typing import NamedTuple
+
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
@@ -34,6 +38,16 @@ from state_space_practice.utils import validate_scalar
 
 # The value of ``f`` is the first state component: f = H @ x.
 MATERN32_MEASUREMENT_VECTOR = jnp.array([1.0, 0.0])
+
+
+class Matern32SDE(NamedTuple):
+    """Continuous-time SDE form of a Matern-3/2 GP (see :func:`matern32_continuous`)."""
+
+    F: Array
+    L: Array
+    Qc: Array
+    H: Array
+    Pinf: Array
 
 
 def _matern32_rate(lengthscale: Array) -> Array:
@@ -45,7 +59,7 @@ def matern32_continuous(
     variance: ArrayLike,
     lengthscale: ArrayLike,
     validate: bool = True,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> Matern32SDE:
     r"""Continuous-time SDE representation of a Matern-3/2 Gaussian process.
 
     The kernel is
@@ -99,7 +113,7 @@ def matern32_continuous(
     L = jnp.array([0.0, 1.0])
     Qc = 4.0 * variance * lam**3
     Pinf = jnp.array([[variance, 0.0], [0.0, lam**2 * variance]])
-    return F, L, Qc, MATERN32_MEASUREMENT_VECTOR, Pinf
+    return Matern32SDE(F, L, Qc, MATERN32_MEASUREMENT_VECTOR, Pinf)
 
 
 def matern32_discretize(
@@ -169,7 +183,7 @@ def matern32_discretize(
     r = lam_dt
     r2 = r * r
     q11_closed = variance * (1.0 - decay_sq * (1.0 + 2.0 * r + 2.0 * r2))
-    q11_poly = 16.0 / 405.0
+    q11_poly: Array | float = 16.0 / 405.0
     for coeff in (-2.0 / 15.0, 8.0 / 21.0, -8.0 / 9.0, 8.0 / 5.0, -2.0, 4.0 / 3.0):
         q11_poly = coeff + r * q11_poly
     q11_series = variance * r**3 * q11_poly

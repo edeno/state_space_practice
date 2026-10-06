@@ -49,10 +49,10 @@ dt = data["dt"]
 n_neurons = data["n_neurons"]
 n_time = data["n_time"]
 
-print(f"Full dataset: {n_time} steps ({n_time*dt:.0f} sec), {n_neurons} neurons")
+print(f"Full dataset: {n_time} steps ({n_time * dt:.0f} sec), {n_neurons} neurons")
 print(f"Sampling: {sampling_freq} Hz, dt={dt} sec")
-print(f"Running fraction: {(labels==1).mean():.2f}")
-print(f"Mean firing rate: {float(jnp.mean(spikes)/dt):.1f} Hz/neuron")
+print(f"Running fraction: {(labels == 1).mean():.2f}")
+print(f"Mean firing rate: {float(jnp.mean(spikes) / dt):.1f} Hz/neuron")
 
 # %% [markdown]
 # # Step 1: 2-state model on full data
@@ -106,10 +106,12 @@ n_im = np.sum(valid[:-1] == 0)
 n_run = np.sum(valid[:-1] == 1)
 p_im_stay = (np.sum((valid[:-1] == 0) & (valid[1:] == 0)) + 1) / (n_im + 2)
 p_run_stay = (np.sum((valid[:-1] == 1) & (valid[1:] == 1)) + 1) / (n_run + 2)
-model2.discrete_transition_matrix = jnp.array([
-    [p_im_stay, 1 - p_im_stay],
-    [1 - p_run_stay, p_run_stay],
-])
+model2.discrete_transition_matrix = jnp.array(
+    [
+        [p_im_stay, 1 - p_im_stay],
+        [1 - p_run_stay, p_run_stay],
+    ]
+)
 model2.init_discrete_state_prob = jnp.array([1 - running_frac, running_frac])
 
 # Data-adaptive spike param initialization
@@ -117,12 +119,19 @@ model2.init_discrete_state_prob = jnp.array([1 - running_frac, running_frac])
 mean_counts = np.array(jnp.mean(spikes, axis=0))
 empirical_baseline = np.log(mean_counts / dt + 1e-10)
 model2.spike_params = SpikeObsParams(
-    baseline=jnp.stack([jnp.array(empirical_baseline), jnp.array(empirical_baseline)], axis=-1),
-    weights=jnp.zeros((n_neurons, 2, 2)) + jax.random.normal(key, (n_neurons, 2, 2)) * 0.01,
+    baseline=jnp.stack(
+        [jnp.array(empirical_baseline), jnp.array(empirical_baseline)], axis=-1
+    ),
+    weights=jnp.zeros((n_neurons, 2, 2))
+    + jax.random.normal(key, (n_neurons, 2, 2)) * 0.01,
 )
 
-print(f"Empirical baseline range: [{empirical_baseline.min():.1f}, {empirical_baseline.max():.1f}]")
-print(f"Transition: P(stay|immobile)={float(p_im_stay):.4f}, P(stay|run)={float(p_run_stay):.4f}")
+print(
+    f"Empirical baseline range: [{empirical_baseline.min():.1f}, {empirical_baseline.max():.1f}]"
+)
+print(
+    f"Transition: P(stay|immobile)={float(p_im_stay):.4f}, P(stay|run)={float(p_run_stay):.4f}"
+)
 
 print(f"\nFitting on full dataset ({n_time} steps)...")
 lls2 = model2.fit(spikes, max_iter=20, skip_init=True)
@@ -140,9 +149,13 @@ theta_on_state = np.argmax(corr2)
 clear_mask = (labels == 0) | (labels == 1)
 auc2 = roc_auc_score(running_mask[clear_mask], prob2[clear_mask, theta_on_state])
 
-smoother_mean2 = np.array(jnp.einsum(
-    "tls,ts->tl", model2.smoother_state_cond_mean, model2.smoother_discrete_state_prob,
-))
+smoother_mean2 = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model2.smoother_state_cond_mean,
+        model2.smoother_discrete_state_prob,
+    )
+)
 amplitude2 = np.sqrt(smoother_mean2[:, 0] ** 2 + smoother_mean2[:, 1] ** 2)
 
 print(f"Theta-on = state {theta_on_state}")
@@ -152,11 +165,18 @@ print(f"Z: {np.array(model2.discrete_transition_matrix)}")
 
 # Save 2-state results
 with open(output_dir / "model2_results.pkl", "wb") as f:
-    pickle.dump({
-        "model": model2, "lls": lls2, "prob": prob2,
-        "theta_on_state": theta_on_state, "auc": auc2,
-        "smoother_mean": smoother_mean2, "amplitude": amplitude2,
-    }, f)
+    pickle.dump(
+        {
+            "model": model2,
+            "lls": lls2,
+            "prob": prob2,
+            "theta_on_state": theta_on_state,
+            "auc": auc2,
+            "smoother_mean": smoother_mean2,
+            "amplitude": amplitude2,
+        },
+        f,
+    )
 
 # %%
 # Plot first 2 minutes
@@ -174,7 +194,9 @@ ax.legend()
 
 ax = axes[1]
 ax.plot(time_show, prob2[t_show, theta_on_state], color="C1", alpha=0.8, linewidth=0.5)
-ax.fill_between(time_show, 0, running_mask[t_show], alpha=0.15, color="C0", label="Running")
+ax.fill_between(
+    time_show, 0, running_mask[t_show], alpha=0.15, color="C0", label="Running"
+)
 ax.set_ylabel("P(theta-on)")
 ax.legend()
 
@@ -207,7 +229,9 @@ print("3-state model: theta-off / theta-on / SWR")
 print("=" * 50)
 
 A_swr = construct_common_oscillator_transition_matrix(
-    theta_freq, jnp.array([0.80]), sampling_freq  # moderately damped
+    theta_freq,
+    jnp.array([0.80]),
+    sampling_freq,  # moderately damped
 )
 
 model3 = SwitchingSpikeOscillatorModel(
@@ -232,12 +256,16 @@ model3.process_cov = jnp.stack([Q_off, Q_on, Q_off], axis=-1)
 model3.init_cov = jnp.stack([jnp.eye(2) * 0.5] * 3, axis=-1)
 
 # Transition: theta-off and theta-on are stable, SWR is brief
-model3.discrete_transition_matrix = jnp.array([
-    [p_im_stay - 0.001, 1 - p_im_stay, 0.001],  # theta-off: mostly stay, rare SWR
-    [1 - p_run_stay, p_run_stay - 0.001, 0.001],  # theta-on: mostly stay, rare SWR
-    [0.15,  0.05,  0.80],   # SWR: brief (~5 steps = 20ms), mostly back to off
-])
-model3.init_discrete_state_prob = jnp.array([1 - running_frac - 0.02, running_frac, 0.02])
+model3.discrete_transition_matrix = jnp.array(
+    [
+        [p_im_stay - 0.001, 1 - p_im_stay, 0.001],  # theta-off: mostly stay, rare SWR
+        [1 - p_run_stay, p_run_stay - 0.001, 0.001],  # theta-on: mostly stay, rare SWR
+        [0.15, 0.05, 0.80],  # SWR: brief (~5 steps = 20ms), mostly back to off
+    ]
+)
+model3.init_discrete_state_prob = jnp.array(
+    [1 - running_frac - 0.02, running_frac, 0.02]
+)
 
 # Data-adaptive spike params: shared across states
 model3.spike_params = SpikeObsParams(
@@ -259,8 +287,10 @@ for j in range(3):
     # Weight of this state at each timestep
     w = prob3[:, j]
     # Weighted mean spike rate
-    weighted_rate = float(np.sum(w[:, None] * np.array(spikes), axis=0).sum() /
-                          (np.sum(w) * n_neurons * dt))
+    weighted_rate = float(
+        np.sum(w[:, None] * np.array(spikes), axis=0).sum()
+        / (np.sum(w) * n_neurons * dt)
+    )
     mean_rates.append(weighted_rate)
 
 # SWR state should have highest rate
@@ -272,17 +302,25 @@ theta_on_3 = remaining[np.argmax(corr_remaining)]
 theta_off_3 = [j for j in range(3) if j not in [swr_state, theta_on_3]][0]
 
 print(f"State mapping: theta-off={theta_off_3}, theta-on={theta_on_3}, SWR={swr_state}")
-print(f"Mean rates: off={mean_rates[theta_off_3]:.1f}, on={mean_rates[theta_on_3]:.1f}, SWR={mean_rates[swr_state]:.1f} Hz")
-print(f"State occupancy: off={prob3[:, theta_off_3].mean():.3f}, on={prob3[:, theta_on_3].mean():.3f}, SWR={prob3[:, swr_state].mean():.3f}")
+print(
+    f"Mean rates: off={mean_rates[theta_off_3]:.1f}, on={mean_rates[theta_on_3]:.1f}, SWR={mean_rates[swr_state]:.1f} Hz"
+)
+print(
+    f"State occupancy: off={prob3[:, theta_off_3].mean():.3f}, on={prob3[:, theta_on_3].mean():.3f}, SWR={prob3[:, swr_state].mean():.3f}"
+)
 
 auc3 = roc_auc_score(running_mask[clear_mask], prob3[clear_mask, theta_on_3])
 print(f"AUC (theta-on vs running): {auc3:.3f}")
 print(f"Z: {np.array(model3.discrete_transition_matrix)}")
 
 # %%
-smoother_mean3 = np.array(jnp.einsum(
-    "tls,ts->tl", model3.smoother_state_cond_mean, model3.smoother_discrete_state_prob,
-))
+smoother_mean3 = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model3.smoother_state_cond_mean,
+        model3.smoother_discrete_state_prob,
+    )
+)
 amplitude3 = np.sqrt(smoother_mean3[:, 0] ** 2 + smoother_mean3[:, 1] ** 2)
 
 fig, axes = plt.subplots(5, 1, figsize=(16, 14), sharex=True)
@@ -294,14 +332,37 @@ ax.set_ylabel("Speed (cm/s)")
 ax.set_title(f"3-state model: theta-off / theta-on / SWR  (AUC={auc3:.3f})")
 
 ax = axes[1]
-ax.plot(time_show, prob3[t_show, theta_on_3], color="C1", alpha=0.8, linewidth=0.5, label="P(theta-on)")
-ax.plot(time_show, prob3[t_show, swr_state], color="C3", alpha=0.8, linewidth=0.5, label="P(SWR)")
-ax.fill_between(time_show, 0, running_mask[t_show], alpha=0.1, color="C0", label="Running")
+ax.plot(
+    time_show,
+    prob3[t_show, theta_on_3],
+    color="C1",
+    alpha=0.8,
+    linewidth=0.5,
+    label="P(theta-on)",
+)
+ax.plot(
+    time_show,
+    prob3[t_show, swr_state],
+    color="C3",
+    alpha=0.8,
+    linewidth=0.5,
+    label="P(SWR)",
+)
+ax.fill_between(
+    time_show, 0, running_mask[t_show], alpha=0.1, color="C0", label="Running"
+)
 ax.set_ylabel("Probability")
 ax.legend(fontsize=8)
 
 ax = axes[2]
-ax.plot(time_show, prob3[t_show, theta_off_3], color="C0", alpha=0.8, linewidth=0.5, label="P(theta-off)")
+ax.plot(
+    time_show,
+    prob3[t_show, theta_off_3],
+    color="C0",
+    alpha=0.8,
+    linewidth=0.5,
+    label="P(theta-off)",
+)
 ax.set_ylabel("P(theta-off)")
 ax.legend(fontsize=8)
 

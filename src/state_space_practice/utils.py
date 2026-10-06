@@ -1,16 +1,58 @@
+from __future__ import annotations
+
+import functools
+import logging
+import operator
 import warnings
-from typing import Optional, Union
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 import numpy as np
 from jax import Array
-from jax.typing import ArrayLike
-from scipy.optimize import linear_sum_assignment
+from jax.typing import ArrayLike, DTypeLike
+
+from state_space_practice.exceptions import StateSpaceWarning
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
+logger = logging.getLogger(__name__)
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
-Numeric = Union[float, int, np.ndarray, jax.Array]
+Numeric = float | int | np.ndarray | jax.Array
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def typed_jit(fun: Callable[_P, _R], /, **jit_kwargs: Any) -> Callable[_P, _R]:
+    """``jax.jit`` that keeps ``fun``'s signature visible to type checkers.
+
+    ``jax.jit`` returns a wrapper whose ``__call__`` is typed ``(*Any) -> Any``,
+    so mypy checks neither the arguments nor the result at a jitted call. This
+    returns the identical ``jax.jit(fun, **jit_kwargs)`` object, typed as
+    ``fun``. Use it like ``jax.jit``: ``@typed_jit`` or
+    ``@functools.partial(typed_jit, static_argnames=...)``. The jit-only
+    attributes (``.lower``, ``.trace``) still exist at runtime but are not
+    visible to the type checker.
+    """
+    return cast(Callable[_P, _R], jax.jit(fun, **jit_kwargs))
+
+
+def _root_figure(ax: Axes) -> Figure:
+    """The top-level Figure holding ``ax``, even when ``ax`` is in a SubFigure.
+
+    ``ax.figure`` is the innermost (Sub)Figure, which lacks ``tight_layout`` /
+    ``savefig``; plotting helpers that call those need the root.
+    """
+    fig = ax.get_figure(root=True)
+    if fig is None:
+        raise ValueError("ax is not attached to a matplotlib Figure.")
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -18,12 +60,12 @@ Numeric = Union[float, int, np.ndarray, jax.Array]
 # ---------------------------------------------------------------------------
 
 
-def symmetrize(A: jax.Array) -> jax.Array:
+def symmetrize(A: ArrayLike) -> jax.Array:
     """Symmetrize one or more matrices by averaging each matrix with its transpose.
 
     Parameters
     ----------
-    A : jax.Array
+    A : ArrayLike
         A matrix or a batch of matrices to be symmetrized. The last two
         dimensions should be square matrices.
 
@@ -42,37 +84,103 @@ def symmetrize(A: jax.Array) -> jax.Array:
            [2.5, 4. ]], dtype=float32)
 
     """
+    A = jnp.asarray(A)
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
+#: Default relative diagonal shift of :func:`psd_cholesky` / :func:`psd_solve`
+#: for float64 matrices (~1e4 * f64 machine epsilon). Lower-precision dtypes
+#: use their machine epsilon instead (see :func:`_default_relative_boost`).
+DEFAULT_RELATIVE_BOOST = 1e-12
+
+
+def _default_relative_boost(dtype: DTypeLike) -> float:
+    """Relative diagonal shift used when a caller passes ``relative_boost=None``.
+
+    ``max(DEFAULT_RELATIVE_BOOST, eps(dtype))``: ``1e-12`` in float64, and the
+    machine epsilon in float32 (``~1.2e-7``) where a ``1e-12`` relative shift
+    would round away entirely.
+    """
+    return max(DEFAULT_RELATIVE_BOOST, float(jnp.finfo(dtype).eps))
+
+
+#: Diagonal entries below this fraction of the largest one are shifted as if
+#: they were this large (see :func:`_stabilizing_shift`).
+_SHIFT_DIAGONAL_FLOOR_RATIO = 1e-8
+
+
+def _stabilizing_shift(
+    A_sym: jax.Array,
+    diagonal_boost: float,
+    relative_boost: float | jax.Array | None,
+) -> jax.Array:
+    """Per-diagonal-entry shift of :func:`psd_cholesky` (shape ``A.shape[:-1]``).
+
+    ``shift_i = max(diagonal_boost, relative_boost * d_i, sqrt(tiny))`` with
+    ``d_i = max(|A_ii|, 1e-8 * max_j |A_jj|)`` and ``tiny`` the smallest
+    normal number of the dtype.
+
+    The shift is proportional to each diagonal entry, i.e. ``A + rel *
+    diag(A)``: Cholesky's roundoff is bounded componentwise by
+    ``~n eps sqrt(A_ii A_jj)``, so this is the natural (diagonal-scaling
+    invariant) stabilisation. It makes the factorization equivariant under
+    any rescaling ``D A D`` of the coordinates (a state in cm next to one in
+    cm/s is shifted by the same *relative* amount), and it is block-local: a
+    block-diagonal matrix gets the same shift factored whole or block by
+    block, so block-diagonal fast paths agree with their dense counterparts
+    to roundoff. The ``1e-8 * max`` floor on ``d_i`` caps the precision of
+    an exactly-degenerate coordinate (a zero diagonal entry) at
+    ``~1e20 / max|diag|`` instead of ``1 / sqrt(tiny)``; ``sqrt(tiny)``
+    (~1.5e-154 in float64) only keeps an all-zero matrix finite.
+    """
+    dtype = A_sym.dtype
+    if relative_boost is None:
+        relative_boost = _default_relative_boost(dtype)
+    diag_abs = jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1))
+    max_diag = jnp.max(diag_abs, axis=-1, keepdims=True)
+    scale = jnp.maximum(diag_abs, _SHIFT_DIAGONAL_FLOOR_RATIO * max_diag)
+    floor = float(jnp.finfo(dtype).tiny) ** 0.5
+    return jnp.maximum(
+        jnp.maximum(
+            jnp.asarray(diagonal_boost, dtype=dtype),
+            jnp.asarray(relative_boost, dtype=dtype) * scale,
+        ),
+        jnp.asarray(floor, dtype=dtype),
+    )
+
+
 def psd_cholesky(
-    A: jax.Array,
-    diagonal_boost: float = 1e-9,
-    relative_boost: float = 1e-12,
+    A: ArrayLike,
+    diagonal_boost: float = 0.0,
+    relative_boost: float | None = None,
 ) -> tuple[jax.Array, bool]:
     """Stabilized Cholesky factor of a PSD matrix.
 
-    Symmetrizes ``A`` and adds the same ``max(diagonal_boost,
-    relative_boost * max|diag(A)|)`` shift as :func:`psd_solve` before
-    factoring, then returns the ``(factor, lower)`` pair accepted by
+    Symmetrizes ``A`` and adds the same diagonal shift as :func:`psd_solve`
+    (entry ``i``: ``max(diagonal_boost, relative_boost * |A_ii|, sqrt(tiny))``,
+    see :func:`_stabilizing_shift`) before factoring, then returns the ``(factor, lower)`` pair accepted by
     :func:`jax.scipy.linalg.cho_solve`. Sharing one factorization lets a
     caller reuse it for a linear solve, a quadratic form, and a
-    log-determinant instead of factoring the same matrix several times --
-    and guarantees all three see the *same* stabilized matrix (avoiding a
-    boosted-solve / unboosted-``slogdet`` mismatch on near-singular ``A``).
+    log-determinant (:func:`psd_logdet`) instead of factoring the same
+    matrix several times -- and guarantees all three see the *same*
+    stabilized matrix (avoiding a boosted-solve / unboosted-``slogdet``
+    mismatch on near-singular ``A``).
 
-    See :func:`psd_solve` for the rationale behind the two-part shift.
+    See :func:`psd_solve` for the rationale behind the shift policy.
 
     Parameters
     ----------
-    A : jax.Array
+    A : ArrayLike
         Coefficient matrix or batch of matrices, expected positive
         semi-definite. Only the last two axes are treated as the matrix.
     diagonal_boost : float, optional
-        Absolute floor for the stabilization shift. Default is 1e-9.
-    relative_boost : float, optional
-        Coefficient of ``max|diag(A)|`` for the relative component of the
-        shift. Default is 1e-12. Pass ``0.0`` to disable relative scaling.
+        Absolute floor for the stabilization shift. Default 0.0 (the shift
+        is purely scale-relative).
+    relative_boost : float or None, optional
+        Coefficient of ``|A_ii|`` for the relative component of the shift of
+        diagonal entry ``i``. Default None: ``1e-12`` for float64, machine
+        epsilon for lower precision. Pass ``0.0`` to disable relative
+        scaling.
 
     Returns
     -------
@@ -81,23 +189,43 @@ def psd_cholesky(
         The stabilized matrix's log-determinant is
         ``2 * sum(log(abs(diag(factor))))``.
     """
+    A = jnp.asarray(A)
     A_sym = symmetrize(A)
+    shift = _stabilizing_shift(A_sym, diagonal_boost, relative_boost)
     n = A.shape[-1]
-    diag_abs = jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1))
-    max_diag = jnp.max(diag_abs, axis=-1)
-    effective_boost = jnp.maximum(
-        jnp.asarray(diagonal_boost, dtype=A.dtype),
-        jnp.asarray(relative_boost, dtype=A.dtype) * max_diag,
-    )
-    A_stabilized = A_sym + effective_boost[..., None, None] * jnp.eye(n, dtype=A.dtype)
+    idx = jnp.arange(n)
+    A_stabilized = A_sym.at[..., idx, idx].add(shift)
     return jax.scipy.linalg.cho_factor(A_stabilized)
 
 
+def psd_logdet(cho: tuple[jax.Array, bool]) -> jax.Array:
+    """Log-determinant from a :func:`psd_cholesky` factor.
+
+    ``2 * sum(log|diag(factor)|)`` for the stabilized matrix that was
+    factored, so a caller reusing one factor for a solve and a
+    log-determinant sees the same matrix in both.
+
+    Parameters
+    ----------
+    cho : tuple[jax.Array, bool]
+        The ``(factor, lower)`` tuple returned by :func:`psd_cholesky`;
+        ``factor`` has shape ``(..., n, n)`` (a single matrix or a batch).
+
+    Returns
+    -------
+    logdet : jax.Array, shape (...)
+        Log-determinant of each stabilized matrix (a scalar array for a
+        single ``(n, n)`` factor).
+    """
+    diag = jnp.diagonal(cho[0], axis1=-2, axis2=-1)
+    return 2.0 * jnp.sum(jnp.log(jnp.abs(diag)), axis=-1)
+
+
 def psd_solve(
-    A: jax.Array,
-    b: jax.Array,
-    diagonal_boost: float = 1e-9,
-    relative_boost: float = 1e-12,
+    A: ArrayLike,
+    b: ArrayLike,
+    diagonal_boost: float = 0.0,
+    relative_boost: float | None = None,
 ) -> jax.Array:
     """Solves a linear system Ax = b for positive semi-definite (PSD) matrices A.
 
@@ -108,51 +236,57 @@ def psd_solve(
 
     Stabilization shift
     -------------------
-    The shift added to each matrix diagonal is::
+    Diagonal entry ``i`` of each matrix is shifted by::
 
-        effective = max(diagonal_boost, relative_boost * max|diag(A)|)
+        shift_i = max(diagonal_boost, relative_boost * d_i, sqrt(tiny))
+        d_i     = max(|A_ii|, 1e-8 * max_j |A_jj|)
 
-    For batched inputs the effective shift is computed independently for each
-    matrix in the batch.
+    (:func:`_stabilizing_shift`). For batched inputs the shift is computed
+    independently for each matrix in the batch.
 
-    Using ``max(absolute, relative * scale)`` is standard numerics
-    practice. Rationale:
+    By default the shift is **scale-relative**: ``diagonal_boost=0`` and
+    ``relative_boost=1e-12`` in float64 (machine epsilon in float32, where
+    ``1e-12`` would round away), i.e. ``A + 1e-12 * diag(A)``. Rescaling
+    ``A -> s A`` rescales the shift by the same factor, so
+    ``psd_solve(s A, b) == psd_solve(A, b) / s`` for any ``s > 0`` -- the
+    solve is scale-equivariant, and so are the filters built on it (a
+    covariance of scale ``1e-10`` is treated exactly like one of scale 1).
+    Because the shift is proportional to each diagonal entry it is also
+    equivariant under per-coordinate rescaling ``D A D`` and block-local
+    (a block-diagonal matrix is shifted identically whether it is factored
+    whole or block by block). ``sqrt(tiny)`` (``~1.5e-154`` in float64) is a
+    last-resort floor that only keeps an all-zero matrix finite.
 
-    - The absolute ``diagonal_boost`` handles matrices whose entries are
-      O(1) or smaller; the ~1e-9 floor sits just above f64 cholesky
-      precision and catches matrices that are numerically (but not
-      structurally) positive semidefinite.
-    - The ``relative_boost`` handles matrices whose entries span many
-      orders of magnitude. A cov matrix with ``max_diag ~ 1e6`` needs a
-      larger shift than ``1e-9`` to stabilize cholesky; a cov with
-      ``max_diag ~ 1e-3`` would have ``1e-9`` be a relatively large
-      perturbation of the signal. Relative scaling is scale-invariant
-      and gives roughly f64-precision-level stability on any input.
+    An absolute floor (``diagonal_boost > 0``) is *not* scale-equivariant:
+    ``diagonal_boost=1e-9`` dominates the shift for matrices below ~1e-3 in
+    scale and swamps covariances below ~1e-7 entirely. Callers that want one
+    anyway (e.g. to regularise a matrix that is structurally rank-deficient,
+    or in fixed physical units) can still pass ``diagonal_boost``;
+    ``diagonal_boost=0.0`` is the default.
 
     The default ``relative_boost=1e-12`` is approximately 1e4 * f64
-    machine epsilon — small enough that the shift does not perturb
+    machine epsilon -- small enough that the shift does not perturb
     near-singular f64 matrices (whose smallest eigenvalues may be at
-    1e-10 to 1e-5) but still catches genuinely ill-conditioned matrices
-    at large scales (where ``max_diag * 1e-12`` exceeds the absolute
-    ``1e-9`` floor). Callers can raise ``relative_boost`` for aggressive
-    regularization or lower it to 0.0 to disable relative scaling
-    entirely and match the pre-adaptive behavior.
+    1e-10 to 1e-5 of the largest) but large enough to absorb the
+    ``O(n eps sqrt(A_ii A_jj))`` roundoff that makes a numerically-PSD
+    matrix fail Cholesky. Pass ``relative_boost=0.0`` to disable relative
+    scaling (with ``diagonal_boost=0.0`` too, only the ``sqrt(tiny)`` floor
+    remains).
 
     Parameters
     ----------
-    A : jax.Array
+    A : ArrayLike
         The coefficient matrix or batch of coefficient matrices, expected to
         be positive semi-definite.
-    b : jax.Array
+    b : ArrayLike
         The right-hand side vector or matrix.
     diagonal_boost : float, optional
-        Absolute floor for the stabilization shift. Default is 1e-9.
-    relative_boost : float, optional
-        Coefficient of ``max|diag(A)|`` used as the relative component
-        of the stabilization shift. Default is 1e-12 (~1e4 * f64 eps).
-        Pass ``0.0`` to disable relative scaling entirely and match the
-        pre-adaptive (absolute-only) behavior — useful for callers that
-        need bit-for-bit reproducibility with older code.
+        Absolute floor for the stabilization shift. Default 0.0.
+    relative_boost : float or None, optional
+        Coefficient of ``|A_ii|`` used as the relative component of the
+        shift of diagonal entry ``i``. Default None: ``1e-12`` (~1e4 * f64
+        eps) for float64 and machine epsilon for lower-precision dtypes.
+        Pass ``0.0`` to disable relative scaling entirely.
 
     Returns
     -------
@@ -169,6 +303,7 @@ def psd_solve(
     # the deprecation recommends -- and drop it again. The non-batched vector
     # path is numerically unchanged, and 2D matrix right-hand sides (all
     # internal callers) are untouched.
+    A = jnp.asarray(A)
     cho = psd_cholesky(A, diagonal_boost=diagonal_boost, relative_boost=relative_boost)
     b = jnp.asarray(b)
     rhs_is_vector = b.ndim == A.ndim - 1
@@ -177,7 +312,40 @@ def psd_solve(
     return x[..., 0] if rhs_is_vector else x
 
 
-def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+def clip_eigenvalues(
+    mat: ArrayLike,
+    min_eigenvalue: float | None = None,
+    max_eigenvalue: float | None = None,
+) -> jax.Array:
+    """Clip the eigenvalues of a symmetric matrix into ``[min, max]``.
+
+    Symmetrizes ``mat``, eigendecomposes it, clips the spectrum (each bound is
+    skipped when ``None``) and reconstructs the matrix. Used by the EM
+    trust-region updates to keep process / initial covariances inside a
+    configured eigenvalue range.
+
+    Parameters
+    ----------
+    mat : ArrayLike, shape (n, n)
+        Matrix to clip; only its symmetric part is used.
+    min_eigenvalue, max_eigenvalue : float or None
+        Lower / upper bound on the eigenvalues; ``None`` leaves that side open.
+
+    Returns
+    -------
+    clipped : jax.Array, shape (n, n)
+        Symmetric matrix with the same eigenvectors as ``symmetrize(mat)`` and
+        its eigenvalues clipped into ``[min_eigenvalue, max_eigenvalue]``.
+    """
+    eigvals, eigvecs = jnp.linalg.eigh(symmetrize(mat))
+    if min_eigenvalue is not None:
+        eigvals = jnp.maximum(eigvals, min_eigenvalue)
+    if max_eigenvalue is not None:
+        eigvals = jnp.minimum(eigvals, max_eigenvalue)
+    return cast(jax.Array, eigvecs @ jnp.diag(eigvals) @ eigvecs.T)
+
+
+def project_psd(Q: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Project a matrix onto the positive semi-definite cone.
 
     This function ensures the input matrix is positive semi-definite by:
@@ -187,7 +355,7 @@ def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
 
     Parameters
     ----------
-    Q : jax.Array
+    Q : ArrayLike
         A symmetric matrix to project onto the PSD cone. Shape (n, n).
     min_eigenvalue : float, optional
         Minimum eigenvalue to enforce. Default is 1e-8.
@@ -197,19 +365,307 @@ def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
     jax.Array
         The projected PSD matrix with all eigenvalues >= min_eigenvalue.
     """
-    Q = symmetrize(Q)
-    eigvals, eigvecs = jnp.linalg.eigh(Q)
-    eigvals_clipped = jnp.maximum(eigvals, min_eigenvalue)
-    projected = eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
-    return symmetrize(projected)
+    return symmetrize(clip_eigenvalues(Q, min_eigenvalue=min_eigenvalue))
 
 
-def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+def stabilize_covariance(cov: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Symmetrize a covariance-like matrix and project it to the PSD cone."""
-    return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
+    return project_psd(cov, min_eigenvalue=min_eigenvalue)
 
 
-def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+#: Default relative eigenvalue floor for M-step covariance projections: an
+#: eigenvalue below ``PSD_RELATIVE_FLOOR * max|eigenvalue|`` is raised to it.
+PSD_RELATIVE_FLOOR = 1e-8
+#: Absolute floor under the relative one; only binds for an (all-)zero matrix.
+PSD_ABSOLUTE_FLOOR = 1e-30
+
+
+def relative_psd_floor(
+    eigenvalues: ArrayLike,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+) -> Array:
+    """Scale-relative lower bound for the eigenvalues of a covariance.
+
+    Returns ``max(absolute_floor, rel * max|eigenvalues|)`` with
+    ``rel = max(relative_floor, 10 * eps)`` for the dtype, so the floor
+    scales with the matrix: a covariance in volts (entries ~1e-10) is not
+    clamped to the same absolute value as one in centimetres. The ``10 *
+    eps`` term keeps the floor above the roundoff of an eigen-reconstruction
+    in low precision.
+
+    Parameters
+    ----------
+    eigenvalues : ArrayLike, shape (..., n)
+        Eigenvalues (or the diagonal of a diagonal covariance).
+    relative_floor : float, default=PSD_RELATIVE_FLOOR
+        Floor as a fraction of the largest eigenvalue magnitude.
+    absolute_floor : float, default=PSD_ABSOLUTE_FLOOR
+        Lower bound on the floor itself (binds only for a ~zero matrix).
+
+    Returns
+    -------
+    floor : Array, shape (...)
+        The eigenvalue floor for each matrix.
+    """
+    eigenvalues = jnp.asarray(eigenvalues)
+    dtype = (
+        eigenvalues.dtype
+        if jnp.issubdtype(eigenvalues.dtype, jnp.floating)
+        else jnp.result_type(float)
+    )
+    rel = max(float(relative_floor), 10.0 * float(jnp.finfo(dtype).eps))
+    scale = jnp.max(jnp.abs(eigenvalues), axis=-1)
+    return jnp.maximum(jnp.asarray(absolute_floor, dtype=dtype), rel * scale)
+
+
+def _log_floored_eigenvalues(
+    n_floored: Array,
+    floor: Array,
+    min_eigenvalue: Array | None = None,
+    max_abs_eigenvalue: Array | None = None,
+    *,
+    name: str,
+) -> None:
+    """Host-side logger for :func:`project_psd_relative` (via debug callback)."""
+    n = int(np.sum(np.asarray(n_floored)))
+    if n == 0:
+        return
+    floor_value = float(np.min(np.asarray(floor)))
+    if min_eigenvalue is not None and max_abs_eigenvalue is not None:
+        min_eig = np.asarray(min_eigenvalue)
+        max_abs = np.asarray(max_abs_eigenvalue)
+        tolerance = np.sqrt(np.finfo(min_eig.dtype).eps) * max_abs
+        if bool(np.any(min_eig < -tolerance)):
+            logger.warning(
+                "%s: the estimate is indefinite (minimum eigenvalue %.3g "
+                "relative to a largest |eigenvalue| of %.3g, on the "
+                "correlation scale); raised %d eigenvalue(s) to the PSD floor "
+                "%.3g. A materially negative eigenvalue indicates inconsistent "
+                "sufficient statistics (e.g. E-step moments that do not come "
+                "from one posterior), not a degenerate latent dimension.",
+                name,
+                float(np.min(min_eig)),
+                float(np.max(max_abs)),
+                n,
+                floor_value,
+            )
+            return
+    logger.warning(
+        "%s: raised %d eigenvalue(s) to the scale-relative PSD floor "
+        "%.3g. The estimate is (numerically) rank deficient; check for "
+        "a degenerate latent dimension or an over-parameterised model.",
+        name,
+        n,
+        floor_value,
+    )
+
+
+def warn_if_floored(
+    n_floored: ArrayLike,
+    floor: ArrayLike,
+    name: str,
+    min_eigenvalue: ArrayLike | None = None,
+    max_abs_eigenvalue: ArrayLike | None = None,
+) -> None:
+    """Log (host side, jit-safe) that ``n_floored`` eigenvalues were floored.
+
+    Emits a ``logger.warning`` from :mod:`state_space_practice.utils` when
+    ``n_floored > 0``. Works eagerly and inside ``jax.jit`` / ``lax.scan``
+    (through :func:`jax.debug.callback`), so jitted M-steps can report a
+    projection without a host sync of their own.
+
+    A round-off-level negative (or zero) eigenvalue is reported as numerical
+    rank deficiency. When the eigenvalue range is supplied and the minimum
+    eigenvalue is materially negative (below ``-sqrt(eps) *
+    max_abs_eigenvalue``), the matrix is reported as indefinite instead, which
+    points at inconsistent sufficient statistics rather than a degenerate
+    dimension.
+
+    Parameters
+    ----------
+    n_floored : ArrayLike
+        Number of eigenvalues (or variances) that were raised to the floor.
+    floor : ArrayLike
+        The floor that was applied.
+    name : str
+        Name of the quantity, used in the log message.
+    min_eigenvalue, max_abs_eigenvalue : ArrayLike or None, optional
+        Minimum eigenvalue and largest eigenvalue magnitude of the matrix
+        before flooring (on the scale the floor was applied on).
+    """
+    # None is an empty pytree, so it reaches the host logger unchanged.
+    jax.debug.callback(
+        functools.partial(_log_floored_eigenvalues, name=name),
+        n_floored,
+        floor,
+        min_eigenvalue,
+        max_abs_eigenvalue,
+    )
+
+
+def clip_eigenvalues_relative(
+    cov: ArrayLike,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+) -> tuple[Array, Array]:
+    """Floor a covariance on the correlation scale and count what was raised.
+
+    The silent core of :func:`project_psd_relative`, for callers that report
+    the count themselves (e.g. accumulated over a ``lax.scan``). See
+    :func:`project_psd_relative` for the projection.
+
+    Parameters
+    ----------
+    cov : ArrayLike, shape (n, n)
+        Covariance-like matrix; only its symmetric part is used.
+    relative_floor, absolute_floor : float
+        See :func:`relative_psd_floor`; applied to the eigenvalues of the
+        correlation-scaled matrix.
+
+    Returns
+    -------
+    projected : Array, shape (n, n)
+        ``symmetrize(cov)`` exactly when no eigenvalue is floored, otherwise
+        the floored matrix (positive definite).
+    n_floored : Array
+        Number of correlation-scale eigenvalues that were raised to the floor
+        (int scalar).
+    """
+    cov = jnp.asarray(cov)
+    projected, n_floored, _, _ = _clip_eigenvalues_relative(
+        cov, relative_floor, absolute_floor
+    )
+    return projected, n_floored
+
+
+def _correlation_scale(cov: Array) -> Array:
+    """Per-coordinate scale ``sqrt(d_i)`` used to form ``D^{-1/2} C D^{-1/2}``.
+
+    A nonpositive diagonal entry (a degenerate or indefinite coordinate) has
+    no scale of its own and uses the largest diagonal entry instead; an
+    all-nonpositive diagonal uses 1 (the absolute scale).
+
+    Parameters
+    ----------
+    cov : Array, shape (..., n, n)
+        Symmetric matrix.
+
+    Returns
+    -------
+    scale : Array, shape (..., n)
+        Positive scales.
+    """
+    diag = jnp.diagonal(cov, axis1=-2, axis2=-1)
+    max_diag = jnp.max(diag, axis=-1, keepdims=True)
+    fallback = jnp.where(max_diag > 0.0, max_diag, jnp.ones_like(max_diag))
+    return jnp.sqrt(jnp.where(diag > 0.0, diag, fallback))
+
+
+def _clip_eigenvalues_relative(
+    cov: Array, relative_floor: float, absolute_floor: float
+) -> tuple[Array, Array, Array, Array]:
+    """:func:`clip_eigenvalues_relative` that also returns the floor used and
+    the eigenvalues before flooring (both on the correlation scale)."""
+    cov = symmetrize(jnp.asarray(cov))
+    scale = _correlation_scale(cov)
+    outer_scale = scale[..., :, None] * scale[..., None, :]
+    eigvals, eigvecs = jnp.linalg.eigh(cov / outer_scale)
+    floor = relative_psd_floor(eigvals, relative_floor, absolute_floor)
+    floored = eigvals < floor
+    raised = jnp.where(floored, floor, eigvals)
+    projected = symmetrize(((eigvecs * raised[None, :]) @ eigvecs.T) * outer_scale)
+    n_floored = jnp.sum(floored, dtype=jnp.int32)
+    return jnp.where(n_floored > 0, projected, cov), n_floored, floor, eigvals
+
+
+def project_psd_relative(
+    cov: ArrayLike,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+    name: str = "covariance",
+    warn: bool = True,
+) -> Array:
+    """Symmetrize a covariance and floor its eigenvalues on the correlation scale.
+
+    The scale-aware covariance projection of the EM M-steps. With ``D`` the
+    positive diagonal of ``C = symmetrize(cov)`` (see
+    :func:`_correlation_scale` for nonpositive entries), the eigenvalues of
+    the correlation-scaled matrix ``D^{-1/2} C D^{-1/2}`` below
+    :func:`relative_psd_floor` of it are raised to it and the result is
+    scaled back. The projection is therefore equivariant under any diagonal
+    change of units, ``floor(S C S) = S floor(C) S``: a small variance next
+    to a large one is floored relative to its own scale, not to the largest
+    eigenvalue. A covariance with no correlation-scale eigenvalue below the
+    floor is returned exactly (``symmetrize(cov)``).
+
+    Parameters
+    ----------
+    cov : ArrayLike, shape (n, n)
+        Covariance estimate; only its symmetric part is used.
+    relative_floor, absolute_floor : float
+        See :func:`relative_psd_floor`; applied to the correlation-scaled
+        eigenvalues.
+    name : str, default="covariance"
+        Name used in the log message.
+    warn : bool, default=True
+        If True, log a warning (see :func:`warn_if_floored`) whenever the
+        projection changes an eigenvalue.
+
+    Returns
+    -------
+    projected : Array, shape (n, n)
+        Symmetric positive-definite matrix.
+    """
+    cov = jnp.asarray(cov)
+    projected, n_floored, floor, eigvals = _clip_eigenvalues_relative(
+        cov, relative_floor, absolute_floor
+    )
+    if warn:
+        warn_if_floored(
+            n_floored,
+            floor,
+            name,
+            min_eigenvalue=jnp.min(eigvals),
+            max_abs_eigenvalue=jnp.max(jnp.abs(eigvals)),
+        )
+    return projected
+
+
+def floor_variances_relative(
+    variances: ArrayLike,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+    name: str = "variances",
+    warn: bool = True,
+) -> Array:
+    """Diagonal-covariance counterpart of :func:`project_psd_relative`.
+
+    Parameters
+    ----------
+    variances : ArrayLike, shape (n,)
+        Diagonal of a diagonal covariance.
+    relative_floor, absolute_floor : float
+        See :func:`relative_psd_floor`.
+    name : str, default="variances"
+        Name used in the log message.
+    warn : bool, default=True
+        If True, log a warning when any variance is raised to the floor.
+
+    Returns
+    -------
+    floored : Array, shape (n,)
+        ``maximum(variances, floor)``.
+    """
+    variances = jnp.asarray(variances)
+    floor = relative_psd_floor(variances, relative_floor, absolute_floor)
+    floored = variances < floor
+    if warn:
+        warn_if_floored(jnp.sum(floored, dtype=jnp.int32), floor, name)
+    return jnp.where(floored, floor, variances)
+
+
+def shift_to_psd(cov: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     r"""Lift a symmetric matrix to the PSD cone by a uniform eigenvalue shift.
 
     Returns ``cov + max(min_eigenvalue - lambda_min(cov), 0) * I`` -- the
@@ -235,7 +691,7 @@ def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
 
     Parameters
     ----------
-    cov : jax.Array
+    cov : ArrayLike
         A symmetric matrix. Shape (n, n).
     min_eigenvalue : float, optional
         Target lower bound on the minimum eigenvalue. Default is 1e-8.
@@ -246,6 +702,7 @@ def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
         ``cov`` shifted so its minimum eigenvalue is at least
         ``min_eigenvalue``. Shape (n, n).
     """
+    cov = jnp.asarray(cov)
     lambda_min = jnp.linalg.eigvalsh(cov).min()
     shift = jnp.maximum(min_eigenvalue - lambda_min, 0.0)
     return cov + shift * jnp.eye(cov.shape[-1], dtype=cov.dtype)
@@ -260,6 +717,8 @@ def spectral_radius(matrix: ArrayLike) -> float:
     use this for eager, post-optimization stability checks -- not inside a JIT
     trace -- so a host computation is both safe and portable across backends.
     For symmetric matrices prefer ``jnp.linalg.eigvalsh``, which is accelerated.
+    Inside a traced / differentiated computation use
+    :func:`differentiable_spectral_radius` instead.
 
     Parameters
     ----------
@@ -275,16 +734,148 @@ def spectral_radius(matrix: ArrayLike) -> float:
     return float(np.max(np.abs(eigenvalues)))
 
 
+def _host_spectral_radius_and_gradient(
+    matrices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Spectral radius and its gradient for a batch of real square matrices.
+
+    For the dominant eigenvalue ``lambda = V[:, i]``-eigenpair of ``A = V D
+    V^{-1}``, first-order perturbation gives ``d lambda = (V^{-1} dA V)_{ii}``
+    and ``d|lambda| = Re(conj(lambda) d lambda) / |lambda|``, so
+    ``d|lambda| / dA_{ab} = Re(conj(lambda) / |lambda| * Vinv[i, a] * V[b, i])``.
+    The gradient is zeroed where it is undefined (``lambda == 0``) or not finite
+    (defective / numerically non-diagonalizable ``A``).
+    """
+    matrices = np.asarray(matrices)
+    batch_shape = matrices.shape[:-2]
+    n = matrices.shape[-1]
+    flat = matrices.reshape((-1, n, n))
+    radii = np.zeros(len(flat), dtype=matrices.dtype)
+    grads = np.zeros_like(flat)
+    for k, A in enumerate(flat):
+        if not np.all(np.isfinite(A)):
+            radii[k] = np.nan
+            continue
+        eigenvalues, V = np.linalg.eig(A)
+        i = int(np.argmax(np.abs(eigenvalues)))
+        lam = eigenvalues[i]
+        radii[k] = np.abs(lam)
+        if radii[k] == 0.0:
+            continue
+        try:
+            V_inv = np.linalg.inv(V)
+        except np.linalg.LinAlgError:
+            continue
+        grad = np.real((np.conj(lam) / np.abs(lam)) * np.outer(V_inv[i, :], V[:, i]))
+        if np.all(np.isfinite(grad)):
+            grads[k] = grad
+    return radii.reshape(batch_shape), grads.reshape(matrices.shape)
+
+
+def _spectral_radius_callback(matrices: jax.Array) -> tuple[jax.Array, jax.Array]:
+    dtype = matrices.dtype
+    result_shape = (
+        jax.ShapeDtypeStruct(matrices.shape[:-2], dtype),
+        jax.ShapeDtypeStruct(matrices.shape, dtype),
+    )
+    return cast(
+        tuple[jax.Array, jax.Array],
+        jax.pure_callback(
+            _host_spectral_radius_and_gradient,
+            result_shape,
+            matrices,
+            vmap_method="sequential",
+        ),
+    )
+
+
+@jax.custom_jvp
+def differentiable_spectral_radius(matrices: ArrayLike) -> Array:
+    """Exact, differentiable spectral radius usable inside JIT / ``grad``.
+
+    The eigen-decomposition runs on host through ``jax.pure_callback`` (the
+    general ``eigvals`` has no portable accelerator lowering), and a custom JVP
+    supplies the first-order perturbation derivative of the dominant eigenvalue
+    magnitude. Unlike a norm-based upper bound, the value is the actual
+    ``max |lambda|``, so a clamp built on it engages only when the dynamics
+    really exceed the bound.
+
+    The derivative is exact wherever the dominant eigenvalue (or conjugate
+    pair) is simple; at a crossing of two dominant moduli it is one
+    subgradient, and it is zero for a defective matrix.
+
+    Parameters
+    ----------
+    matrices : ArrayLike, shape (..., n, n)
+        Real square matrix or batch of matrices.
+
+    Returns
+    -------
+    Array, shape (...)
+        Spectral radius of each matrix.
+    """
+    radii, _ = _spectral_radius_callback(jnp.asarray(matrices))
+    return radii
+
+
+@differentiable_spectral_radius.defjvp
+def _differentiable_spectral_radius_jvp(
+    primals: tuple[ArrayLike], tangents: tuple[Array]
+) -> tuple[Array, Array]:
+    (matrices,) = primals
+    (d_matrices,) = tangents
+    matrices = jnp.asarray(matrices)
+    radii, grads = _spectral_radius_callback(matrices)
+    return radii, jnp.sum(grads * d_matrices, axis=(-2, -1))
+
+
+def _strongly_connected_blocks(matrix: np.ndarray, block_size: int) -> list[np.ndarray]:
+    """Group ``block_size`` diagonal blocks into strongly connected components.
+
+    Block ``(i, j)`` is an edge when it has any nonzero entry. The spectrum of
+    ``matrix`` is the union of the spectra of the principal submatrices of its
+    strongly connected components (a permutation brings it to block-triangular
+    form), so each component can be stabilized on its own.
+    """
+    from scipy.sparse.csgraph import connected_components
+
+    n_blocks = matrix.shape[0] // block_size
+    blocks = matrix.reshape(n_blocks, block_size, n_blocks, block_size)
+    adjacency = np.any(blocks != 0.0, axis=(1, 3))
+    n_components, labels = connected_components(
+        adjacency, directed=True, connection="strong"
+    )
+    return [np.flatnonzero(labels == c) for c in range(n_components)]
+
+
 def stabilize_transition_matrix(
-    matrix: ArrayLike, max_spectral_radius: float = 0.99
+    matrix: ArrayLike,
+    max_spectral_radius: float = 0.99,
+    block_size: int | None = None,
+    warn: bool = True,
 ) -> Array:
-    """Uniformly scale a transition matrix so its spectral radius <= the bound.
+    """Scale a transition matrix so its spectral radius is <= the bound.
 
     A linear transition ``x_t = A @ x_{t-1} + ...`` is stable only when every
     eigenvalue of ``A`` lies inside the unit circle. When the spectral radius
     exceeds ``max_spectral_radius`` the matrix is scaled by
-    ``max_spectral_radius / spectral_radius`` (which scales every eigenvalue by
-    the same factor); otherwise it is returned unchanged.
+    ``max_spectral_radius / spectral_radius``; otherwise it is returned
+    unchanged.
+
+    With ``block_size`` (e.g. ``2`` for oscillator blocks) the clamp is local:
+    the ``block_size x block_size`` blocks are grouped into strongly connected
+    components of the block coupling graph, whose principal submatrices carry
+    disjoint parts of the spectrum, and only the components whose own spectral
+    radius exceeds the bound are scaled. For uncoupled oscillators this rescales
+    only the offending oscillator instead of damping every rhythm; for a fully
+    coupled matrix it reduces to the uniform scale.
+
+    Choosing ``max_spectral_radius``: an oscillator block with radius ``r`` at
+    sampling rate ``fs`` has a spectral peak of half-power bandwidth
+    ``Delta f ~= (1 - r) * fs / pi``. To keep rhythms as narrow as
+    ``Delta f_min`` representable use ``max_spectral_radius >= 1 - pi *
+    Delta f_min / fs`` (e.g. ``fs = 100`` Hz and ``Delta f_min = 0.3`` Hz gives
+    ``0.99``; ``fs = 1000`` Hz needs ``0.999``).
 
     The spectral radius is computed on host (see :func:`spectral_radius`), so
     this is portable across accelerator backends but must be called eagerly,
@@ -293,31 +884,147 @@ def stabilize_transition_matrix(
     Parameters
     ----------
     matrix : ArrayLike, shape (n, n)
-        Transition matrix (need not be symmetric).
+        Transition matrix (need not be symmetric). Integer and boolean inputs
+        are promoted to the default floating dtype before scaling.
     max_spectral_radius : float, default=0.99
         Upper bound on the spectral radius.
+    block_size : int or None, default=None
+        Size of the structural diagonal blocks. ``None`` applies one uniform
+        scale to the whole matrix. A positive ``block_size`` that does not
+        divide ``n`` also falls back to the uniform scale (logged at WARNING
+        when ``warn=True``).
+    warn : bool, default=True
+        Log a warning (``logging``, host-side) reporting the radius and applied
+        scale whenever the clamp engages. Logging rather than
+        ``warnings.warn`` because EM calls this every iteration.
 
     Returns
     -------
     Array, shape (n, n)
-        The scaled matrix, or the input unchanged if already within the bound.
+        The stabilized matrix, or the (dtype-promoted) input unchanged if
+        already within the bound.
     """
     A = jnp.asarray(matrix)
-    radius = spectral_radius(A)
-    if radius > max_spectral_radius:
-        return A * (max_spectral_radius / radius)
-    return A
+    if not jnp.issubdtype(A.dtype, jnp.inexact):
+        A = A.astype(jnp.result_type(float))
+    A_host = np.asarray(A)
+    n = A_host.shape[0]
+    if block_size is None or block_size <= 0 or n % block_size != 0:
+        if warn and block_size is not None and block_size > 0:
+            logger.warning(
+                "stabilize_transition_matrix: block_size=%d does not divide "
+                "the matrix size %d; clamping with one uniform scale over the "
+                "whole matrix instead of per block.",
+                block_size,
+                n,
+            )
+        components = [np.arange(n)]
+    else:
+        components = [
+            (block_size * comp[:, None] + np.arange(block_size)[None, :]).ravel()
+            for comp in _strongly_connected_blocks(A_host, block_size)
+        ]
+
+    stabilized = A_host.copy()
+    applied = []
+    for idx in components:
+        sub = A_host[np.ix_(idx, idx)]
+        radius = spectral_radius(sub)
+        if radius > max_spectral_radius:
+            scale = max_spectral_radius / radius
+            stabilized[np.ix_(idx, idx)] = sub * scale
+            applied.append((idx, radius, scale))
+    if not applied:
+        return A
+    if warn:
+        details = "; ".join(
+            f"rows {idx.tolist()}: radius={radius:.6g}, scale={scale:.6g}"
+            for idx, radius, scale in applied
+        )
+        logger.warning(
+            "Transition matrix spectral radius exceeded max_spectral_radius="
+            "%g; clamped (%s). If a narrow-band rhythm is expected, raise "
+            "max_spectral_radius toward 1 - pi * bandwidth / sampling_freq.",
+            max_spectral_radius,
+            details,
+        )
+    return jnp.asarray(stabilized, dtype=A.dtype)
 
 
-def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
+def contains_tracer(*values: object) -> bool:
+    """Return True if any pytree leaf is being traced by JAX."""
+    return any(
+        isinstance(leaf, jax.core.Tracer)
+        for value in values
+        for leaf in jax.tree_util.tree_leaves(value)
+    )
+
+
+def _warn_not_positive_definite_host(
+    min_eigenvalue: np.ndarray, *, name: str, filter_name: str
+) -> None:
+    """Host side of :func:`warn_if_not_positive_definite_in_graph`."""
+    min_eig = float(np.min(np.asarray(min_eigenvalue)))
+    if not min_eig > 0.0:
+        warnings.warn(
+            f"{filter_name}: {name} is not positive definite (minimum "
+            f"eigenvalue {min_eig:g}). The input was traced (jax.jit / "
+            f"jax.grad / jax.vmap), so this could not be raised as an error; "
+            f"the returned estimates and log-likelihood are invalid.",
+            StateSpaceWarning,
+            stacklevel=2,
+        )
+
+
+def warn_if_not_positive_definite_in_graph(
+    cov: ArrayLike, *, name: str, filter_name: str
+) -> None:
+    """Report a non-positive-definite (possibly traced) covariance at run time.
+
+    The in-graph counterpart of the host-side positive-definiteness check for
+    inputs that are JAX tracers: the minimum eigenvalue of ``symmetrize(cov)``
+    is computed inside the traced computation and handed to
+    :func:`jax.debug.callback`, which emits a
+    :class:`~state_space_practice.exceptions.StateSpaceWarning` naming it when
+    it is not strictly positive (or not finite). Works under ``jax.jit``,
+    ``jax.grad`` and ``jax.vmap``; the callback is asynchronous, so the warning
+    is emitted when the computation runs (``jax.effects_barrier()`` waits for
+    it).
+
+    Parameters
+    ----------
+    cov : ArrayLike, shape (..., n, n)
+        Covariance (or batch of covariances) to check.
+    name : str
+        Name of the covariance, used in the warning.
+    filter_name : str
+        Name of the public entry point, used in the warning.
+    """
+    cov = jnp.asarray(cov)
+    min_eig = jnp.min(jnp.linalg.eigvalsh(symmetrize(cov)))
+    jax.debug.callback(
+        functools.partial(
+            _warn_not_positive_definite_host, name=name, filter_name=filter_name
+        ),
+        min_eig,
+    )
+
+
+def debug_print_if(condition: ArrayLike, fmt: str, **fmt_kwargs: Any) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
-    Wraps ``jax.lax.cond`` so callers don't have to spell out the
-    ``(lambda: jax.debug.print(...), lambda: None)`` pattern at every
-    silent-fallback site. The print branch fires when the predicate is
+    Under tracing it wraps ``jax.lax.cond``, so callers don't have to spell
+    out the ``(lambda: jax.debug.print(...), lambda: None)`` pattern at every
+    silent-fallback site; with concrete inputs it branches on the host. The print branch fires when the predicate is
     True (i.e. when the *bad* condition holds), matching how the call
     site reads at the user's eye: "if `~is_valid`, print the warning."
     """
+    if not contains_tracer(condition, fmt_kwargs):
+        # Concrete inputs: branch on the host instead of building (and
+        # compiling) a fresh ``lax.cond`` on every eager call.
+        if bool(condition):
+            jax.debug.print(fmt, **fmt_kwargs)
+        return
     jax.lax.cond(
         condition,
         lambda: jax.debug.print(fmt, **fmt_kwargs),
@@ -384,6 +1091,155 @@ def validate_count_array(
         raise ValueError(f"{name} must contain integer-valued counts.")
 
 
+def as_2d_count_matrix(counts: ArrayLike, name: str) -> Array:
+    """Coerce counts to ``(n_time, n_neurons)`` and validate them as counts.
+
+    Parameters
+    ----------
+    counts : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+        Observed counts; a 1-D array is treated as a single neuron.
+    name : str
+        Argument name used in error messages.
+
+    Returns
+    -------
+    Array, shape (n_time, n_neurons)
+
+    Raises
+    ------
+    ValueError
+        If ``counts`` is not 1-D or 2-D, is empty, or fails
+        :func:`validate_count_array`.
+    """
+    counts_arr = jnp.asarray(counts)
+    if counts_arr.ndim == 1:
+        counts_arr = counts_arr[:, None]
+    if counts_arr.ndim != 2:
+        raise ValueError(
+            f"{name} must be 1D (n_time,) or 2D (n_time, n_neurons), "
+            f"got shape {counts_arr.shape}."
+        )
+    validate_count_array(counts_arr, name, allow_empty=False)
+    return counts_arr
+
+
+def validate_finite_array(name: str, value: ArrayLike) -> None:
+    """Validate finite model parameters at public boundaries.
+
+    Host-side check (it forces a device-to-host sync), so call it on concrete
+    values before JIT dispatch, not inside traced code.
+
+    Parameters
+    ----------
+    name : str
+        Parameter name used in the error message.
+    value : ArrayLike, any shape
+        Values to check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is NaN or infinite.
+    """
+    arr = jnp.asarray(value)
+    if bool(jnp.any(~jnp.isfinite(arr))):
+        raise ValueError(f"{name} must contain only finite values.")
+
+
+def validate_nonnegative_array(name: str, value: ArrayLike) -> None:
+    """Validate finite, non-negative model parameters at public boundaries.
+
+    Host-side check; see :func:`validate_finite_array`.
+
+    Parameters
+    ----------
+    name : str
+        Parameter name used in the error message.
+    value : ArrayLike, any shape
+        Values to check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is non-finite or negative.
+    """
+    arr = jnp.asarray(value)
+    validate_finite_array(name, arr)
+    if bool(jnp.any(arr < 0)):
+        raise ValueError(f"{name} must be non-negative.")
+
+
+def validate_unit_interval_array(name: str, value: ArrayLike) -> None:
+    """Validate finite parameters constrained to the closed unit interval.
+
+    Host-side check; see :func:`validate_finite_array`.
+
+    Parameters
+    ----------
+    name : str
+        Parameter name used in the error message.
+    value : ArrayLike, any shape
+        Values to check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is non-finite or outside ``[0, 1]``.
+    """
+    arr = jnp.asarray(value)
+    validate_finite_array(name, arr)
+    if bool(jnp.any((arr < 0) | (arr > 1))):
+        raise ValueError(f"{name} entries must lie in [0, 1].")
+
+
+def validate_int(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> int:
+    """Validate an integer configuration value at a public boundary.
+
+    Accepts exactly what ``operator.index`` accepts: Python and NumPy
+    integers, 0-d integer NumPy / JAX arrays, and ``bool`` (``True`` -> 1,
+    since ``bool`` subclasses ``int``). Floats (even integer-valued ones) and
+    arrays with ``ndim >= 1`` are rejected.
+
+    Parameters
+    ----------
+    value : object
+        Value to validate.
+    name : str
+        Parameter name used in the error message.
+    positive : bool, default=False
+        Require ``value > 0``.
+    nonnegative : bool, default=False
+        Require ``value >= 0``.
+
+    Returns
+    -------
+    value_int : int
+        ``value`` as a plain Python ``int``.
+
+    Raises
+    ------
+    ValueError
+        If ``value`` is not an integer (as above) or is outside the requested
+        range.
+    """
+    kind = "positive" if positive else "non-negative" if nonnegative else "an"
+    article = "a " if kind != "an" else ""
+    message = f"{name} must be {article}{kind} integer."
+    try:
+        value_int = operator.index(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(message) from exc
+    if (positive and value_int <= 0) or (nonnegative and value_int < 0):
+        raise ValueError(message)
+    return value_int
+
+
 def validate_scalar(
     value: object,
     name: str,
@@ -415,8 +1271,8 @@ def _validate_filter_numerics(
     n_time: int,
     stacklevel: int = 3,
     filter_name: str = "filter",
-    measurement_cov: Optional[Array] = None,
-    process_cov: Optional[Array] = None,
+    measurement_cov: Array | None = None,
+    process_cov: Array | None = None,
 ) -> None:
     """Validate covariance numerics + warn about f32 numerical risk.
 
@@ -448,79 +1304,91 @@ def _validate_filter_numerics(
     This helper runs at the top of each public entry point (``fit``,
     ``fit_sgd``, or the public filter/smoother wrappers) once per call,
     then inner call sites pass ``validate_inputs=False`` to skip
-    re-validation. The ``eigvalsh → float(...)`` conversion used here
-    is incompatible with ``jax.jit`` tracing, so inner calls must bypass
-    the check entirely.
+    re-validation. The ``eigvalsh → float(...)`` conversion used here needs
+    concrete values. Concrete arrays are checked even inside an active trace
+    (e.g. constants closed over by a jitted function): the checks run under
+    :func:`jax.ensure_compile_time_eval`. The whole check is skipped when any
+    covariance is a JAX tracer (a traced argument of ``jax.jit`` /
+    ``jax.grad`` / ``jax.vmap``), since a traced value cannot be inspected
+    host-side; the public filters then report a non-positive-definite
+    ``init_cov`` at run time through
+    :func:`warn_if_not_positive_definite_in_graph` instead.
     """
-    validate_covariance(
-        init_covariance,
-        name="init_covariance",
-        require_positive_definite=True,
-    )
-    if measurement_cov is not None:
+    if contains_tracer(init_covariance, measurement_cov, process_cov):
+        return
+    # Closed-over constants of a jitted caller are concrete, but any jnp op
+    # on them inside the trace is staged; evaluate the checks eagerly so
+    # they stay concrete.
+    with jax.ensure_compile_time_eval():
         validate_covariance(
-            measurement_cov,
-            name="measurement_cov",
+            init_covariance,
+            name="init_covariance",
             require_positive_definite=True,
         )
-    if process_cov is not None:
-        validate_covariance(
-            process_cov,
-            name="process_cov",
-            require_positive_definite=False,
-        )
-
-    # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
-    # invocation, vs d^3 per scan step — negligible.
-    init_cov_sym = symmetrize(init_covariance)
-    eigs = jnp.linalg.eigvalsh(init_cov_sym)
-    min_eig = float(eigs.min())
-    max_eig = float(eigs.max())
-
-    # Condition number. Cap the denominator to avoid divide-by-zero on
-    # an (already-filtered) perfectly-rank-deficient matrix.
-    cond = max_eig / max(min_eig, 1e-300)
-    n_state = int(init_covariance.shape[0])
-
-    # Check precision: the filter's scan body inherits its dtype from
-    # init_covariance (via jnp.asarray internally). If the caller passed
-    # an f32 array — either because jax_enable_x64 is off, or because
-    # they explicitly cast — the inner Cholesky solves and matrix
-    # products accumulate f32 roundoff. f64 arrays do not have this
-    # issue in practice.
-    is_f32 = init_covariance.dtype == jnp.float32
-
-    if is_f32:
-        # Rough upper bound on per-bin absolute covariance roundoff from
-        # the predict-step congruence (A @ P @ A^T + Q) and the Cholesky
-        # update. Error-analysis constants: conservative ~sqrt(n_state)
-        # factor, f32 machine epsilon ~1.2e-7. Under a random-walk
-        # accumulation model over n_time bins, total roundoff ~
-        # sqrt(n_time * n_state) * eps * max_eig.
-        f32_eps = 1.2e-7
-        worst_roundoff = float((n_time * n_state) ** 0.5) * f32_eps * max_eig
-        if worst_roundoff > 0.5 * min_eig:
-            warnings.warn(
-                f"{filter_name} running in float32 with "
-                f"a long / ill-conditioned problem: "
-                f"T={n_time}, n_state={n_state}, "
-                f"init_cov condition number {cond:.1e}, "
-                f"min_eig {min_eig:.2e}, max_eig {max_eig:.2e}. "
-                f"Estimated accumulated covariance roundoff "
-                f"({worst_roundoff:.2e}) exceeds half of min_eig, which "
-                f"means the predict step's covariance is likely to lose "
-                f"PSD during the scan and produce NaN. Enable float64 "
-                f"BEFORE importing state_space_practice:\n"
-                f"    import jax\n"
-                f"    jax.config.update('jax_enable_x64', True)\n"
-                f"    # now import state_space_practice models",
-                UserWarning,
-                stacklevel=stacklevel,
+        if measurement_cov is not None:
+            validate_covariance(
+                measurement_cov,
+                name="measurement_cov",
+                require_positive_definite=True,
             )
+        if process_cov is not None:
+            validate_covariance(
+                process_cov,
+                name="process_cov",
+                require_positive_definite=False,
+            )
+
+        # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
+        # invocation, vs d^3 per scan step — negligible.
+        init_cov_sym = symmetrize(init_covariance)
+        eigs = jnp.linalg.eigvalsh(init_cov_sym)
+        min_eig = float(eigs.min())
+        max_eig = float(eigs.max())
+
+        # Condition number. Cap the denominator to avoid divide-by-zero on
+        # an (already-filtered) perfectly-rank-deficient matrix.
+        cond = max_eig / max(min_eig, 1e-300)
+        n_state = int(init_covariance.shape[0])
+
+        # Check precision: the filter's scan body inherits its dtype from
+        # init_covariance (via jnp.asarray internally). If the caller passed
+        # an f32 array — either because jax_enable_x64 is off, or because
+        # they explicitly cast — the inner Cholesky solves and matrix
+        # products accumulate f32 roundoff. f64 arrays do not have this
+        # issue in practice.
+        is_f32 = init_covariance.dtype == jnp.float32
+
+        if is_f32:
+            # Rough upper bound on per-bin absolute covariance roundoff from
+            # the predict-step congruence (A @ P @ A^T + Q) and the Cholesky
+            # update. Error-analysis constants: conservative ~sqrt(n_state)
+            # factor, f32 machine epsilon ~1.2e-7. Under a random-walk
+            # accumulation model over n_time bins, total roundoff ~
+            # sqrt(n_time * n_state) * eps * max_eig.
+            f32_eps = 1.2e-7
+            worst_roundoff = float((n_time * n_state) ** 0.5) * f32_eps * max_eig
+            if worst_roundoff > 0.5 * min_eig:
+                warnings.warn(
+                    f"{filter_name} running in float32 with "
+                    f"a long / ill-conditioned problem: "
+                    f"T={n_time}, n_state={n_state}, "
+                    f"init_cov condition number {cond:.1e}, "
+                    f"min_eig {min_eig:.2e}, max_eig {max_eig:.2e}. "
+                    f"Estimated accumulated covariance roundoff "
+                    f"({worst_roundoff:.2e}) exceeds half of min_eig, which "
+                    f"means the predict step's covariance is likely to lose "
+                    f"PSD during the scan and produce NaN. Enable float64 "
+                    f"BEFORE importing state_space_practice:\n"
+                    f"    import jax\n"
+                    f"    jax.config.update('jax_enable_x64', True)\n"
+                    f"    # now import state_space_practice models",
+                    StateSpaceWarning,
+                    stacklevel=stacklevel,
+                )
 
 
 def validate_covariance(
-    covariance: Array,
+    covariance: ArrayLike,
     name: str = "covariance",
     *,
     require_positive_definite: bool = True,
@@ -537,7 +1405,7 @@ def validate_covariance(
 
     Parameters
     ----------
-    covariance : Array
+    covariance : ArrayLike
         Either a single square matrix ``(d, d)`` or a stack of per-discrete-
         state matrices ``(d, d, n_states)`` (discrete-state axis last, per the
         project convention).
@@ -558,7 +1426,7 @@ def validate_covariance(
     """
     arr = jnp.asarray(covariance)
     if arr.ndim == 2:
-        slices: list[tuple[Optional[int], Array]] = [(None, arr)]
+        slices: list[tuple[int | None, Array]] = [(None, arr)]
     elif arr.ndim == 3:
         slices = [(k, arr[..., k]) for k in range(arr.shape[-1])]
     else:
@@ -620,7 +1488,7 @@ def validate_covariance(
 
 
 def validate_transition_matrix(
-    transition_matrix: Array,
+    transition_matrix: ArrayLike,
     name: str = "transition_matrix",
     *,
     atol: float = 1e-6,
@@ -629,7 +1497,7 @@ def validate_transition_matrix(
 
     Parameters
     ----------
-    transition_matrix : Array, shape (n_states, n_states)
+    transition_matrix : ArrayLike, shape (n_states, n_states)
         Discrete-state transition matrix, row-stochastic by convention
         (``T[i, j] = P(next = j | current = i)``).
     name : str
@@ -672,7 +1540,7 @@ def validate_transition_matrix(
 
 
 def validate_probability_vector(
-    probabilities: Array,
+    probabilities: ArrayLike,
     name: str = "probabilities",
     *,
     atol: float = 1e-6,
@@ -681,7 +1549,7 @@ def validate_probability_vector(
 
     Parameters
     ----------
-    probabilities : Array, shape (n_states,)
+    probabilities : ArrayLike, shape (n_states,)
         Discrete probability vector.
     name : str
         Field name used in error messages.
@@ -723,7 +1591,7 @@ _LOG_FLOOR_VALUE = float(np.log(_LOG_PROB_FLOOR))
 _DISCRETE_PROB_STABILITY_FLOOR = 1e-10
 
 
-def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+def divide_safe(numerator: ArrayLike, denominator: ArrayLike) -> jax.Array:
     """Divide two arrays, returning 0.0 where denominator is exactly 0.0.
 
     Guards against division-by-zero for exact floating-point zeros only
@@ -732,8 +1600,8 @@ def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
 
     Parameters
     ----------
-    numerator : jax.Array
-    denominator : jax.Array
+    numerator : ArrayLike
+    denominator : ArrayLike
 
     Returns
     -------
@@ -744,7 +1612,7 @@ def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
     return jnp.where(denominator == 0.0, 0.0, numerator / safe_denominator)
 
 
-def safe_log(x: jax.Array) -> jax.Array:
+def safe_log(x: ArrayLike) -> jax.Array:
     """Compute log(x) with numerical stability for small probabilities.
 
     Uses jnp.where to explicitly handle near-zero values rather than
@@ -752,7 +1620,7 @@ def safe_log(x: jax.Array) -> jax.Array:
 
     Parameters
     ----------
-    x : jax.Array
+    x : ArrayLike
         Input array (typically probabilities).
 
     Returns
@@ -773,7 +1641,7 @@ def safe_log(x: jax.Array) -> jax.Array:
     return jnp.where(jnp.isnan(x), jnp.nan, result)
 
 
-def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
+def stabilize_probability_vector(probabilities: ArrayLike) -> jax.Array:
     """Prevent exact-zero probability lockout from numerical underflow.
 
     Applies a small floor to each element, then re-normalizes so the vector
@@ -782,7 +1650,7 @@ def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
 
     Parameters
     ----------
-    probabilities : jax.Array, shape (n_states,)
+    probabilities : ArrayLike, shape (n_states,)
         Probability vector (non-negative, ideally sums to 1).
 
     Returns
@@ -837,12 +1705,12 @@ def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
     return stabilized / jnp.sum(stabilized)
 
 
-def scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, jax.Array]:
+def scale_likelihood(log_likelihood: ArrayLike) -> tuple[jax.Array, jax.Array]:
     """Scale the log likelihood to avoid numerical underflow.
 
     Parameters
     ----------
-    log_likelihood : jax.Array
+    log_likelihood : ArrayLike
         Log likelihood values.
 
     Returns
@@ -877,7 +1745,7 @@ def check_converged(
     log_likelihood: Numeric,
     previous_log_likelihood: Numeric,
     tolerance: float = 1e-4,
-    absolute_tolerance: Optional[float] = None,
+    absolute_tolerance: float | None = None,
 ) -> tuple[bool, bool]:
     """We have converged if the slope of the log-likelihood function falls below 'tolerance',
 
@@ -933,7 +1801,7 @@ def check_converged(
     return bool(is_converged), bool(is_increasing)
 
 
-def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Array:
+def make_discrete_transition_matrix(diag: ArrayLike, n_discrete_states: int) -> Array:
     """Build a row-stochastic transition matrix from diagonal values.
 
     Off-diagonal elements distribute the remaining probability mass
@@ -941,7 +1809,7 @@ def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Arra
 
     Parameters
     ----------
-    diag : Array, shape (n_discrete_states,)
+    diag : ArrayLike, shape (n_discrete_states,)
         Diagonal (self-transition) probabilities for each state.
     n_discrete_states : int
         Number of discrete states.
@@ -980,11 +1848,11 @@ def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Arra
 # ---------------------------------------------------------------------------
 
 
-@jax.jit
+@typed_jit
 def hmm_viterbi(
-    initial_probs: Array,
-    transition_matrix: Array,
-    log_likelihoods: Array,
+    initial_probs: ArrayLike,
+    transition_matrix: ArrayLike,
+    log_likelihoods: ArrayLike,
 ) -> Array:
     """Find the most likely discrete state sequence (Viterbi algorithm).
 
@@ -993,12 +1861,12 @@ def hmm_viterbi(
 
     Parameters
     ----------
-    initial_probs : Array, shape (K,)
+    initial_probs : ArrayLike, shape (K,)
         Prior probability of each discrete state at time 0.
-    transition_matrix : Array, shape (K, K)
+    transition_matrix : ArrayLike, shape (K, K)
         Row-stochastic transition matrix where entry ``(i, j)`` is
         ``P(S_t = j | S_{t-1} = i)``.
-    log_likelihoods : Array, shape (T, K)
+    log_likelihoods : ArrayLike, shape (T, K)
         Per-state log observation likelihoods ``log p(y_t | S_t = k)``
         at each time step.
 
@@ -1007,12 +1875,13 @@ def hmm_viterbi(
     states : Array, shape (T,)
         Most likely state sequence (integer-valued).
     """
+    log_likelihoods = jnp.asarray(log_likelihoods)
     num_timesteps, num_states = log_likelihoods.shape
-    log_initial_probs = _zero_preserving_log(initial_probs)
-    log_transition_matrix = _zero_preserving_log(transition_matrix)
+    log_initial_probs = zero_preserving_log(initial_probs)
+    log_transition_matrix = zero_preserving_log(transition_matrix)
 
     # Backward pass: accumulate best future scores and store argmax pointers
-    def _backward_step(best_next_score, t):
+    def _backward_step(best_next_score: Array, t: Array) -> tuple[Array, Array]:
         scores = log_transition_matrix + best_next_score + log_likelihoods[t + 1]
         best_next_state = jnp.argmax(scores, axis=1)
         best_next_score = jnp.max(scores, axis=1)
@@ -1029,7 +1898,7 @@ def hmm_viterbi(
     first_state = jnp.argmax(log_initial_probs + log_likelihoods[0] + best_second_score)
 
     # Forward pass: trace through pointers
-    def _forward_step(state, best_next_state):
+    def _forward_step(state: Array, best_next_state: Array) -> tuple[Array, Array]:
         next_state = best_next_state[state]
         return next_state, next_state
 
@@ -1038,8 +1907,25 @@ def hmm_viterbi(
     return jnp.concatenate([jnp.array([first_state]), states])
 
 
-def _zero_preserving_log(probabilities: Array) -> Array:
-    """Return log probabilities while keeping exact zeros at ``-inf``."""
+def zero_preserving_log(probabilities: ArrayLike) -> Array:
+    """Elementwise log of probabilities that keeps exact zeros at ``-inf``.
+
+    There is no floor: an exact zero maps to ``-inf`` (an impossible state or
+    transition stays impossible), and every positive value maps to its true
+    log (e.g. ``1e-300 -> -690.8``; note XLA may flush subnormals to zero).
+    Malformed inputs are not masked: NaN and negative entries give NaN, so
+    they propagate (fail loud) instead of being mistaken for a structural zero.
+
+    Parameters
+    ----------
+    probabilities : ArrayLike, shape (...)
+        Probabilities (any shape).
+
+    Returns
+    -------
+    log_probabilities : Array, shape (...)
+        ``log(probabilities)`` with ``0 -> -inf`` and ``NaN``/negative -> NaN.
+    """
     safe_probabilities = jnp.where(probabilities == 0, 1.0, probabilities)
     return jnp.where(probabilities == 0, -jnp.inf, jnp.log(safe_probabilities))
 
@@ -1052,8 +1938,8 @@ def _zero_preserving_log(probabilities: Array) -> Array:
 
 
 def compute_state_overlap(
-    z1: Array,
-    z2: Array,
+    z1: ArrayLike,
+    z2: ArrayLike,
 ) -> Array:
     """Compute a matrix of state-wise overlap counts between two state sequences.
 
@@ -1062,9 +1948,9 @@ def compute_state_overlap(
 
     Parameters
     ----------
-    z1 : Int[Array, " num_timesteps"]
+    z1 : Int[ArrayLike, " num_timesteps"]
         First state sequence (integer-valued, non-negative).
-    z2 : Int[Array, " num_timesteps"]
+    z2 : Int[ArrayLike, " num_timesteps"]
         Second state sequence (integer-valued, non-negative, same length).
 
     Returns
@@ -1090,8 +1976,8 @@ def compute_state_overlap(
 
 
 def find_permutation(
-    z1: Array,
-    z2: Array,
+    z1: ArrayLike,
+    z2: ArrayLike,
 ) -> np.ndarray:
     """Find the permutation of labels in ``z1`` that best aligns with ``z2``.
 
@@ -1100,9 +1986,9 @@ def find_permutation(
 
     Parameters
     ----------
-    z1 : Int[Array, " num_timesteps"]
+    z1 : Int[ArrayLike, " num_timesteps"]
         First state sequence (integer-valued, non-negative).
-    z2 : Int[Array, " num_timesteps"]
+    z2 : Int[ArrayLike, " num_timesteps"]
         Second state sequence (integer-valued, non-negative, same length).
 
     Returns
@@ -1111,6 +1997,8 @@ def find_permutation(
         Permutation such that ``jnp.take(permutation, z1)`` best aligns
         with ``z2``.  ``K = max(z1.max(), z2.max()) + 1``.
     """
+    from scipy.optimize import linear_sum_assignment  # deferred: slow import
+
     overlap = compute_state_overlap(z1, z2)
     _, perm = linear_sum_assignment(-np.asarray(overlap))
-    return perm
+    return cast(np.ndarray, perm)

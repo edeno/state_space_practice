@@ -10,10 +10,22 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_models import (
     CommonOscillatorModel,
     CorrelatedNoiseModel,
     DirectedInfluenceModel,
+)
+from state_space_practice.oscillator_utils import (
+    construct_common_oscillator_transition_matrix,
+)
+from state_space_practice.simulate.scenarios import (
+    simulate_cnm_scenario,
+    simulate_dim_scenario,
+)
+from state_space_practice.tests.model_state import (
+    assert_snapshots_equal,
+    snapshot_model_state,
 )
 
 # Enable 64-bit precision for numerical stability
@@ -295,13 +307,15 @@ class TestCorrelatedNoiseModel:
         assert model.n_oscillators == correlated_noise_params["n_oscillators"]
         assert model.n_sources == model.n_oscillators  # CNM constraint
 
-    def test_constrained_mstep_is_opt_in(self, correlated_noise_params) -> None:
+    def test_constrained_mstep_is_the_default(self, correlated_noise_params) -> None:
+        """The exact fixed-A constrained Q update is the default M-step; the
+        generic estimate-then-project path is opt-out."""
         default = CorrelatedNoiseModel(**correlated_noise_params)
-        constrained = CorrelatedNoiseModel(
-            **correlated_noise_params, use_reparameterized_mstep=True
+        generic = CorrelatedNoiseModel(
+            **correlated_noise_params, use_reparameterized_mstep=False
         )
-        assert default.use_reparameterized_mstep is False
-        assert constrained.use_reparameterized_mstep is True
+        assert default.use_reparameterized_mstep is True
+        assert generic.use_reparameterized_mstep is False
 
     @pytest.mark.slow
     def test_constrained_mstep_fits_psd_reconstructable_q(
@@ -443,7 +457,11 @@ class TestCorrelatedNoiseModel:
         self, correlated_noise_params
     ) -> None:
         """Projection must restore the structured symmetric PSD CNM family."""
-        model = CorrelatedNoiseModel(**correlated_noise_params)
+        # The generic estimate-then-project path (the default constrained path
+        # recomputes Q from the smoother instead of projecting it).
+        model = CorrelatedNoiseModel(
+            **correlated_noise_params, use_reparameterized_mstep=False
+        )
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Perturb Q the way an M-step might: asymmetrically and off the PSD cone.
@@ -546,20 +564,21 @@ class TestDirectedInfluenceModel:
         """A smaller ``max_spectral_radius`` should shrink the achieved radius
         of the constructed transition matrix in exact proportion.
 
-        With strong coupling the block-row operator norm exceeds both bounds, so
+        With strong coupling the actual spectral radius exceeds both bounds, so
         the differentiable stability scale is active and ``A = scale * A_intrinsic``
-        with ``scale = max_spectral_radius / norm``. The spectral radius is
+        with ``scale = max_spectral_radius / radius``. The spectral radius is
         therefore linear in ``max_spectral_radius``.
         """
         n_osc = directed_influence_params["n_oscillators"]
         n_disc = directed_influence_params["n_discrete_states"]
         strong_coupling = (
-            jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(0.4).at[1, 0, :].set(0.4)
+            jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(1.5).at[1, 0, :].set(1.5)
         )
         params = {**directed_influence_params, "coupling_strength": strong_coupling}
 
         model_high = DirectedInfluenceModel(**params, max_spectral_radius=0.99)
         model_low = DirectedInfluenceModel(**params, max_spectral_radius=0.5)
+        # The clamp engages for both bounds and must say so.
         model_high._initialize_parameters(jax.random.PRNGKey(0))
         model_low._initialize_parameters(jax.random.PRNGKey(0))
 
@@ -1846,7 +1865,9 @@ class TestDIMStabilityEnforcement:
     def test_stability_scale_gradient_finite_at_degenerate_block(self) -> None:
         """diagonal_norm_sq == 0 (damping == signed incoming-sum with freq == 0)
         must not yield a NaN gradient from sqrt'(0)."""
-        from state_space_practice.oscillator_models import _dim_stability_scale
+        from state_space_practice.oscillator_utils import (
+            compute_directed_influence_stability_scale,
+        )
 
         def scale_of(c):
             freqs = jnp.array([0.0, 5.0, 5.0])  # freq 0 -> rotation angle 0
@@ -1862,7 +1883,9 @@ class TestDIMStabilityEnforcement:
                 .at[2, 0]
                 .set(0.1)
             )
-            return _dim_stability_scale(freqs, damping, coupling, 100.0)
+            return compute_directed_influence_stability_scale(
+                freqs, damping, coupling, 100.0, phase_difference=jnp.zeros((3, 3))
+            )
 
         assert bool(jnp.isfinite(scale_of(0.0)))
         assert bool(jnp.isfinite(jax.grad(scale_of)(0.0)))
@@ -1951,6 +1974,23 @@ class TestCommonOscillatorSGDFitting:
         lls = model.fit_sgd(obs, key=key, num_steps=30)
         # LL should improve from first to last
         assert lls[-1] > lls[0]
+
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    def test_one_dimensional_observations_raise_value_error(self, com_setup, method):
+        model, obs = com_setup
+        with pytest.raises(ValueError, match="2D"):
+            getattr(model, method)(obs[:, 0], key=jax.random.PRNGKey(0))
+
+    def test_zero_step_fit_sgd_records_log_likelihood(self, com_setup):
+        """num_steps=0 records no optimization history, but final inference
+        still runs, so log_likelihood_ is the marginal LL at the stored
+        parameters."""
+        model, obs = com_setup
+        lls = model.fit_sgd(obs, key=jax.random.PRNGKey(0), num_steps=0)
+        assert lls == []
+        assert model.log_likelihood_ == pytest.approx(
+            float(model._e_step(obs)), rel=1e-12
+        )
 
     def test_sgd_discrete_transitions_stochastic(self, com_setup):
         model, obs = com_setup
@@ -2417,7 +2457,7 @@ class TestBaseModelDecodeAndPredictProba:
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
         )
-        with pytest.raises(RuntimeError, match="fit"):
+        with pytest.raises(NotFittedError, match="fit"):
             model.decode()
 
     def test_predict_proba_before_fit_raises(self):
@@ -2432,7 +2472,7 @@ class TestBaseModelDecodeAndPredictProba:
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
         )
-        with pytest.raises(RuntimeError, match="fit"):
+        with pytest.raises(NotFittedError, match="fit"):
             model.predict_proba()
 
     @pytest.mark.slow
@@ -2731,18 +2771,48 @@ class TestComWarmInitStateDependentH:
         model._warm_initialize_states(obs)
         assert not np.allclose(np.array(model.init_mean), np.array(cold_mean))
 
+    def test_skipped_seeding_is_logged_at_warning(self, caplog, monkeypatch):
+        """A non-finite E-step skips per-state seeding (parameters restored);
+        that must be visible at the default log level."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        A_before = np.array(model.continuous_transition_matrix)
+        monkeypatch.setattr(
+            DirectedInfluenceModel, "_e_step", lambda self, obs: float("nan")
+        )
+        obs = np.asarray(jax.random.normal(jax.random.PRNGKey(1), (40, 2)))
+        with caplog.at_level(
+            "WARNING", logger="state_space_practice.oscillator_models"
+        ):
+            model._seed_state_parameters_from_windows(
+                np.full((4, 2), 0.5), obs, window=10
+            )
+        records = [r for r in caplog.records if "seeding skipped" in r.getMessage()]
+        assert records and records[0].levelname == "WARNING"
+        np.testing.assert_array_equal(
+            np.array(model.continuous_transition_matrix), A_before
+        )
+
 
 class TestReparameterizedPublicParamsReconstructA:
     """After a reparameterized DIM fit, public params must reconstruct A."""
 
     @pytest.mark.slow
     def test_public_params_reconstruct_transition_matrix(self):
-        from state_space_practice.oscillator_models import (
-            _stabilize_transition_matrix,
-        )
         from state_space_practice.oscillator_utils import (
             construct_directed_influence_transition_matrix,
         )
+        from state_space_practice.utils import stabilize_transition_matrix
 
         key = jax.random.PRNGKey(3)
         n_time = 250
@@ -2772,7 +2842,7 @@ class TestReparameterizedPublicParamsReconstructA:
         # the fix, self.freqs was the cross-state mean while A used per-state
         # freqs, so this reconstruction would not match.
         for j in range(model.n_discrete_states):
-            A_recon = _stabilize_transition_matrix(
+            A_recon = stabilize_transition_matrix(
                 construct_directed_influence_transition_matrix(
                     freqs=model.freqs,
                     damping_coeffs=model.damping_coef,
@@ -2815,7 +2885,8 @@ class TestFirstIterationFailureClearsPosteriors:
 
         # Nothing usable was produced.
         assert lls == []
-        assert model.smoother_discrete_state_prob is None
+        with pytest.raises(NotFittedError):
+            _ = model.smoother_discrete_state_prob
         with pytest.raises(RuntimeError, match="No smoother posteriors"):
             model.decode()
         with pytest.raises(RuntimeError, match="No smoother posteriors"):
@@ -2885,3 +2956,1001 @@ class TestSamplingFrequencyRange:
             1.0 - 1.0 / sampling_freq,
             rtol=1e-6,
         )
+
+
+class TestBaseModelSGDStorage:
+    """BaseModel stores its plain SGD keys through the mapping-driven default."""
+
+    def test_store_sgd_params_writes_plain_keys_and_leaves_others(
+        self, common_oscillator_params
+    ) -> None:
+        model = CommonOscillatorModel(**common_oscillator_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        n_states = model.n_discrete_states
+        old_init_cov = model.init_cov
+        new_Z = jnp.full((n_states, n_states), 1.0 / n_states)
+        new_pi = jnp.full((n_states,), 1.0 / n_states)
+        new_m0 = model.init_mean + 1.0
+        # Guard: the new values differ from the initialized ones.
+        assert not bool(jnp.allclose(new_Z, model.discrete_transition_matrix))
+        assert not bool(jnp.allclose(new_m0, model.init_mean))
+
+        model._store_sgd_params(
+            {
+                "discrete_transition_matrix": new_Z,
+                "init_discrete_state_prob": new_pi,
+                "init_mean": new_m0,
+            }
+        )
+
+        np.testing.assert_array_equal(model.discrete_transition_matrix, new_Z)
+        np.testing.assert_array_equal(model.init_discrete_state_prob, new_pi)
+        np.testing.assert_array_equal(model.init_mean, new_m0)
+        # Keys absent from params are left untouched.
+        assert model.init_cov is old_init_cov
+
+    @pytest.mark.parametrize(
+        "model_cls, params_fixture",
+        [
+            (CommonOscillatorModel, "common_oscillator_params"),
+            (CorrelatedNoiseModel, "correlated_noise_params"),
+            (DirectedInfluenceModel, "directed_influence_params"),
+        ],
+    )
+    def test_store_sgd_params_restacks_per_state_covariances(
+        self, request, model_cls, params_fixture
+    ) -> None:
+        """The spec optimizes one shared (s, s) measurement_cov and per-state
+        init_cov_{j} keys; storing them must rebuild the (..., K) stacks."""
+        model = model_cls(**request.getfixturevalue(params_fixture))
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        s, n, k = model.n_sources, model.n_cont_states, model.n_discrete_states
+        old_init_cov = model.init_cov
+        new_R = jnp.eye(s) * 0.7
+        new_P1 = jnp.eye(n) * 3.0
+        # Guard: the new values differ from the initialized ones.
+        assert not bool(jnp.allclose(new_R, model.measurement_cov[..., 0]))
+        assert not bool(jnp.allclose(new_P1, old_init_cov[..., 1]))
+
+        model._store_sgd_params({"measurement_cov": new_R, "init_cov_1": new_P1})
+
+        assert model.measurement_cov.shape == (s, s, k)
+        for j in range(k):
+            np.testing.assert_array_equal(model.measurement_cov[..., j], new_R)
+        assert model.init_cov.shape == (n, n, k)
+        np.testing.assert_array_equal(model.init_cov[..., 1], new_P1)
+        for j in (0, 2):
+            np.testing.assert_array_equal(model.init_cov[..., j], old_init_cov[..., j])
+
+
+# ============================================================================
+# Fixed-H covariance update and DIM fixed point at the truth
+# ============================================================================
+
+
+@pytest.fixture(scope="module")
+def misspecified_h_observations():
+    """Two-oscillator data observed through an H the CNM does not use."""
+    rng = np.random.default_rng(4)
+    n_time = 400
+    A = np.asarray(
+        construct_common_oscillator_transition_matrix(
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            sampling_freq=100.0,
+        )
+    )
+    x = np.zeros((n_time, 4))
+    for t in range(1, n_time):
+        x[t] = A @ x[t - 1] + np.sqrt(0.1) * rng.normal(size=4)
+    # CNM's fixed H reads the x-component; the data mix in the y-component too.
+    H_true = np.array([[1.0, 0.8, 0.0, 0.0], [0.0, 0.0, 1.0, 0.8]])
+    return jnp.asarray(x @ H_true.T + np.sqrt(0.05) * rng.normal(size=(n_time, 2)))
+
+
+@pytest.mark.slow
+def test_cnm_fixed_h_installs_fixed_h_optimal_r_and_em_is_monotone(
+    misspecified_h_observations,
+) -> None:
+    """CNM keeps H fixed, so the installed R must be the optimum for that H
+    (not the shortcut built from the unused H*), and with one discrete state
+    (exact Kalman EM) the log-likelihood never decreases."""
+    obs = misspecified_h_observations
+    model = CorrelatedNoiseModel(
+        n_oscillators=2,
+        n_discrete_states=1,
+        sampling_freq=100.0,
+        freqs=jnp.array([8.0, 12.0]),
+        damping_coef=jnp.array([0.95, 0.95]),
+        process_variance=jnp.full((2, 1), 0.1),
+        measurement_variance=0.05,
+        phase_difference=jnp.zeros((2, 2, 1)),
+        coupling_strength=jnp.zeros((2, 2, 1)),
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    model._e_step(obs)
+    H = np.asarray(model.measurement_matrix[..., 0])
+    m = np.asarray(model.smoother_state_cond_mean[..., 0])
+    P = np.asarray(model.smoother_state_cond_cov[..., 0])
+    y = np.asarray(obs)
+    resid = y - m @ H.T
+    R_fixed_h = (resid.T @ resid + H @ P.sum(0) @ H.T) / len(y)
+    gamma = P.sum(0) + m.T @ m
+    delta = y.T @ m
+    R_shortcut = (y.T @ y - H @ delta.T) / len(y)  # old: assumes H = H*
+    # Guard: the posterior regression H* is not the fixed H, so the two
+    # covariances differ by far more than the equality tolerance below.
+    assert np.max(np.abs(np.linalg.solve(gamma, delta.T).T - H)) > 1e-3
+    gap = np.max(np.abs(R_fixed_h - R_shortcut)) / np.max(np.abs(R_fixed_h))
+    assert gap > 1e-6
+
+    model._m_step(obs)
+    np.testing.assert_allclose(model.measurement_cov[..., 0], R_fixed_h, rtol=1e-9)
+
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    lls = np.asarray(model.fit(obs, max_iter=6, skip_init=True, tol=1e-12))
+    assert len(lls) >= 4  # guard: EM actually iterated
+    assert np.all(np.diff(lls) >= -1e-8 * np.abs(lls[:-1])), np.diff(lls)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("use_reparameterized_mstep", [False, True])
+def test_dim_em_started_at_truth_does_not_roll_back(use_reparameterized_mstep) -> None:
+    """At the true DIM scenario parameters the initial A is exactly A_true and
+    EM improves the likelihood instead of over-damping A and rolling back (the
+    old loose stability scale shrank A to 0.76x: LL -2331 -> -6839)."""
+    from state_space_practice.simulate.scenarios import simulate_dim_scenario
+
+    data = simulate_dim_scenario(n_time=1000)
+    p = data["params"]
+    model = DirectedInfluenceModel(
+        n_oscillators=2,
+        n_discrete_states=2,
+        sampling_freq=p["sampling_freq"],
+        freqs=jnp.asarray(p["freqs"]),
+        damping_coef=jnp.asarray(p["damping"]),
+        process_variance=jnp.asarray(p["process_variance"]),
+        measurement_variance=p["measurement_variance"],
+        phase_difference=jnp.asarray(p["phase_difference"]),
+        coupling_strength=jnp.asarray(p["coupling_strength"]),
+        max_spectral_radius=0.999,  # the true radius is 0.9962
+        use_reparameterized_mstep=use_reparameterized_mstep,
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    model.discrete_transition_matrix = jnp.asarray(p["Z"])
+    A_true = np.asarray(p["A"])
+    assert (
+        np.max(np.abs(np.asarray(model.continuous_transition_matrix) - A_true)) < 1e-8
+    )
+
+    lls = np.asarray(model.fit(jnp.asarray(data["obs"]), max_iter=3, skip_init=True))
+    assert lls[1] > lls[0]
+    assert np.all(np.diff(lls) > -1e-4 * np.abs(lls[:-1])), np.diff(lls)
+    assert (
+        np.max(np.abs(np.asarray(model.continuous_transition_matrix) - A_true)) < 0.05
+    )
+
+
+# ============================================================================
+# Calibration of the switching smoother at the true parameters
+# ============================================================================
+
+_CALIBRATION_REPLICATES = 16
+_CALIBRATION_N_TIME = 150
+
+
+def _calibration_run(kind: str, n_discrete_states: int, switching: bool) -> dict:
+    """Pooled smoothed-error statistics over small replicates at the truth."""
+    from state_space_practice.tests.recovery_helpers import (
+        collapse_switching_posterior,
+        oscillator_model_at_truth,
+        simulate_from_oscillator_model,
+        standardized_errors,
+    )
+
+    model = oscillator_model_at_truth(kind, n_discrete_states, switching)
+    rng = np.random.default_rng(0)
+    zs, mahal, means, covs = [], [], [], []
+    for _ in range(_CALIBRATION_REPLICATES):
+        x, y, _ = simulate_from_oscillator_model(model, _CALIBRATION_N_TIME, rng)
+        model._e_step(jnp.asarray(y))
+        mean, cov = collapse_switching_posterior(
+            model.smoother_discrete_state_prob,
+            model.smoother_state_cond_mean,
+            model.smoother_state_cond_cov,
+        )
+        z, m2 = standardized_errors(x, mean, cov)
+        zs.append(z)
+        mahal.append(m2)
+        means.append(mean)
+        covs.append(cov)
+    z = np.concatenate(zs).ravel()
+    n_latent = model.n_cont_states
+    return {
+        "z_mean": float(z.mean()),
+        "z_var": float(z.var()),
+        "coverage90": float(np.mean(np.abs(z) < 1.6448536)),
+        "mahalanobis_per_dim": float(np.concatenate(mahal).mean() / n_latent),
+        "means": np.stack(means),
+        "covs": np.stack(covs),
+    }
+
+
+@pytest.mark.slow
+class TestCalibrationAtTrueParameters:
+    """The switching Kalman smoother is exact for a single linear-Gaussian
+    regime, so at the true parameters the smoothed errors must be N(0, P).
+
+    16 replicates x 150 bins x 4 latent dims = 9600 z-scores.  Replicate-level
+    spread puts the standard error of the pooled variance near 0.02 and of the
+    90% coverage near 0.005; the tolerances below are ~3-4 standard errors,
+    while a smoother that reported its *filtered* covariance, or a covariance
+    off by 15%, fails them.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def runs(cls) -> dict:
+        return {
+            (kind, n_states, switching): _calibration_run(kind, n_states, switching)
+            for kind in ("COM", "CNM", "DIM")
+            for n_states, switching in ((1, False), (2, False), (2, True))
+        }
+
+    @staticmethod
+    def _assert_calibrated(stats: dict, label: str) -> None:
+        summary = {k: round(v, 4) for k, v in stats.items() if not hasattr(v, "shape")}
+        assert abs(stats["z_mean"]) < 0.05, f"{label}: {summary}"
+        assert abs(stats["z_var"] - 1.0) < 0.08, f"{label}: {summary}"
+        assert abs(stats["coverage90"] - 0.90) < 0.02, f"{label}: {summary}"
+        assert abs(stats["mahalanobis_per_dim"] - 1.0) < 0.06, f"{label}: {summary}"
+
+    @pytest.mark.parametrize("kind", ["COM", "CNM", "DIM"])
+    def test_single_regime_is_calibrated(self, runs, kind):
+        # Observed z-variance / coverage: COM 1.023 / 0.897, CNM 0.993 / 0.902,
+        # DIM 1.019 / 0.899.
+        self._assert_calibrated(runs[kind, 1, False], f"{kind} single regime")
+
+    @pytest.mark.parametrize("kind", ["COM", "CNM", "DIM"])
+    def test_identical_regimes_reproduce_single_regime(self, runs, kind):
+        """Two labels for one regime: the GPB collapse is exact, so the smoothed
+        moments equal the single-regime smoother's on the same data."""
+        single, double = runs[kind, 1, False], runs[kind, 2, False]
+        np.testing.assert_allclose(double["means"], single["means"], atol=1e-8)
+        np.testing.assert_allclose(double["covs"], single["covs"], atol=1e-8)
+        self._assert_calibrated(double, f"{kind} identical regimes")
+
+    @pytest.mark.parametrize(
+        ("kind", "z_var_range", "coverage_range"),
+        [
+            # Observed: z-variance 1.052, coverage 0.893.
+            ("COM", (0.95, 1.15), (0.86, 0.92)),
+            # Observed: z-variance 1.000, coverage 0.900.
+            ("CNM", (0.92, 1.10), (0.87, 0.93)),
+            # Observed: z-variance 1.023, coverage 0.896.
+            ("DIM", (0.93, 1.12), (0.87, 0.93)),
+        ],
+    )
+    def test_switching_regimes_coverage_is_pinned(
+        self, runs, kind, z_var_range, coverage_range
+    ):
+        """Genuinely switching: GPB1 moment matching is approximate; pin the
+        observed calibration (it stays close to nominal on these data)."""
+        stats = runs[kind, 2, True]
+        # Guard: the switching data differ from the identical-regime data.
+        assert np.max(np.abs(stats["means"] - runs[kind, 2, False]["means"])) > 1e-2
+        assert z_var_range[0] < stats["z_var"] < z_var_range[1], stats["z_var"]
+        assert coverage_range[0] < stats["coverage90"] < coverage_range[1], stats[
+            "coverage90"
+        ]
+
+
+# ============================================================================
+# M-step exactness: stationarity of the constrained expected objective
+# ============================================================================
+
+_MSTEP_PARAM_NAMES = (
+    "continuous_transition_matrix",
+    "process_cov",
+    "measurement_matrix",
+    "measurement_cov",
+    "init_mean",
+    "init_cov",
+    "discrete_transition_matrix",
+    "init_discrete_state_prob",
+)
+
+
+def _mstep_params(model) -> dict:
+    return {name: getattr(model, name) for name in _MSTEP_PARAM_NAMES}
+
+
+def _expected_complete_objective(params: dict, obs, stats: dict) -> float:
+    from state_space_practice.tests import recovery_helpers as rh
+
+    return float(
+        rh.transition_objective(
+            params["continuous_transition_matrix"], params["process_cov"], stats
+        )
+        + rh.observation_objective(
+            params["measurement_matrix"], params["measurement_cov"], obs, stats
+        )
+        + rh.initial_state_objective(params["init_mean"], params["init_cov"], stats)
+        + rh.discrete_objective(
+            params["discrete_transition_matrix"],
+            params["init_discrete_state_prob"],
+            stats,
+        )
+    )
+
+
+def _run_one_mstep(
+    kind: str, perturb, perturb_init_and_z: bool = True, **model_kwargs
+) -> dict:
+    """E-step at perturbed parameters, then one M-step (+ projection).
+
+    Returns the model, data, the E-step statistics and the parameters before
+    and after the M-step.  GPB2 is used so every statistic in the objective
+    is an exact posterior expectation.
+    """
+    from state_space_practice.tests import recovery_helpers as rh
+
+    model = rh.oscillator_model_at_truth(
+        kind, 2, switching=True, smoother_type="gpb2", **model_kwargs
+    )
+    _, y, _ = rh.simulate_from_oscillator_model(model, 400, np.random.default_rng(5))
+    obs = jnp.asarray(y)
+    perturb(model)
+    model.measurement_cov = model.measurement_cov * 1.5
+    if perturb_init_and_z:
+        model.init_mean = model.init_mean + 0.5
+        model.discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.2, 0.8]])
+    model._e_step(obs)
+    stats = rh.switching_posterior_stats(model)
+    before = _mstep_params(model)
+    model._m_step(obs)
+    model._project_parameters()
+    return {
+        "model": model,
+        "obs": obs,
+        "stats": stats,
+        "before": before,
+        "after": _mstep_params(model),
+    }
+
+
+def _symmetric_gradient(f, base: np.ndarray) -> np.ndarray:
+    """FD gradient of f(base + sum_k c_k E_k) over the symmetric basis E_k."""
+    from state_space_practice.tests import recovery_helpers as rh
+
+    basis = np.array(rh.symmetric_basis(base.shape[0]))
+    return rh.central_difference_gradient(
+        lambda c: f(base + np.einsum("k,kab->ab", c, basis)), np.zeros(len(basis)), 1e-7
+    )
+
+
+def _assert_stationary(grad_after, grad_before, label: str, rtol: float = 1e-6):
+    after = float(np.max(np.abs(grad_after)))
+    before = float(np.max(np.abs(grad_before)))
+    assert before > 1.0, f"{label}: guard -- the start must be far from optimal"
+    assert after < rtol * before, (
+        f"{label}: |grad| {after:.3e} at the M-step output vs {before:.3e} before"
+    )
+
+
+def _perturb_com(model) -> None:
+    model.measurement_matrix = model.measurement_matrix + 0.3
+
+
+def _perturb_cnm(model) -> None:
+    model.coupling_strength = model.coupling_strength.at[0, 1, 1].set(0.2)
+    model.process_variance = model.process_variance * 1.3
+    model._initialize_process_covariance()
+
+
+def _perturb_dim(model) -> None:
+    model.coupling_strength = (
+        model.coupling_strength.at[0, 1, 0].set(0.15).at[1, 0, 1].set(0.1)
+    )
+    model.freqs = model.freqs + jnp.array([0.4, -0.3])
+    model.damping_coef = model.damping_coef * 0.98
+    model._rebuild_stable_transition_matrix()
+
+
+def _cnm_process_cov(theta: np.ndarray) -> jax.Array:
+    """CNM Q stack from theta = per state (variance_0, variance_1, coupling, phase)."""
+    from state_space_practice.oscillator_utils import (
+        construct_correlated_noise_process_covariance,
+    )
+
+    stack = []
+    for j in range(2):
+        v, c, p = theta[4 * j : 4 * j + 2], theta[4 * j + 2], theta[4 * j + 3]
+        coupling = jnp.zeros((2, 2)).at[0, 1].set(c)
+        phase = jnp.zeros((2, 2)).at[0, 1].set(p)
+        stack.append(
+            construct_correlated_noise_process_covariance(
+                variance=jnp.asarray(v),
+                phase_difference=phase,
+                coupling_strength=coupling,
+            )
+        )
+    return jnp.stack(stack, axis=-1)
+
+
+def _cnm_theta(model) -> np.ndarray:
+    return np.concatenate(
+        [
+            np.r_[
+                np.asarray(model.process_variance)[:, j],
+                np.asarray(model.coupling_strength)[0, 1, j],
+                np.asarray(model.phase_difference)[0, 1, j],
+            ]
+            for j in range(2)
+        ]
+    )
+
+
+def _dim_transition(theta: np.ndarray, model) -> jax.Array:
+    """DIM A stack (with the stability scale) from the joint parametrisation."""
+    from state_space_practice.oscillator_utils import (
+        construct_stable_directed_influence_transition_stack,
+    )
+
+    coupling = jnp.zeros((2, 2, 2)).at[0, 1].set(theta[4:6]).at[1, 0].set(theta[6:8])
+    phase = jnp.zeros((2, 2, 2)).at[0, 1].set(theta[8:10]).at[1, 0].set(theta[10:12])
+    return construct_stable_directed_influence_transition_stack(
+        jnp.asarray(theta[0:2]),
+        jnp.asarray(theta[2:4]),
+        coupling,
+        phase,
+        model.sampling_freq,
+        max_spectral_radius=model.max_spectral_radius,
+    )
+
+
+def _dim_theta(model) -> np.ndarray:
+    c = np.asarray(model.coupling_strength)
+    p = np.asarray(model.phase_difference)
+    return np.concatenate(
+        [
+            np.asarray(model.freqs),
+            np.asarray(model.damping_coef),
+            c[0, 1],
+            c[1, 0],
+            p[0, 1],
+            p[1, 0],
+        ]
+    )
+
+
+@pytest.mark.slow
+class TestMStepIsConstrainedStationaryPoint:
+    """The M-step output maximizes the expected complete-data objective.
+
+    The objective is written out in ``recovery_helpers`` from the definitions
+    (not from the library's M-step).  Gradients are central finite
+    differences in each model's *constrained* parametrisation: COM's free
+    per-state H and shared R; CNM's (variance, coupling, phase) noise family;
+    DIM's shared (frequency, damping) and per-state (coupling, phase) with
+    the stability scale.  Stationarity is asserted relative to the gradient
+    at the pre-M-step parameters.
+    """
+
+    def test_com_update_is_stationary_and_increases_objective(self):
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep("COM", _perturb_com)
+        obs, stats, before, after = (
+            run[k] for k in ("obs", "stats", "before", "after")
+        )
+        H, H0 = (
+            np.asarray(after["measurement_matrix"]),
+            np.asarray(before["measurement_matrix"]),
+        )
+
+        def f_H(R):
+            return lambda h: rh.observation_objective(
+                jnp.asarray(h.reshape(H.shape)), R, obs, stats
+            )
+
+        _assert_stationary(
+            rh.central_difference_gradient(f_H(after["measurement_cov"]), H.ravel()),
+            rh.central_difference_gradient(f_H(before["measurement_cov"]), H0.ravel()),
+            "COM H",
+        )
+
+        def f_R(H_stack):
+            return lambda R: rh.observation_objective(
+                H_stack, jnp.asarray(R)[..., None].repeat(2, -1), obs, stats
+            )
+
+        _assert_stationary(
+            _symmetric_gradient(
+                f_R(after["measurement_matrix"]),
+                np.asarray(after["measurement_cov"][..., 0]),
+            ),
+            _symmetric_gradient(
+                f_R(after["measurement_matrix"]),
+                np.asarray(before["measurement_cov"][..., 0]),
+            ),
+            "COM shared R",
+        )
+        np.testing.assert_allclose(
+            after["measurement_cov"][..., 0], after["measurement_cov"][..., 1]
+        )
+        gain = _expected_complete_objective(
+            after, obs, stats
+        ) - _expected_complete_objective(before, obs, stats)
+        assert gain > 1.0, gain
+
+    def test_initial_state_and_discrete_updates_are_stationary(self):
+        """init_mean / init_cov (x_1 convention) and Z maximize their terms."""
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep("COM", _perturb_com)
+        stats, before, after = run["stats"], run["before"], run["after"]
+        m0 = np.asarray(after["init_mean"])
+
+        def f_m0(v):
+            return rh.initial_state_objective(
+                jnp.asarray(v.reshape(m0.shape)), after["init_cov"], stats
+            )
+
+        _assert_stationary(
+            rh.central_difference_gradient(f_m0, m0.ravel()),
+            rh.central_difference_gradient(
+                f_m0, np.asarray(before["init_mean"]).ravel()
+            ),
+            "init_mean",
+        )
+        for j in range(2):
+            # Relative to the w_1j-scaled curvature: this state's weight at
+            # t=1 can be tiny, so compare against its own pre-M-step gradient.
+            def f_P0(P, j=j):
+                return rh.initial_state_objective(
+                    after["init_mean"], after["init_cov"].at[..., j].set(P), stats
+                )
+
+            grad_after = _symmetric_gradient(
+                f_P0, np.asarray(after["init_cov"][..., j])
+            )
+            grad_before = _symmetric_gradient(
+                f_P0, np.asarray(before["init_cov"][..., j])
+            )
+            assert np.max(np.abs(grad_after)) < 1e-6 * max(
+                np.max(np.abs(grad_before)), 1e-3
+            ), (j, grad_after, grad_before)
+        Z = np.asarray(after["discrete_transition_matrix"])
+
+        def f_Z(d, base):
+            step = np.array([[d[0], -d[0]], [-d[1], d[1]]])
+            return rh.discrete_objective(
+                jnp.asarray(base + step), after["init_discrete_state_prob"], stats
+            )
+
+        _assert_stationary(
+            rh.central_difference_gradient(lambda d: f_Z(d, Z), np.zeros(2), 1e-7),
+            rh.central_difference_gradient(
+                lambda d: f_Z(d, np.asarray(before["discrete_transition_matrix"])),
+                np.zeros(2),
+                1e-7,
+            ),
+            "Z (simplex directions)",
+        )
+
+    def test_init_state_update_is_smoothed_x1(self):
+        """The switching filter starts at x_1 (no prediction before the first
+        update), so the exact init update is the smoothed x_1 moments -- not the
+        smoothed x_0 of the predict-first filters in ``kalman.py``."""
+        from state_space_practice.kalman import kalman_measurement_update
+
+        run = _run_one_mstep("COM", _perturb_com)
+        model, stats, before = run["model"], run["stats"], run["before"]
+        np.testing.assert_allclose(model.init_mean, stats["mean"][0], atol=1e-12)
+        np.testing.assert_allclose(model.init_cov, stats["cov"][0], atol=1e-12)
+
+        # The E-step's first filtered moment is the measurement update of the
+        # prior itself (x_1 convention).
+        from state_space_practice.switching_kalman import switching_kalman_filter
+
+        filt = switching_kalman_filter(
+            before["init_mean"],
+            before["init_cov"],
+            before["init_discrete_state_prob"],
+            run["obs"],
+            before["discrete_transition_matrix"],
+            before["continuous_transition_matrix"],
+            before["process_cov"],
+            before["measurement_matrix"],
+            before["measurement_cov"],
+        )
+        mean0, cov0, _ = kalman_measurement_update(
+            before["init_mean"][:, 1],
+            before["init_cov"][..., 1],
+            run["obs"][0],
+            before["measurement_matrix"][..., 1],
+            before["measurement_cov"][..., 1],
+        )
+        np.testing.assert_allclose(filt[0][0, :, 1], mean0, atol=1e-10)
+        np.testing.assert_allclose(filt[1][0, :, :, 1], cov0, atol=1e-10)
+
+    @pytest.mark.parametrize("use_reparameterized_mstep", [True, False])
+    def test_cnm_noise_family_update_is_stationary(self, use_reparameterized_mstep):
+        """Both CNM paths land on the constrained optimum: the CNM family is the
+        real form of complex Hermitian matrices, closed under inversion, so the
+        projected residual covariance is exactly the constrained MLE."""
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep(
+            "CNM", _perturb_cnm, use_reparameterized_mstep=use_reparameterized_mstep
+        )
+        model, obs, stats, before, after = (
+            run[k] for k in ("model", "obs", "stats", "before", "after")
+        )
+        theta = _cnm_theta(model)
+        np.testing.assert_allclose(
+            _cnm_process_cov(theta), model.process_cov, atol=1e-12
+        )
+        A = after["continuous_transition_matrix"]
+
+        def f(t):
+            return rh.transition_objective(A, _cnm_process_cov(t), stats)
+
+        grad_after = rh.central_difference_gradient(f, theta, 1e-7)
+        # Reference gradient at the pre-M-step CNM parameters (perturbed start).
+        start = rh.oscillator_model_at_truth(
+            "CNM", 2, switching=True, smoother_type="gpb2"
+        )
+        _perturb_cnm(start)
+        grad_before = rh.central_difference_gradient(f, _cnm_theta(start), 1e-7)
+        _assert_stationary(grad_after, grad_before, "CNM (variance, coupling, phase)")
+
+        def f_R(R):
+            return rh.observation_objective(
+                after["measurement_matrix"],
+                jnp.asarray(R)[..., None].repeat(2, -1),
+                obs,
+                stats,
+            )
+
+        _assert_stationary(
+            _symmetric_gradient(f_R, np.asarray(after["measurement_cov"][..., 0])),
+            _symmetric_gradient(f_R, np.asarray(before["measurement_cov"][..., 0])),
+            "CNM shared R",
+        )
+        assert _expected_complete_objective(
+            after, obs, stats
+        ) > _expected_complete_objective(before, obs, stats)
+
+    def test_dim_joint_optimizer_reaches_stationary_point(self):
+        """The reparameterized DIM M-step is a stationary point of the joint
+        (shared frequency/damping, per-state coupling/phase, stability-scaled)
+        objective.  A single BFGS solve stops on a line-search failure at
+        |grad| = 67 here; the restarted solve converges."""
+        from state_space_practice.switching_kalman import (
+            optimize_dim_transition_params_joint,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep(
+            "DIM",
+            _perturb_dim,
+            perturb_init_and_z=False,
+            use_reparameterized_mstep=True,
+        )
+        model, obs, stats, before, after = (
+            run[k] for k in ("model", "obs", "stats", "before", "after")
+        )
+        theta = _dim_theta(model)
+        np.testing.assert_allclose(
+            _dim_transition(theta, model),
+            model.continuous_transition_matrix,
+            atol=1e-12,
+        )
+        # Guard: interior solution (no bound or stability-scale kink active).
+        assert float(model._effective_dim_scale()) == 1.0
+        assert np.all(np.asarray(model.damping_coef) < model.max_damping - 1e-3)
+        assert np.all(theta[4:8] > 1e-3)
+
+        def f(t):
+            return rh.transition_objective(
+                _dim_transition(t, model), after["process_cov"], stats
+            )
+
+        grad_after = rh.central_difference_gradient(f, theta, 1e-6)
+        start = rh.oscillator_model_at_truth("DIM", 2, switching=True)
+        _perturb_dim(start)
+        grad_before = rh.central_difference_gradient(f, _dim_theta(start), 1e-6)
+        # Guard: a single BFGS solve from the same start is NOT stationary.
+        single = optimize_dim_transition_params_joint(
+            gamma1=jnp.asarray(stats["gamma1"]),
+            beta=jnp.asarray(stats["beta"]),
+            init_params=start._intrinsic_osc_params(),
+            sampling_freq=model.sampling_freq,
+            process_cov=after["process_cov"],
+            max_spectral_radius=model.max_spectral_radius,
+            max_damping=model.max_damping,
+        )
+        start.freqs, start.damping_coef = single["freq"], single["damping"]
+        start.coupling_strength = single["coupling_strength"]
+        start.phase_difference = single["phase_diff"]
+        grad_single = rh.central_difference_gradient(f, _dim_theta(start), 1e-6)
+        assert np.max(np.abs(grad_single)) > 1.0, np.max(np.abs(grad_single))
+        # BFGS gradient tolerance is 1e-6 in its bounded coordinates; allow the
+        # FD / coordinate-map slack.
+        _assert_stationary(grad_after, grad_before, "DIM joint", rtol=1e-4)
+        assert _expected_complete_objective(
+            after, obs, stats
+        ) > _expected_complete_objective(before, obs, stats)
+
+    def test_dim_standard_mstep_is_generalized_em(self):
+        """The standard DIM M-step (A* -> Frobenius projection) is not the
+        constrained optimum.  From a perturbed start it still improves the
+        objective, but it is not stationary; started *at* the constrained
+        optimum the projection would lower the objective (0.2-0.8 nats on these
+        problems), so the model keeps the previous dynamics and the objective
+        never decreases."""
+        from state_space_practice.oscillator_utils import (
+            optimize_dim_transition_params_joint_until_stationary,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep("DIM", _perturb_dim)
+        model, obs, stats, before, after = (
+            run[k] for k in ("model", "obs", "stats", "before", "after")
+        )
+        A_before = before["continuous_transition_matrix"]
+        Q = after["process_cov"]
+        obj_before = float(rh.transition_objective(A_before, Q, stats))
+        obj_after = float(
+            rh.transition_objective(after["continuous_transition_matrix"], Q, stats)
+        )
+        assert obj_after > obj_before + 1.0
+        grad = rh.central_difference_gradient(
+            lambda t: rh.transition_objective(_dim_transition(t, model), Q, stats),
+            _dim_theta(model),
+            1e-6,
+        )
+        assert np.max(np.abs(grad)) > 1.0, "documented: projection is not stationary"
+
+        # Start the standard M-step at the constrained optimum for these stats.
+        optimum = optimize_dim_transition_params_joint_until_stationary(
+            gamma1=jnp.asarray(stats["gamma1"]),
+            beta=jnp.asarray(stats["beta"]),
+            init_params=model._intrinsic_osc_params(),
+            sampling_freq=model.sampling_freq,
+            process_cov=Q,
+            max_spectral_radius=model.max_spectral_radius,
+            max_damping=model.max_damping,
+        )
+        rh.set_dim_public_params(model, optimum)
+        A_opt = model.continuous_transition_matrix
+        obj_opt = float(rh.transition_objective(A_opt, Q, stats))
+
+        # What the bare projection would install (the old behaviour).
+        A_proj = rh.dim_projected_mstep_parameters(stats, model)["transition_matrix"]
+        decrease = obj_opt - float(rh.transition_objective(A_proj, Q, stats))
+        assert decrease > 1e-2, f"guard: the projection must lose here ({decrease})"
+
+        model._m_step(obs)  # same E-step statistics
+        model._project_parameters()
+        obj_guarded = float(
+            rh.transition_objective(model.continuous_transition_matrix, Q, stats)
+        )
+        assert obj_guarded >= obj_opt - 1e-9 * abs(obj_opt), (obj_guarded, obj_opt)
+
+
+# ============================================================================
+# Fitted outputs before fitting
+# ============================================================================
+
+
+def _dim_dynamics_kwargs():
+    return {
+        "n_oscillators": 2,
+        "n_discrete_states": 2,
+        "sampling_freq": 100.0,
+        "freqs": jnp.array([8.0, 12.0]),
+        "damping_coef": jnp.array([0.95, 0.95]),
+        "process_variance": jnp.array([0.1, 0.1]),
+        "phase_difference": jnp.zeros((2, 2, 2)),
+        "coupling_strength": jnp.zeros((2, 2, 2)),
+    }
+
+
+def _make_dim():
+    return DirectedInfluenceModel(**_dim_dynamics_kwargs(), measurement_variance=0.05)
+
+
+def _make_dim_pp():
+    from state_space_practice.point_process_models import (
+        DirectedInfluencePointProcessModel,
+    )
+
+    return DirectedInfluencePointProcessModel(
+        **_dim_dynamics_kwargs(), n_neurons=3, dt=0.01
+    )
+
+
+def _make_switching_spike():
+    from state_space_practice.switching_point_process import (
+        SwitchingSpikeOscillatorModel,
+    )
+
+    return SwitchingSpikeOscillatorModel(
+        n_oscillators=2, n_neurons=3, n_discrete_states=2, sampling_freq=100.0, dt=0.01
+    )
+
+
+def _make_hamiltonian_lfp():
+    from state_space_practice.hamiltonian_lfp import HamiltonianLFPModel
+
+    return HamiltonianLFPModel(n_oscillators=1, n_sources=2, sampling_freq=100.0)
+
+
+def _make_switching_hamiltonian():
+    from state_space_practice.hamiltonian_switching import (
+        SwitchingHamiltonianJointModel,
+    )
+
+    return SwitchingHamiltonianJointModel(
+        n_oscillators=1,
+        n_discrete_states=2,
+        n_lfp_sources=2,
+        n_spike_sources=2,
+        sampling_freq=100.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("make_model", "attribute"),
+    [
+        (_make_dim, "smoother_discrete_state_prob"),
+        (_make_dim, "smoother_pair_cond_means"),
+        (_make_dim, "smoother_pair_cond_covs"),
+        (_make_dim_pp, "smoother_state_cond_mean"),
+        (_make_dim_pp, "log_likelihood_"),
+        (_make_switching_spike, "smoother_joint_discrete_state_prob"),
+        (_make_switching_spike, "smoother_next_pair_cond_means"),
+        (_make_hamiltonian_lfp, "filtered_means_"),
+        (_make_switching_hamiltonian, "smoothed_discrete_probs_"),
+        (_make_switching_hamiltonian, "smoother_state_cond_cov"),
+    ],
+)
+def test_fitted_attribute_before_fit_raises_not_fitted(make_model, attribute):
+    """A fitted output read before fitting raises NotFittedError, not None."""
+    model = make_model()
+    assert not hasattr(model, attribute)
+    with pytest.raises(NotFittedError, match=attribute):
+        getattr(model, attribute)
+
+
+@pytest.mark.parametrize("make_model", [_make_dim, _make_dim_pp])
+def test_em_restore_unsets_outputs_missing_from_snapshot(make_model):
+    """Rolling back to a pre-E-step snapshot unsets later smoother outputs."""
+    model = make_model()
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    snapshot = model._snapshot_em_state()
+    assert "smoother_discrete_state_prob" not in snapshot.values
+    model.smoother_discrete_state_prob = jnp.ones((5, 2)) / 2
+
+    model._restore_em_state(snapshot)
+
+    assert not hasattr(model, "smoother_discrete_state_prob")
+    np.testing.assert_array_equal(model.init_mean, snapshot.values["init_mean"])
+
+
+# ============================================================================
+# Refitting restarts from the constructor's initial parameters
+# ============================================================================
+
+_REFIT_KEY = jax.random.key(0)
+# Constructor parameters that seed initialization; fitting overwrites some.
+_REFIT_INIT_ATTRS = (
+    "freqs",
+    "damping_coef",
+    "process_variance",
+    "phase_difference",
+    "coupling_strength",
+)
+
+
+def _refit_case(kind: str):
+    """A model factory and observations from the ``kind`` scenario."""
+    simulate = simulate_cnm_scenario if kind == "CNM" else simulate_dim_scenario
+    scenario = simulate(n_time=100, seed=42)
+    p = scenario["params"]
+    cls = CorrelatedNoiseModel if kind == "CNM" else DirectedInfluenceModel
+    kwargs = {"use_reparameterized_mstep": True} if kind == "DIM-reparam" else {}
+
+    def make():
+        return cls(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+            **kwargs,
+        )
+
+    return make, jnp.asarray(scenario["obs"])
+
+
+def _run_fitter(model, method: str, observations, **kwargs) -> list[float]:
+    if method == "fit":
+        return model.fit(observations, key=_REFIT_KEY, max_iter=3, **kwargs)
+    return model.fit_sgd(observations, key=_REFIT_KEY, num_steps=5, **kwargs)
+
+
+def _init_params(model) -> dict:
+    return {name: np.asarray(getattr(model, name)) for name in _REFIT_INIT_ATTRS}
+
+
+def _assert_same_fit(refit_model, fresh_model) -> None:
+    """Every attribute of the fresh fit is bit-identical on the refit model.
+
+    Bookkeeping an earlier ``fit_sgd`` leaves behind (the SGD sequence length,
+    which ``fit`` does not use) is not compared.
+    """
+    fresh = snapshot_model_state(fresh_model)
+    refit = snapshot_model_state(refit_model)
+    keys = [k for k in fresh if k != "_sgd_n_time"]
+    assert_snapshots_equal({k: refit[k] for k in keys}, {k: fresh[k] for k in keys})
+
+
+@pytest.mark.slow
+class TestRefitRestartsFromConstructorParameters:
+    """``fit`` / ``fit_sgd`` start from the constructor's parameters every call.
+
+    Fitting overwrites public parameters that seed initialization (CNM: noise
+    variance, coupling and phase; DIM: frequency, damping, coupling and
+    phase), so a repeat fit must not read them back: it reproduces a fresh
+    model. ``skip_init=True`` is the explicit warm start.
+    """
+
+    @pytest.mark.parametrize("kind", ["CNM", "DIM", "DIM-reparam"])
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("fit", "fit"),
+            ("fit_sgd", "fit_sgd"),
+            ("fit", "fit_sgd"),
+            ("fit_sgd", "fit"),
+        ],
+    )
+    def test_repeat_fit_reproduces_fresh_model(self, kind, first, second) -> None:
+        make, observations = _refit_case(kind)
+        fresh = make()
+        fresh_history = _run_fitter(fresh, second, observations)
+
+        model = make()
+        constructed = _init_params(model)
+        _run_fitter(model, first, observations)
+        # Guard: the first fit moved parameters that seed initialization.
+        fitted = _init_params(model)
+        assert any(not np.array_equal(constructed[k], fitted[k]) for k in fitted)
+
+        history = _run_fitter(model, second, observations)
+
+        assert history == fresh_history
+        _assert_same_fit(model, fresh)
+
+    @pytest.mark.parametrize("kind", ["CNM", "DIM", "DIM-reparam"])
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    def test_skip_init_continues_from_fitted_parameters(self, kind, method) -> None:
+        make, observations = _refit_case(kind)
+        model = make()
+        fresh_history = _run_fitter(model, method, observations)
+        ll_at_fitted = float(model._e_step(observations))
+
+        history = _run_fitter(model, method, observations, skip_init=True)
+
+        # The resumed fit starts at the fitted parameters (initialization was
+        # not rerun), not where a fresh fit starts.
+        np.testing.assert_allclose(history[0], ll_at_fitted, rtol=1e-8)
+        assert history[0] != fresh_history[0]

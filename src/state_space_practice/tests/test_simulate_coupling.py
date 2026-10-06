@@ -8,6 +8,7 @@ model.
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy import special, stats
 
 import state_space_practice.coupling_model as coupling_model
 from state_space_practice.circular_stats import (
@@ -26,6 +27,7 @@ from state_space_practice.coupling_model import (
     validate_coupling_observations,
     validate_coupling_params,
 )
+from state_space_practice.coupling_validation import batch_means_mcse
 from state_space_practice.simulate_coupling import simulate_coupling
 
 
@@ -283,6 +285,11 @@ class TestValidation:
     def test_accepts_canonical_params(self, coupling_params_small):
         # guard: the valid fixture passes (validation isn't rejecting good input)
         validate_coupling_params(coupling_params_small)
+        # ...and the validated parameters build a stable latent transition
+        # (spectral radius = the per-band decay 0.99 < 1).
+        transition_matrix, _ = build_transition(coupling_params_small)
+        spectral_radius = np.abs(np.linalg.eigvals(np.asarray(transition_matrix))).max()
+        np.testing.assert_allclose(spectral_radius, 0.99, rtol=1e-10)
 
     def test_requires_jax_x64(self, coupling_params_small, monkeypatch):
         monkeypatch.setattr(coupling_model, "_coupling_x64_enabled", lambda: False)
@@ -476,3 +483,128 @@ class TestValidateCouplingObservations:
             validate_coupling_observations(
                 spikes, bad, n_neurons=n_neurons, n_latent=n_latent
             )
+
+
+@pytest.fixture(scope="module")
+def simulated_coupling_long(coupling_params_small):
+    """20 000 bins (~200 latent correlation times) for moment checks."""
+    return simulate_coupling(coupling_params_small, n_time=20_000, seed=3)
+
+
+def _true_eta(sim, params) -> np.ndarray:
+    latent = np.asarray(sim.latent_true)
+    return (
+        np.asarray(params.baseline)[None, :]
+        + latent[:, 0::2] @ np.asarray(params.beta_real).T
+        + latent[:, 1::2] @ np.asarray(params.beta_imag).T
+    )
+
+
+class TestSimulatorMoments:
+    """The simulator's output has the moments its generative model implies."""
+
+    def test_marginal_rate_matches_stationary_expectation(
+        self, simulated_coupling_long, coupling_params_small
+    ):
+        """E[y_s] = E[sigmoid(b + beta_s . x)], x ~ N(0, I) (unit stationary var).
+
+        beta_s . x ~ N(0, |beta_s|^2), so the expectation is a 1-D Gauss-Hermite
+        integral. Tolerance: 4 batch-means MCSE (20 batches of 1000 bins, ~10
+        latent correlation times each), which accounts for the latent's
+        autocorrelation. Guard: the coupling raises the rate well above
+        sigmoid(baseline), so the check sees the coupling, not just the base rate.
+        """
+        params = coupling_params_small
+        spikes = np.asarray(simulated_coupling_long.spikes)
+        nodes, weights = np.polynomial.hermite_e.hermegauss(80)
+        weights = weights / weights.sum()
+        magnitude = np.hypot(np.asarray(params.beta_real), np.asarray(params.beta_imag))
+        magnitude = np.sqrt((magnitude**2).sum(axis=1))  # (S,)
+        for neuron in range(spikes.shape[1]):
+            expected = float(
+                weights
+                @ special.expit(
+                    float(params.baseline[neuron]) + magnitude[neuron] * nodes
+                )
+            )
+            mcse = float(batch_means_mcse(spikes[:, neuron], 20))
+            rate = float(spikes[:, neuron].mean())
+            assert abs(rate - expected) < 4.0 * mcse, (neuron, rate, expected, mcse)
+            base = float(special.expit(float(params.baseline[neuron])))
+            assert expected - base > 10.0 * mcse, (neuron, expected, base, mcse)
+
+    def test_latent_has_unit_stationary_variance(
+        self, simulated_coupling_long, coupling_params_small
+    ):
+        params = coupling_params_small
+        latent = np.asarray(simulated_coupling_long.latent_true)
+        expected = np.repeat(
+            np.asarray(params.process_noise_var)
+            / (1.0 - np.asarray(params.osc_decay) ** 2),
+            2,
+        )
+        second = latent**2
+        mcse = batch_means_mcse(second, 20)
+        assert np.all(np.abs(second.mean(0) - expected) < 4.0 * mcse), (
+            second.mean(0),
+            mcse,
+        )
+
+    @pytest.mark.parametrize("beta_scale", [1.0, 0.8])
+    def test_spikes_are_conditionally_bernoulli_given_latent(
+        self, simulated_coupling_long, coupling_params_small, beta_scale
+    ):
+        """Score statistics at the generating parameters are N(0, 1).
+
+        Given the latent, y_{s,k} are independent Bernoulli(p_{s,k}), so
+        ``sum_k g_k (y - p) / sqrt(sum_k g_k^2 p (1 - p))`` is exactly mean-0,
+        variance-1 for any latent-measurable g (here 1 and each latent
+        component: 3 neurons x 5 = 15 statistics, max |z| < 4). With the
+        coupling mis-scaled by 0.8 the same statistics must blow up (power).
+        """
+        params = coupling_params_small
+        sim = simulated_coupling_long
+        scaled = params._replace(
+            beta_real=params.beta_real * beta_scale,
+            beta_imag=params.beta_imag * beta_scale,
+        )
+        p = special.expit(_true_eta(sim, scaled))
+        y = np.asarray(sim.spikes)
+        latent = np.asarray(sim.latent_true)
+        features = np.column_stack([np.ones(len(latent)), latent])  # (T, 5)
+        resid = y - p
+        info = p * (1.0 - p)
+        z = (features.T @ resid) / np.sqrt((features**2).T @ info)  # (5, S)
+        if beta_scale == 1.0:
+            assert np.max(np.abs(z)) < 4.0, np.round(z, 2)
+        else:
+            assert np.max(np.abs(z)) > 6.0, np.round(z, 2)
+
+    def test_lfp_noise_is_white_with_declared_variance(
+        self, simulated_coupling_long, coupling_params_small
+    ):
+        """lfp - latent is i.i.d. N(0, lfp_noise_var I), independent of the latent.
+
+        Regression: the LFP key used to coincide with the process-noise key, so
+        ``lfp - x_k`` was an exact scaled copy of the process noise
+        ``w_k = x_k - A x_{k-1}`` (correlation 1, and 0.14 with the latent).
+        """
+        sim = simulated_coupling_long
+        noise = np.asarray(sim.lfp) - np.asarray(sim.latent_true)
+        n = noise.shape[0]
+        A, _ = build_transition(coupling_params_small)
+        latent = np.asarray(sim.latent_true)
+        process_noise = latent[1:] - latent[:-1] @ np.asarray(A).T
+        for comp in range(noise.shape[1]):
+            r = np.corrcoef(noise[1:, comp], process_noise[:, comp])[0, 1]
+            assert abs(r) < 4.0 / np.sqrt(n - 1), (comp, r)
+        var = float(coupling_params_small.lfp_noise_var)
+        lo, hi = stats.chi2.ppf([1e-4, 1.0 - 1e-4], n) / n * var
+        for comp in range(noise.shape[1]):
+            v = float(np.mean(noise[:, comp] ** 2))
+            assert lo < v < hi, (comp, v, lo, hi)
+            lag1 = np.corrcoef(noise[1:, comp], noise[:-1, comp])[0, 1]
+            assert abs(lag1) < 4.0 / np.sqrt(n), (comp, lag1)
+            cross = np.corrcoef(noise[:, comp], np.asarray(sim.latent_true)[:, comp])
+            assert abs(cross[0, 1]) < 4.0 / np.sqrt(n), (comp, cross[0, 1])
+        assert stats.kstest(noise.ravel() / np.sqrt(var), "norm").pvalue > 1e-3

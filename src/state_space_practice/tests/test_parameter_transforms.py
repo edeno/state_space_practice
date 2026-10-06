@@ -151,6 +151,16 @@ class TestPSDMatrixTransform:
 
 
 class TestPositiveCappedTransform:
+    def test_same_cap_gives_equal_transforms(self) -> None:
+        """The SGD compiled-step cache keys on the parameter spec, so building
+        the spec twice with the same cap must give equal (hashable) transforms;
+        otherwise every fit_sgd recompiles."""
+        from state_space_practice.parameter_transforms import positive_capped
+
+        assert positive_capped(50.0) == positive_capped(max_val=50.0)
+        assert hash(positive_capped(50.0)) == hash(positive_capped(50.0))
+        assert positive_capped(50.0) != positive_capped(20.0)
+
     def test_roundtrip(self) -> None:
         from state_space_practice.parameter_transforms import positive_capped
 

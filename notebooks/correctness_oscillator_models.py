@@ -71,10 +71,13 @@ A1_com = construct_common_oscillator_transition_matrix(freqs, damping_1, samplin
 A_com = jnp.stack([A0_com, A1_com], axis=-1)
 
 Q_var = jnp.array([0.05])
-Q_com = jnp.stack([
-    construct_common_oscillator_process_covariance(Q_var),
-    construct_common_oscillator_process_covariance(Q_var),
-], axis=-1)
+Q_com = jnp.stack(
+    [
+        construct_common_oscillator_process_covariance(Q_var),
+        construct_common_oscillator_process_covariance(Q_var),
+    ],
+    axis=-1,
+)
 
 Z_com = jnp.array([[0.998, 0.002], [0.002, 0.998]])
 
@@ -101,7 +104,9 @@ disc_states = np.zeros(n_time, dtype=int)
 disc_states[0] = 0
 for t in range(1, n_time):
     k_disc, k = jax.random.split(k_disc)
-    if float(jax.random.uniform(k)) < float(Z_com[disc_states[t - 1], 1 - disc_states[t - 1]]):
+    if float(jax.random.uniform(k)) < float(
+        Z_com[disc_states[t - 1], 1 - disc_states[t - 1]]
+    ):
         disc_states[t] = 1 - disc_states[t - 1]
     else:
         disc_states[t] = disc_states[t - 1]
@@ -112,7 +117,9 @@ for t in range(1, n_time):
     k_state, k = jax.random.split(k_state)
     A_t = np.array(A_com[:, :, disc_states[t]])
     Q_t = np.array(Q_com[:, :, disc_states[t]])
-    noise = np.array(jax.random.multivariate_normal(k, jnp.zeros(n_latent), jnp.array(Q_t)))
+    noise = np.array(
+        jax.random.multivariate_normal(k, jnp.zeros(n_latent), jnp.array(Q_t))
+    )
     states[t] = A_t @ states[t - 1] + noise
 
 spikes_com = np.zeros((n_time, n_neurons))
@@ -147,7 +154,9 @@ model_com._initialize_parameters(jax.random.PRNGKey(0))
 # Warm start
 k_p = jax.random.PRNGKey(77)
 k1, k2, k3, k4 = jax.random.split(k_p, 4)
-model_com.continuous_transition_matrix = A_com + jax.random.normal(k1, A_com.shape) * 0.005
+model_com.continuous_transition_matrix = (
+    A_com + jax.random.normal(k1, A_com.shape) * 0.005
+)
 model_com.process_cov = Q_com + jnp.abs(jax.random.normal(k2, Q_com.shape)) * 0.001
 model_com.discrete_transition_matrix = Z_com
 model_com.spike_params = SpikeObsParams(
@@ -162,17 +171,29 @@ print(f"Done. LL improvement: {lls_com[-1] - lls_com[0]:.1f}")
 # %%
 # Extract results
 prob_com = np.array(model_com.smoother_discrete_state_prob)
-corr_com = [np.corrcoef(disc_states.astype(float), prob_com[:, j])[0, 1] for j in range(2)]
+corr_com = [
+    np.corrcoef(disc_states.astype(float), prob_com[:, j])[0, 1] for j in range(2)
+]
 best_j_com = np.argmax(np.abs(corr_com))
 rhythmic_label = best_j_com if corr_com[best_j_com] > 0 else 1 - best_j_com
 
-smoother_mean_com = np.array(jnp.einsum(
-    "tls,ts->tl", model_com.smoother_state_cond_mean, model_com.smoother_discrete_state_prob,
-))
-smoother_theta_amp = np.sqrt(smoother_mean_com[:, 0] ** 2 + smoother_mean_com[:, 1] ** 2)
+smoother_mean_com = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model_com.smoother_state_cond_mean,
+        model_com.smoother_discrete_state_prob,
+    )
+)
+smoother_theta_amp = np.sqrt(
+    smoother_mean_com[:, 0] ** 2 + smoother_mean_com[:, 1] ** 2
+)
 
 # Recovered frequencies
-fitted_eigs = [np.linalg.eigvals(np.array(model_com.continuous_transition_matrix[:, :, j])) for j in range(2)]
+fitted_eigs = [
+    np.linalg.eigvals(np.array(model_com.continuous_transition_matrix[:, :, j]))
+    for j in range(2)
+]
+
 
 def extract_oscillator_freq(eigs, n_osc, sampling_freq):
     """Extract frequencies from eigenvalues of block-diagonal rotation matrix."""
@@ -189,6 +210,7 @@ def extract_oscillator_freq(eigs, n_osc, sampling_freq):
             freqs_out.append(np.nan)
     return freqs_out
 
+
 freqs_state0 = extract_oscillator_freq(fitted_eigs[0], n_oscillators, sampling_freq)
 freqs_state1 = extract_oscillator_freq(fitted_eigs[1], n_oscillators, sampling_freq)
 
@@ -201,8 +223,21 @@ fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
 
 # Panel 1: True discrete state
 ax = axes[0]
-ax.fill_between(time_sec[t_show], 0, disc_states[t_show], alpha=0.3, color="C1", label="State 1 (rhythmic)")
-ax.plot(time_sec[t_show], prob_com[t_show, rhythmic_label], color="C0", alpha=0.8, label="P(rhythmic | y)")
+ax.fill_between(
+    time_sec[t_show],
+    0,
+    disc_states[t_show],
+    alpha=0.3,
+    color="C1",
+    label="State 1 (rhythmic)",
+)
+ax.plot(
+    time_sec[t_show],
+    prob_com[t_show, rhythmic_label],
+    color="C0",
+    alpha=0.8,
+    label="P(rhythmic | y)",
+)
 ax.set_ylabel("State")
 ax.set_title(f"COM: Discrete state recovery (|corr| = {max(np.abs(corr_com)):.3f})")
 ax.legend(loc="upper right")
@@ -211,7 +246,9 @@ ax.set_ylim(-0.05, 1.05)
 # Panel 2: Theta oscillator
 ax = axes[1]
 ax.plot(time_sec[t_show], states[t_show, 0], alpha=0.3, label="True theta x")
-ax.plot(time_sec[t_show], smoother_mean_com[t_show, 0], alpha=0.8, label="Smoothed theta x")
+ax.plot(
+    time_sec[t_show], smoother_mean_com[t_show, 0], alpha=0.8, label="Smoothed theta x"
+)
 ax.set_ylabel("Theta (8 Hz)")
 ax.set_title("Theta oscillator tracking")
 ax.legend(loc="upper right")
@@ -236,11 +273,18 @@ text = (
     f"  State 0: {sorted(np.abs(fitted_eigs[0]))[-1]:.3f}  (true: {float(damping_0[0]):.3f})\n"
     f"  State 1: {sorted(np.abs(fitted_eigs[1]))[-1]:.3f}  (true: {float(damping_1[0]):.3f})\n\n"
     f"State recovery |corr|: {max(np.abs(corr_com)):.3f}\n"
-    f"Theta tracking corr: {np.corrcoef(states[:,0], smoother_mean_com[:,0])[0,1]:.3f}"
+    f"Theta tracking corr: {np.corrcoef(states[:, 0], smoother_mean_com[:, 0])[0, 1]:.3f}"
 )
-ax.text(0.05, 0.5, text, transform=ax.transAxes, fontsize=10,
-        verticalalignment="center", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+ax.text(
+    0.05,
+    0.5,
+    text,
+    transform=ax.transAxes,
+    fontsize=10,
+    verticalalignment="center",
+    fontfamily="monospace",
+    bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+)
 ax.set_axis_off()
 
 plt.tight_layout()
@@ -269,7 +313,9 @@ dt_cnm = 1.0 / sampling_freq_cnm
 
 # Same A for both states (COM-style, no direct coupling)
 A_cnm_single = construct_common_oscillator_transition_matrix(
-    freqs_cnm, damping_cnm, sampling_freq_cnm,
+    freqs_cnm,
+    damping_cnm,
+    sampling_freq_cnm,
 )
 A_cnm = jnp.stack([A_cnm_single, A_cnm_single], axis=-1)
 
@@ -305,7 +351,9 @@ k_disc_c, k_state_c, k_spike_c = jax.random.split(k_s_cnm, 3)
 disc_cnm = np.zeros(n_time_cnm, dtype=int)
 for t in range(1, n_time_cnm):
     k_disc_c, k = jax.random.split(k_disc_c)
-    if float(jax.random.uniform(k)) < float(Z_cnm[disc_cnm[t - 1], 1 - disc_cnm[t - 1]]):
+    if float(jax.random.uniform(k)) < float(
+        Z_cnm[disc_cnm[t - 1], 1 - disc_cnm[t - 1]]
+    ):
         disc_cnm[t] = 1 - disc_cnm[t - 1]
     else:
         disc_cnm[t] = disc_cnm[t - 1]
@@ -316,7 +364,9 @@ for t in range(1, n_time_cnm):
     k_state_c, k = jax.random.split(k_state_c)
     A_t = np.array(A_cnm[:, :, disc_cnm[t]])
     Q_t = np.array(Q_cnm[:, :, disc_cnm[t]])
-    noise = np.array(jax.random.multivariate_normal(k, jnp.zeros(n_latent_cnm), jnp.array(Q_t)))
+    noise = np.array(
+        jax.random.multivariate_normal(k, jnp.zeros(n_latent_cnm), jnp.array(Q_t))
+    )
     states_cnm[t] = A_t @ states_cnm[t - 1] + noise
 
 spikes_cnm = np.zeros((n_time_cnm, n_neurons_cnm))
@@ -327,8 +377,10 @@ for t in range(n_time_cnm):
     spikes_cnm[t] = np.array(jax.random.poisson(k, jnp.array(rate)))
 
 spikes_cnm = jnp.array(spikes_cnm)
-print(f"\nSimulated CNM data: {int(jnp.sum(spikes_cnm))} spikes, "
-      f"{np.sum(np.diff(disc_cnm) != 0)} transitions")
+print(
+    f"\nSimulated CNM data: {int(jnp.sum(spikes_cnm))} spikes, "
+    f"{np.sum(np.diff(disc_cnm) != 0)} transitions"
+)
 
 # %%
 # Fit
@@ -345,7 +397,9 @@ model_cnm._initialize_parameters(jax.random.PRNGKey(0))
 
 k_p_cnm = jax.random.PRNGKey(44)
 k1, k2, k3, k4 = jax.random.split(k_p_cnm, 4)
-model_cnm.continuous_transition_matrix = A_cnm + jax.random.normal(k1, A_cnm.shape) * 0.003
+model_cnm.continuous_transition_matrix = (
+    A_cnm + jax.random.normal(k1, A_cnm.shape) * 0.003
+)
 model_cnm.process_cov = Q_cnm + jnp.abs(jax.random.normal(k2, Q_cnm.shape)) * 0.001
 model_cnm.discrete_transition_matrix = Z_cnm
 model_cnm.spike_params = SpikeObsParams(
@@ -365,9 +419,13 @@ corr_label_cnm = np.argmax(np.abs(corr_cnm))
 if corr_cnm[corr_label_cnm] < 0:
     corr_label_cnm = 1 - corr_label_cnm
 
-smoother_mean_cnm = np.array(jnp.einsum(
-    "tls,ts->tl", model_cnm.smoother_state_cond_mean, model_cnm.smoother_discrete_state_prob,
-))
+smoother_mean_cnm = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model_cnm.smoother_state_cond_mean,
+        model_cnm.smoother_discrete_state_prob,
+    )
+)
 
 # Check Q recovery: off-diagonal blocks
 fitted_Q = [np.array(model_cnm.process_cov[:, :, j]) for j in range(2)]
@@ -380,25 +438,50 @@ t_show_cnm = slice(0, 6000)
 fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
 
 ax = axes[0]
-ax.fill_between(time_sec_cnm[t_show_cnm], 0, disc_cnm[t_show_cnm], alpha=0.3, color="C1",
-                label="State 1 (correlated noise)")
-ax.plot(time_sec_cnm[t_show_cnm], prob_cnm[t_show_cnm, corr_label_cnm], color="C0", alpha=0.8,
-        label="P(correlated | y)")
+ax.fill_between(
+    time_sec_cnm[t_show_cnm],
+    0,
+    disc_cnm[t_show_cnm],
+    alpha=0.3,
+    color="C1",
+    label="State 1 (correlated noise)",
+)
+ax.plot(
+    time_sec_cnm[t_show_cnm],
+    prob_cnm[t_show_cnm, corr_label_cnm],
+    color="C0",
+    alpha=0.8,
+    label="P(correlated | y)",
+)
 ax.set_ylabel("State")
 ax.set_title(f"CNM: Discrete state recovery (|corr| = {best_corr_cnm:.3f})")
 ax.legend(loc="upper right")
 ax.set_ylim(-0.05, 1.05)
 
 ax = axes[1]
-ax.plot(time_sec_cnm[t_show_cnm], states_cnm[t_show_cnm, 0], alpha=0.3, label="True osc1 x")
-ax.plot(time_sec_cnm[t_show_cnm], smoother_mean_cnm[t_show_cnm, 0], alpha=0.8, label="Smoothed osc1 x")
+ax.plot(
+    time_sec_cnm[t_show_cnm], states_cnm[t_show_cnm, 0], alpha=0.3, label="True osc1 x"
+)
+ax.plot(
+    time_sec_cnm[t_show_cnm],
+    smoother_mean_cnm[t_show_cnm, 0],
+    alpha=0.8,
+    label="Smoothed osc1 x",
+)
 ax.set_ylabel("Osc1 (8 Hz)")
 ax.set_title("Oscillator 1 tracking")
 ax.legend(loc="upper right")
 
 ax = axes[2]
-ax.plot(time_sec_cnm[t_show_cnm], states_cnm[t_show_cnm, 2], alpha=0.3, label="True osc2 x")
-ax.plot(time_sec_cnm[t_show_cnm], smoother_mean_cnm[t_show_cnm, 2], alpha=0.8, label="Smoothed osc2 x")
+ax.plot(
+    time_sec_cnm[t_show_cnm], states_cnm[t_show_cnm, 2], alpha=0.3, label="True osc2 x"
+)
+ax.plot(
+    time_sec_cnm[t_show_cnm],
+    smoother_mean_cnm[t_show_cnm, 2],
+    alpha=0.8,
+    label="Smoothed osc2 x",
+)
 ax.set_ylabel("Osc2 (12 Hz)")
 ax.set_title("Oscillator 2 tracking")
 ax.legend(loc="upper right")
@@ -414,12 +497,19 @@ text = (
     f"  State w/ less coupling: {Q_offdiag[Q_order[0]]:.4f}  (true: {true_Q_offdiag_0:.4f})\n"
     f"  State w/ more coupling: {Q_offdiag[Q_order[1]]:.4f}  (true: {true_Q_offdiag_1:.4f})\n\n"
     f"State recovery |corr|: {best_corr_cnm:.3f}\n"
-    f"Osc1 tracking corr: {np.corrcoef(states_cnm[:,0], smoother_mean_cnm[:,0])[0,1]:.3f}\n"
-    f"Osc2 tracking corr: {np.corrcoef(states_cnm[:,2], smoother_mean_cnm[:,2])[0,1]:.3f}"
+    f"Osc1 tracking corr: {np.corrcoef(states_cnm[:, 0], smoother_mean_cnm[:, 0])[0, 1]:.3f}\n"
+    f"Osc2 tracking corr: {np.corrcoef(states_cnm[:, 2], smoother_mean_cnm[:, 2])[0, 1]:.3f}"
 )
-ax.text(0.05, 0.5, text, transform=ax.transAxes, fontsize=10,
-        verticalalignment="center", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+ax.text(
+    0.05,
+    0.5,
+    text,
+    transform=ax.transAxes,
+    fontsize=10,
+    verticalalignment="center",
+    fontfamily="monospace",
+    bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+)
 ax.set_axis_off()
 
 plt.tight_layout()
@@ -447,27 +537,43 @@ dt_dim = 1.0 / sampling_freq_dim
 coupling_0 = jnp.zeros((n_osc_dim, n_osc_dim))
 phase_diff_0 = jnp.zeros((n_osc_dim, n_osc_dim))
 A0_dim = construct_directed_influence_transition_matrix(
-    freqs_dim, damping_dim, coupling_0, phase_diff_0, sampling_freq_dim,
+    freqs_dim,
+    damping_dim,
+    coupling_0,
+    phase_diff_0,
+    sampling_freq_dim,
 )
 
 # State 1: oscillator 1 → oscillator 2 coupling
 coupling_1 = jnp.array([[0.0, 0.0], [0.15, 0.0]])  # osc1 drives osc2
 phase_diff_1 = jnp.array([[0.0, 0.0], [jnp.pi / 4, 0.0]])  # 45 degree lag
 A1_dim = construct_directed_influence_transition_matrix(
-    freqs_dim, damping_dim, coupling_1, phase_diff_1, sampling_freq_dim,
+    freqs_dim,
+    damping_dim,
+    coupling_1,
+    phase_diff_1,
+    sampling_freq_dim,
 )
 
 A_dim = jnp.stack([A0_dim, A1_dim], axis=-1)
-Q_dim = jnp.stack([
-    construct_common_oscillator_process_covariance(jnp.array([0.02, 0.02])),
-] * 2, axis=-1)
+Q_dim = jnp.stack(
+    [
+        construct_common_oscillator_process_covariance(jnp.array([0.02, 0.02])),
+    ]
+    * 2,
+    axis=-1,
+)
 Z_dim = jnp.array([[0.998, 0.002], [0.002, 0.998]])
 
 print("DIM Model:")
 print(f"  State 0 (uncoupled): A0 has off-diagonal blocks = 0")
 print(f"  State 1 (coupled): osc1→osc2 with strength=0.15, phase_diff=pi/4")
-print(f"  A0 spectral radius: {float(jnp.max(jnp.abs(jnp.linalg.eigvals(A0_dim)))):.3f}")
-print(f"  A1 spectral radius: {float(jnp.max(jnp.abs(jnp.linalg.eigvals(A1_dim)))):.3f}")
+print(
+    f"  A0 spectral radius: {float(jnp.max(jnp.abs(jnp.linalg.eigvals(A0_dim)))):.3f}"
+)
+print(
+    f"  A1 spectral radius: {float(jnp.max(jnp.abs(jnp.linalg.eigvals(A1_dim)))):.3f}"
+)
 
 # Off-diagonal check
 print(f"\n  A0 off-diagonal block (osc2←osc1):\n    {np.array(A0_dim[2:4, 0:2])}")
@@ -486,7 +592,9 @@ k_disc_d, k_state_d, k_spike_d = jax.random.split(k_s_dim, 3)
 disc_dim = np.zeros(n_time_dim, dtype=int)
 for t in range(1, n_time_dim):
     k_disc_d, k = jax.random.split(k_disc_d)
-    if float(jax.random.uniform(k)) < float(Z_dim[disc_dim[t - 1], 1 - disc_dim[t - 1]]):
+    if float(jax.random.uniform(k)) < float(
+        Z_dim[disc_dim[t - 1], 1 - disc_dim[t - 1]]
+    ):
         disc_dim[t] = 1 - disc_dim[t - 1]
     else:
         disc_dim[t] = disc_dim[t - 1]
@@ -497,7 +605,9 @@ for t in range(1, n_time_dim):
     k_state_d, k = jax.random.split(k_state_d)
     A_t = np.array(A_dim[:, :, disc_dim[t]])
     Q_t = np.array(Q_dim[:, :, disc_dim[t]])
-    noise = np.array(jax.random.multivariate_normal(k, jnp.zeros(n_latent_dim), jnp.array(Q_t)))
+    noise = np.array(
+        jax.random.multivariate_normal(k, jnp.zeros(n_latent_dim), jnp.array(Q_t))
+    )
     states_dim[t] = A_t @ states_dim[t - 1] + noise
 
 spikes_dim = np.zeros((n_time_dim, n_neurons_dim))
@@ -508,7 +618,9 @@ for t in range(n_time_dim):
     spikes_dim[t] = np.array(jax.random.poisson(k, jnp.array(rate)))
 
 spikes_dim = jnp.array(spikes_dim)
-print(f"\nSimulated DIM data: {int(jnp.sum(spikes_dim))} spikes, {np.sum(np.diff(disc_dim) != 0)} transitions")
+print(
+    f"\nSimulated DIM data: {int(jnp.sum(spikes_dim))} spikes, {np.sum(np.diff(disc_dim) != 0)} transitions"
+)
 
 # %%
 # Fit
@@ -525,7 +637,9 @@ model_dim._initialize_parameters(jax.random.PRNGKey(0))
 
 k_p2 = jax.random.PRNGKey(88)
 k1, k2, k3, k4 = jax.random.split(k_p2, 4)
-model_dim.continuous_transition_matrix = A_dim + jax.random.normal(k1, A_dim.shape) * 0.003
+model_dim.continuous_transition_matrix = (
+    A_dim + jax.random.normal(k1, A_dim.shape) * 0.003
+)
 model_dim.process_cov = Q_dim + jnp.abs(jax.random.normal(k2, Q_dim.shape)) * 0.001
 model_dim.discrete_transition_matrix = Z_dim
 model_dim.spike_params = SpikeObsParams(
@@ -545,9 +659,13 @@ coupled_label = np.argmax(np.abs(corr_dim))
 if corr_dim[coupled_label] < 0:
     coupled_label = 1 - coupled_label
 
-smoother_mean_dim = np.array(jnp.einsum(
-    "tls,ts->tl", model_dim.smoother_state_cond_mean, model_dim.smoother_discrete_state_prob,
-))
+smoother_mean_dim = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model_dim.smoother_state_cond_mean,
+        model_dim.smoother_discrete_state_prob,
+    )
+)
 
 # Compare off-diagonal coupling blocks
 fitted_A = [np.array(model_dim.continuous_transition_matrix[:, :, j]) for j in range(2)]
@@ -568,23 +686,50 @@ t_show_dim = slice(0, 6000)  # first 60 seconds
 fig, axes = plt.subplots(5, 1, figsize=(14, 14), sharex=True)
 
 ax = axes[0]
-ax.fill_between(time_sec_dim[t_show_dim], 0, disc_dim[t_show_dim], alpha=0.3, color="C1", label="State 1 (coupled)")
-ax.plot(time_sec_dim[t_show_dim], prob_dim[t_show_dim, coupled_label], color="C0", alpha=0.8, label="P(coupled | y)")
+ax.fill_between(
+    time_sec_dim[t_show_dim],
+    0,
+    disc_dim[t_show_dim],
+    alpha=0.3,
+    color="C1",
+    label="State 1 (coupled)",
+)
+ax.plot(
+    time_sec_dim[t_show_dim],
+    prob_dim[t_show_dim, coupled_label],
+    color="C0",
+    alpha=0.8,
+    label="P(coupled | y)",
+)
 ax.set_ylabel("State")
 ax.set_title(f"DIM: Discrete state recovery (|corr| = {best_corr_dim:.3f})")
 ax.legend(loc="upper right")
 ax.set_ylim(-0.05, 1.05)
 
 ax = axes[1]
-ax.plot(time_sec_dim[t_show_dim], states_dim[t_show_dim, 0], alpha=0.3, label="True osc1 x")
-ax.plot(time_sec_dim[t_show_dim], smoother_mean_dim[t_show_dim, 0], alpha=0.8, label="Smoothed osc1 x")
+ax.plot(
+    time_sec_dim[t_show_dim], states_dim[t_show_dim, 0], alpha=0.3, label="True osc1 x"
+)
+ax.plot(
+    time_sec_dim[t_show_dim],
+    smoother_mean_dim[t_show_dim, 0],
+    alpha=0.8,
+    label="Smoothed osc1 x",
+)
 ax.set_ylabel("Osc1 (8 Hz)")
 ax.set_title("Oscillator 1 (driver)")
 ax.legend(loc="upper right")
 
 ax = axes[2]
-ax.plot(time_sec_dim[t_show_dim], states_dim[t_show_dim, 2], alpha=0.3, label="True osc2 x")
-ax.plot(time_sec_dim[t_show_dim], smoother_mean_dim[t_show_dim, 2], alpha=0.8, label="Smoothed osc2 x")
+ax.plot(
+    time_sec_dim[t_show_dim], states_dim[t_show_dim, 2], alpha=0.3, label="True osc2 x"
+)
+ax.plot(
+    time_sec_dim[t_show_dim],
+    smoother_mean_dim[t_show_dim, 2],
+    alpha=0.8,
+    label="Smoothed osc2 x",
+)
 ax.set_ylabel("Osc2 (12 Hz)")
 ax.set_title("Oscillator 2 (driven, when coupled)")
 ax.legend(loc="upper right")
@@ -594,11 +739,18 @@ ax = axes[3]
 true_coupling_0 = np.array(A0_dim[2:4, 0:2])
 true_coupling_1 = np.array(A1_dim[2:4, 0:2])
 
-im_data = np.concatenate([
-    true_coupling_0, np.ones((2, 1)) * np.nan, coupling_block_0,
-    np.ones((2, 1)) * np.nan,
-    true_coupling_1, np.ones((2, 1)) * np.nan, coupling_block_1,
-], axis=1)
+im_data = np.concatenate(
+    [
+        true_coupling_0,
+        np.ones((2, 1)) * np.nan,
+        coupling_block_0,
+        np.ones((2, 1)) * np.nan,
+        true_coupling_1,
+        np.ones((2, 1)) * np.nan,
+        coupling_block_1,
+    ],
+    axis=1,
+)
 # Just show as text
 text = (
     f"Off-diagonal coupling block (osc2 ← osc1):\n\n"
@@ -617,9 +769,16 @@ text = (
     f"  Coupling strength: true={np.linalg.norm(true_coupling_1):.4f}, "
     f"fitted={coupling_strength[1]:.4f}"
 )
-ax.text(0.05, 0.5, text, transform=ax.transAxes, fontsize=9,
-        verticalalignment="center", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+ax.text(
+    0.05,
+    0.5,
+    text,
+    transform=ax.transAxes,
+    fontsize=9,
+    verticalalignment="center",
+    fontfamily="monospace",
+    bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+)
 ax.set_axis_off()
 ax.set_title("Coupling block recovery")
 
@@ -630,8 +789,12 @@ osc2_corr = np.corrcoef(states_dim[:, 2], smoother_mean_dim[:, 2])[0, 1]
 
 eigs_0 = np.linalg.eigvals(fitted_A[0])
 eigs_1 = np.linalg.eigvals(fitted_A[1])
-freq_0 = sorted(np.abs(np.angle(eigs_0[eigs_0.imag > 0])) * sampling_freq_dim / (2 * np.pi))
-freq_1 = sorted(np.abs(np.angle(eigs_1[eigs_1.imag > 0])) * sampling_freq_dim / (2 * np.pi))
+freq_0 = sorted(
+    np.abs(np.angle(eigs_0[eigs_0.imag > 0])) * sampling_freq_dim / (2 * np.pi)
+)
+freq_1 = sorted(
+    np.abs(np.angle(eigs_1[eigs_1.imag > 0])) * sampling_freq_dim / (2 * np.pi)
+)
 
 text2 = (
     f"DIM Model: 2 oscillators ({float(freqs_dim[0]):.0f} Hz + {float(freqs_dim[1]):.0f} Hz)\n"
@@ -646,9 +809,16 @@ text2 = (
     f"Osc1 tracking corr: {osc1_corr:.3f}\n"
     f"Osc2 tracking corr: {osc2_corr:.3f}"
 )
-ax.text(0.05, 0.5, text2, transform=ax.transAxes, fontsize=10,
-        verticalalignment="center", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+ax.text(
+    0.05,
+    0.5,
+    text2,
+    transform=ax.transAxes,
+    fontsize=10,
+    verticalalignment="center",
+    fontfamily="monospace",
+    bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+)
 ax.set_axis_off()
 
 plt.tight_layout()
@@ -661,17 +831,29 @@ print("SUMMARY")
 print("=" * 70)
 print(f"\nCOM Model (theta, switching damping):")
 print(f"  State recovery |corr|: {max(np.abs(corr_com)):.3f}")
-print(f"  Theta tracking corr: {np.corrcoef(states[:,0], smoother_mean_com[:,0])[0,1]:.3f}")
-print(f"  Freq recovery: {[f'{f:.1f}' for f in freqs_state0]} / {[f'{f:.1f}' for f in freqs_state1]} Hz")
+print(
+    f"  Theta tracking corr: {np.corrcoef(states[:, 0], smoother_mean_com[:, 0])[0, 1]:.3f}"
+)
+print(
+    f"  Freq recovery: {[f'{f:.1f}' for f in freqs_state0]} / {[f'{f:.1f}' for f in freqs_state1]} Hz"
+)
 
 print(f"\nCNM Model (8 Hz + 12 Hz, switching noise correlation):")
 print(f"  State recovery |corr|: {best_corr_cnm:.3f}")
-print(f"  Osc1 tracking corr: {np.corrcoef(states_cnm[:,0], smoother_mean_cnm[:,0])[0,1]:.3f}")
-print(f"  Osc2 tracking corr: {np.corrcoef(states_cnm[:,2], smoother_mean_cnm[:,2])[0,1]:.3f}")
-print(f"  Q off-diag recovery: indep={Q_offdiag[Q_order[0]]:.4f}, corr={Q_offdiag[Q_order[1]]:.4f}")
+print(
+    f"  Osc1 tracking corr: {np.corrcoef(states_cnm[:, 0], smoother_mean_cnm[:, 0])[0, 1]:.3f}"
+)
+print(
+    f"  Osc2 tracking corr: {np.corrcoef(states_cnm[:, 2], smoother_mean_cnm[:, 2])[0, 1]:.3f}"
+)
+print(
+    f"  Q off-diag recovery: indep={Q_offdiag[Q_order[0]]:.4f}, corr={Q_offdiag[Q_order[1]]:.4f}"
+)
 
 print(f"\nDIM Model (8 Hz + 12 Hz, switching coupling):")
 print(f"  State recovery |corr|: {best_corr_dim:.3f}")
 print(f"  Osc1 tracking corr: {osc1_corr:.3f}")
 print(f"  Osc2 tracking corr: {osc2_corr:.3f}")
-print(f"  Coupling recovery: uncoupled={coupling_strength[order_dim[0]]:.4f}, coupled={coupling_strength[order_dim[1]]:.4f}")
+print(
+    f"  Coupling recovery: uncoupled={coupling_strength[order_dim[0]]:.4f}, coupled={coupling_strength[order_dim[1]]:.4f}"
+)

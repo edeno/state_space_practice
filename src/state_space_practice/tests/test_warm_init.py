@@ -2,9 +2,12 @@
 """Tests for warm initialization of oscillator models.
 
 Warm init uses windowed cross-covariance features + GMM clustering to
-break symmetry before the first E-step. These tests verify that warm
-init produces better first-iteration accuracy than cold (random) init.
+break symmetry before the first E-step: the window responsibilities seed one
+M-step so each discrete state's parameters start from its own windows. These
+tests verify that warm init produces better first-iteration accuracy than
+cold (random) init.
 """
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -13,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_models import DirectedInfluenceModel
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
@@ -66,9 +70,7 @@ def dim_simulation():
             [construct_directed_influence_measurement_matrix(n_osc)] * n_disc, axis=-1
         )
     )
-    R = np.array(
-        jnp.stack([jnp.eye(n_osc) * measurement_var] * n_disc, axis=-1)
-    )
+    R = np.array(jnp.stack([jnp.eye(n_osc) * measurement_var] * n_disc, axis=-1))
 
     p_stay = 1.0 - 2.0 / sampling_freq
     Z = np.array([[p_stay, 1 - p_stay], [1 - p_stay, p_stay]])
@@ -106,12 +108,8 @@ def _build_model(data):
         damping_coef=data["damping"],
         process_variance=data["process_var"],
         measurement_variance=data["measurement_var"],
-        phase_difference=jnp.zeros(
-            (data["n_osc"], data["n_osc"], data["n_disc"])
-        ),
-        coupling_strength=jnp.zeros(
-            (data["n_osc"], data["n_osc"], data["n_disc"])
-        ),
+        phase_difference=jnp.zeros((data["n_osc"], data["n_osc"], data["n_disc"])),
+        coupling_strength=jnp.zeros((data["n_osc"], data["n_osc"], data["n_disc"])),
         discrete_transition_diag=jnp.full((data["n_disc"],), true_p_stay),
     )
 
@@ -121,10 +119,21 @@ class TestWarmInitConvergence:
     """Warm init should give better first-iteration state segmentation."""
 
     def test_warm_init_first_iteration_accuracy(self, dim_simulation):
-        """Warm init should achieve higher accuracy after 1 E-step than cold init."""
+        """Warm init segments well at the very first E-step; cold init cannot.
+
+        The model starts from zero coupling, so every state's transition
+        matrix is identical and the first cold E-step posterior is just the
+        Markov-chain prior: its "accuracy" is the majority-class rate.  Warm
+        init seeds each state's dynamics with one M-step on its GMM window
+        cluster, so the first E-step already separates the states (observed
+        warm 0.84 vs cold 0.56, majority rate 0.52).  Before the seeding, warm
+        init only set the first-state prior and ``init_mean``, and both starts
+        sat at chance (the old xfail).
+        """
         data = dim_simulation
         obs = jnp.array(data["obs"])
         key = jax.random.PRNGKey(0)
+        majority = max(np.mean(data["true_states"]), 1 - np.mean(data["true_states"]))
 
         # Cold init: random parameters only
         model_cold = _build_model(data)
@@ -143,10 +152,32 @@ class TestWarmInitConvergence:
             data["true_states"], np.array(model_warm.smoother_discrete_state_prob)
         )
 
-        assert acc_warm > acc_cold, (
+        # Guard: the symmetric cold start really cannot segment.
+        assert abs(acc_cold - majority) < 0.08, (acc_cold, majority)
+        assert acc_warm > 0.75, f"warm init first E-step accuracy {acc_warm:.3f}"
+        assert acc_warm > acc_cold + 0.15, (
             f"Warm init accuracy ({acc_warm:.3f}) should exceed "
             f"cold init accuracy ({acc_cold:.3f}) after first E-step"
         )
+
+    def test_warm_init_seeds_distinct_state_dynamics(self, dim_simulation):
+        """The seeding M-step gives the states distinct transition matrices,
+        keeps the discrete transition matrix and clears the seeding posterior."""
+        data = dim_simulation
+        model = _build_model(data)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        A_cold = np.array(model.continuous_transition_matrix)
+        Z_cold = np.array(model.discrete_transition_matrix)
+        assert np.allclose(A_cold[..., 0], A_cold[..., 1])  # symmetric start
+        model._warm_initialize_states(jnp.array(data["obs"]))
+        A = np.array(model.continuous_transition_matrix)
+        # Observed 0.011: small, but enough for the first E-step to separate.
+        assert np.max(np.abs(A[..., 0] - A[..., 1])) > 5e-3
+        np.testing.assert_array_equal(
+            np.array(model.discrete_transition_matrix), Z_cold
+        )
+        with pytest.raises(NotFittedError):
+            _ = model.smoother_discrete_state_prob
 
     def test_warm_init_converges_to_higher_accuracy(self, dim_simulation):
         """Warm init should converge to a strictly higher, stable accuracy.

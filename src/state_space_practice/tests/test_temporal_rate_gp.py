@@ -19,12 +19,14 @@ import pytest
 from jax import random
 from scipy.special import gammaln
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.temporal_rate_gp import (
     TemporalRateGP,
     infer_log_rate,
     infer_log_rate_batch,
     poisson_log_rate_site,
 )
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 
 
 def _sample_matern32_latent(
@@ -57,7 +59,7 @@ def _dense_laplace_lgcp(
     lengthscale: float,
     mean: float = 0.0,
     n_newton: int = 300,
-    jitter: float = 1e-9,
+    jitter: float = 0.0,
     min_weight: float = 1e-9,
 ) -> tuple[np.ndarray, float]:
     """Return (posterior mode of the zero-mean latent g, Laplace log-evidence).
@@ -147,8 +149,9 @@ def test_posterior_mode_matches_dense_gp_laplace(small_counts):
     )
     result = infer_log_rate(small_counts, dt, variance, lengthscale, n_iter=40)
     # mean=0, so the returned log-rate mean IS the zero-mean latent g.
+    # Observed agreement ~1e-14 (the SSM prior reproduces the Gram exactly).
     np.testing.assert_allclose(
-        np.asarray(result.log_rate_mean), dense_g, atol=1e-4, rtol=1e-4
+        np.asarray(result.log_rate_mean), dense_g, atol=1e-10, rtol=1e-8
     )
 
 
@@ -159,9 +162,10 @@ def test_log_evidence_matches_dense_gp_laplace(small_counts):
         np.asarray(small_counts), dt, variance, lengthscale
     )
     result = infer_log_rate(small_counts, dt, variance, lengthscale, n_iter=40)
-    # An O(1)-or-worse error (the failure mode of an approximate energy) would
-    # blow past this; require agreement to a few 1e-2 on an O(10) quantity.
-    assert abs(float(result.log_marginal_likelihood) - dense_evidence) < 2e-2
+    # Observed agreement ~1e-14; an approximate energy would be off by O(1).
+    np.testing.assert_allclose(
+        float(result.log_marginal_likelihood), dense_evidence, rtol=1e-8
+    )
 
 
 def test_evidence_prefers_true_lengthscale_over_dense(small_counts):
@@ -181,6 +185,170 @@ def test_evidence_prefers_true_lengthscale_over_dense(small_counts):
         for ell in lengthscales
     ]
     assert int(np.argmax(ssm)) == int(np.argmax(dense))
+
+
+def test_default_iterations_converge_when_baseline_is_far_below_data():
+    """Regression: Newton is line-searched, so a low baseline cannot derail it.
+
+    With ``mean=0`` (the ``TemporalRateGP`` default) and a 50 Hz train in 4 ms
+    bins, the undamped first step overshot far above the mode and the default
+    25 iterations stopped with ``max_abs_update ~ 1``, a mean log-rate of 5.57
+    (converged: 4.15) and an evidence of -192.1 (converged: -144.2).
+    """
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(50.0 * 0.004, size=200).astype(float)
+    default = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0)
+    reference = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=200)
+    assert float(default.max_abs_update) < 1e-10
+    np.testing.assert_allclose(
+        np.asarray(default.log_rate_mean),
+        np.asarray(reference.log_rate_mean),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        float(default.log_marginal_likelihood),
+        float(reference.log_marginal_likelihood),
+        rtol=1e-10,
+    )
+    # the fitted log-rate sits near log(50 Hz), far from the baseline 0
+    assert abs(float(jnp.mean(default.log_rate_mean)) - np.log(50.0)) < 0.5
+
+
+def _far_baseline_counts() -> np.ndarray:
+    """A 50 Hz train in 4 ms bins: far above the default baseline 0, so a
+    single Newton step does not reach the mode."""
+    rng = np.random.default_rng(0)
+    return rng.poisson(50.0 * 0.004, size=200).astype(float)
+
+
+def test_unconverged_iteration_warns():
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    counts = _far_baseline_counts()
+    with pytest.warns(StateSpaceWarning, match="did not reach the posterior mode"):
+        result = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=1)
+    assert float(result.max_abs_update) > 1e-3  # guard: genuinely unconverged
+
+
+def test_unconverged_batch_counts_trains():
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    counts = np.stack([_far_baseline_counts(), _far_baseline_counts()])
+    with pytest.warns(StateSpaceWarning, match="for 2/2 spike train"):
+        infer_log_rate_batch(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=1)
+
+
+def test_fitted_model_warns_when_final_inference_is_unconverged():
+    """``fit_sgd`` reads the convergence diagnostic of its final inference."""
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    model = TemporalRateGP(dt=0.004, variance=1.0, lengthscale=1.0, n_iter=1)
+    with pytest.warns(StateSpaceWarning, match="did not reach the posterior mode"):
+        model.fit_sgd(_far_baseline_counts(), num_steps=1)
+
+
+@pytest.fixture
+def patch_traced_internals(monkeypatch):
+    """``monkeypatch`` for module globals read while the inference is traced.
+
+    The compiled inference bakes such globals in, so its cache is cleared
+    before the test (to re-trace with the patch) and after it (so the patched
+    program does not leak into later tests).
+    """
+    import state_space_practice.temporal_rate_gp as trg
+
+    def clear() -> None:
+        trg._infer_log_rate_jit.clear_cache()
+        trg._infer_log_rate_batch_jit.clear_cache()
+
+    clear()
+    yield monkeypatch
+    monkeypatch.undo()
+    clear()
+
+
+def test_nonfinite_merit_fallback_is_counted_and_warns(
+    small_counts, patch_traced_internals
+):
+    """A non-finite prior quadratic form (a lost Cholesky factor) makes the
+    merit non-finite: the full step is taken, counted and reported."""
+    import state_space_practice.temporal_rate_gp as trg
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    patch_traced_internals.setattr(
+        trg,
+        "_prior_whitened_residuals",
+        lambda states, *_: jnp.full(states.size, jnp.nan),
+    )
+    # The fallback steps need not reach the mode, so a non-convergence
+    # warning may accompany the fallback warning.
+    with pytest.warns(StateSpaceWarning) as record:
+        result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=3)
+    assert any("fell back in 3 iteration" in str(w.message) for w in record)
+    assert int(result.n_nonfinite_merit) == 3
+    assert int(result.n_unaccepted_steps) == 0
+
+
+def test_unaccepted_step_fallback_is_counted_and_warns(
+    small_counts, patch_traced_internals
+):
+    """When no trial step passes the Armijo test the smallest one is taken;
+    that fallback is counted and reported."""
+    import state_space_practice.temporal_rate_gp as trg
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    # A negative slack larger than any achievable increase rejects every step.
+    patch_traced_internals.setattr(trg, "_MERIT_RTOL", -1.0)
+    with pytest.warns(StateSpaceWarning) as record:
+        result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=3)
+    assert any("in 3 iteration(s) where no step" in str(w.message) for w in record)
+    assert int(result.n_unaccepted_steps) == 3
+    assert int(result.n_nonfinite_merit) == 0
+
+
+@pytest.fixture
+def backend_compiles():
+    """One entry per XLA backend compilation while the test runs."""
+    compiles: list[float] = []
+    event = "/jax/core/compile/backend_compile_duration"
+
+    def listener(name: str, duration: float, **kwargs: object) -> None:
+        if name == event:
+            compiles.append(duration)
+
+    with listen_to_jax_durations(listener):
+        yield compiles
+
+
+def test_repeat_inference_compiles_nothing(small_counts, backend_compiles):
+    """A repeat call with same-shaped inputs reuses the compiled inference, also
+    for new hyperparameter values."""
+    first = infer_log_rate(small_counts, 0.1, 1.5, 0.4, mean=0.2)
+    n_first = len(backend_compiles)
+    again = infer_log_rate(small_counts, 0.1, 1.5, 0.4, mean=0.2)
+    infer_log_rate(small_counts, 0.1, 0.7, 0.9, mean=-0.3)
+    assert n_first > 0  # guard: the listener sees compilations
+    assert len(backend_compiles) == n_first
+    for field, value in first._asdict().items():
+        np.testing.assert_array_equal(getattr(again, field), value)
+
+
+def test_repeat_batch_inference_compiles_nothing(multineuron_counts, backend_compiles):
+    infer_log_rate_batch(
+        multineuron_counts, 0.1, jnp.array([1.0, 0.5, 2.0, 1.5]), 0.4, mean=0.2
+    )
+    n_first = len(backend_compiles)
+    infer_log_rate_batch(
+        multineuron_counts, 0.1, jnp.array([2.0, 1.0, 0.3, 0.8]), 0.6, mean=0.1
+    )
+    assert n_first > 0  # guard: the listener sees compilations
+    assert len(backend_compiles) == n_first
+
+
+def test_converged_inference_reports_no_fallbacks(small_counts):
+    result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=40)
+    assert int(result.n_nonfinite_merit) == 0
+    assert int(result.n_unaccepted_steps) == 0
 
 
 def test_laplace_iteration_converges(small_counts):
@@ -219,7 +387,7 @@ def test_nonzero_mean_offsets_log_rate(small_counts):
     )
     # Returned log-rate mean is f = mean + g.
     np.testing.assert_allclose(
-        np.asarray(result.log_rate_mean), mean + dense_g, atol=1e-4, rtol=1e-4
+        np.asarray(result.log_rate_mean), mean + dense_g, atol=1e-10, rtol=1e-8
     )
 
 
@@ -291,13 +459,136 @@ def test_evidence_gradient_matches_finite_difference(small_counts):
     np.testing.assert_allclose(np.asarray(grad), fd, rtol=1e-3, atol=1e-3)
 
 
+@pytest.fixture
+def sinusoid_counts() -> np.ndarray:
+    """60 bins of a ~3 Hz sinusoidally modulated train (dt = 0.1 s)."""
+    rng = np.random.default_rng(0)
+    rate = np.exp(1.0 + np.sin(np.arange(60) / 5.0))
+    return rng.poisson(rate * 0.1).astype(float)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "variance, lengthscale, mean",
+    [(1.0, 0.5, 0.5), (2.0, 0.2, -0.5), (0.3, 1.5, 1.5)],
+)
+def test_evidence_gradient_in_all_hyperparameters_matches_finite_difference(
+    sinusoid_counts, variance, lengthscale, mean
+):
+    """The evidence gradient in (log variance, log lengthscale, mean) is the
+    exact derivative: it matches central differences of the converged evidence
+    to near round-off, from mean values on both sides of the data's rate."""
+
+    def log_evidence(theta):
+        return infer_log_rate(
+            sinusoid_counts, 0.1, jnp.exp(theta[0]), jnp.exp(theta[1]), theta[2]
+        ).log_marginal_likelihood
+
+    theta = jnp.array([np.log(variance), np.log(lengthscale), mean])
+    grad = np.asarray(jax.grad(log_evidence)(theta))
+    eps = 1e-5
+    fd = np.array(
+        [
+            (
+                float(log_evidence(theta.at[i].add(eps)))
+                - float(log_evidence(theta.at[i].add(-eps)))
+            )
+            / (2 * eps)
+            for i in range(3)
+        ]
+    )
+    assert np.all(np.abs(fd) > 1e-2)  # guard: a non-trivial gradient
+    np.testing.assert_allclose(grad, fd, rtol=1e-6)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("output", ["log_rate_sum", "log_evidence"])
+def test_gradient_is_exact_when_the_fisher_weight_floor_binds(output):
+    """With min_weight above the mode's expected counts the Newton iteration is
+    quasi-Newton (floored weights), so its last step's derivative is not the
+    mode's derivative; the gradient must still match central differences."""
+    counts = jnp.asarray([0.0] * 10 + [1.0] * 10)
+    dt, min_weight, n_iter = 0.1, 0.2, 200
+
+    def f(theta):
+        result = infer_log_rate(
+            counts,
+            dt,
+            jnp.exp(theta[0]),
+            jnp.exp(theta[1]),
+            theta[2],
+            n_iter=n_iter,
+            min_weight=min_weight,
+        )
+        if output == "log_rate_sum":
+            return jnp.sum(result.log_rate_mean)
+        return result.log_marginal_likelihood
+
+    theta = jnp.array([np.log(2.0), np.log(0.3), 0.0])
+    converged = infer_log_rate(
+        counts, dt, 2.0, 0.3, 0.0, n_iter=n_iter, min_weight=min_weight
+    )
+    # Guards: converged, and the floor binds at the mode.
+    assert float(converged.max_abs_update) < 1e-10
+    assert np.any(np.exp(np.asarray(converged.log_rate_mean)) * dt < min_weight)
+
+    grad = np.asarray(jax.grad(f)(theta))
+    eps = 1e-5
+    fd = np.array(
+        [
+            (float(f(theta.at[i].add(eps))) - float(f(theta.at[i].add(-eps))))
+            / (2 * eps)
+            for i in range(3)
+        ]
+    )
+    assert np.all(np.abs(fd) > 1e-2)  # guard: a non-trivial gradient
+    np.testing.assert_allclose(grad, fd, rtol=1e-5)
+
+
+@pytest.mark.slow
+def test_evidence_gradient_memory_does_not_grow_with_newton_iterations():
+    """Only the converged Newton step is differentiated, so the gradient keeps
+    no per-iteration residuals: its compiled temporary memory is (nearly) the
+    same for 5 and 40 Newton iterations rather than ~8x larger."""
+    from state_space_practice.temporal_rate_gp import _infer_log_rate_traced
+
+    rng = np.random.default_rng(0)
+    counts = jnp.asarray(rng.poisson(2.0 * 0.05, size=200).astype(float))
+    theta = jnp.array([0.0, np.log(0.5), 0.5])
+
+    def gradient_temp_bytes(n_iter: int) -> int:
+        def log_evidence(theta):
+            return _infer_log_rate_traced(
+                counts,
+                0.05,
+                jnp.exp(theta[0]),
+                jnp.exp(theta[1]),
+                theta[2],
+                n_iter,
+                1e-9,
+            ).log_marginal_likelihood
+
+        compiled = jax.jit(jax.grad(log_evidence)).lower(theta).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    assert gradient_temp_bytes(40) < 1.5 * gradient_temp_bytes(5)
+
+
 # --- TemporalRateGP model class -----------------------------------------------
 
 
 def test_predict_before_fit_raises():
     model = TemporalRateGP(dt=0.1)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(NotFittedError, match="fit_sgd"):
         model.predict_rate()
+
+
+@pytest.mark.parametrize("attr", ["log_rate_mean_", "log_marginal_likelihood_"])
+def test_fitted_attribute_unset_before_fit(attr):
+    model = TemporalRateGP(dt=0.1)
+    with pytest.raises(NotFittedError, match=attr):
+        getattr(model, attr)
+    assert not hasattr(model, attr)
 
 
 @pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
@@ -455,9 +746,7 @@ def test_batch_inference_rejects_empty_counts():
 
 
 @pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
-def test_batch_inference_rejects_invalid_min_weight(
-    multineuron_counts, bad_min_weight
-):
+def test_batch_inference_rejects_invalid_min_weight(multineuron_counts, bad_min_weight):
     with pytest.raises(ValueError, match="min_weight"):
         infer_log_rate_batch(
             multineuron_counts,
@@ -511,6 +800,35 @@ def test_fit_sgd_multineuron_per_neuron_hyperparameters(multineuron_counts):
     model.fit_sgd(multineuron_counts, num_steps=4)
     assert np.asarray(model.variance_).shape == (n_neurons,)
     assert np.asarray(model.lengthscale_).shape == (n_neurons,)
+
+
+@pytest.mark.parametrize("n_neurons", [1, 3])
+@pytest.mark.parametrize("share_hyperparameters", [True, False])
+def test_fit_sgd_traces_the_train_step_once(
+    multineuron_counts, monkeypatch, n_neurons, share_hyperparameters
+):
+    """One ``fit_sgd`` traces (and compiles) its SGD step once: the initial
+    parameters have the same (strong) dtype as the optimizer's updates, so the
+    second step does not re-trace."""
+    from state_space_practice import sgd_fitting
+
+    traces: list[None] = []
+    record_trace = sgd_fitting._CompiledSGDStep.record_trace
+
+    def counting_record_trace(self, *args, **kwargs):  # runs once per trace
+        traces.append(None)
+        return record_trace(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sgd_fitting._CompiledSGDStep, "record_trace", counting_record_trace
+    )
+    counts = multineuron_counts[0] if n_neurons == 1 else multineuron_counts[:3]
+    model = TemporalRateGP(
+        dt=0.1, n_iter=8, share_hyperparameters=share_hyperparameters
+    )
+    history = model.fit_sgd(counts, num_steps=3)
+    assert len(history) == 3  # guard: every step ran
+    assert len(traces) == 1
 
 
 def test_single_neuron_path_unchanged_by_batch_support(small_counts):

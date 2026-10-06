@@ -16,7 +16,13 @@ Per cell it reports, for each method:
 - ``phase_mae`` — circular mean abs error of the recovered preferred phase.
 
 plus ``ekf_pg_mean_maxdiff``: the max abs difference between the EKF and PG
-posterior means (how much the two methods disagree), and shared latent plug-in
+posterior means (how much the two methods disagree); ``pg_mean_mcse_max``: the
+largest batch-means Monte Carlo standard error of a PG posterior mean (the
+resolution at which the chain can see a disagreement at all);
+``ekf_pg_mean_max_z``: the largest per-component ``|EKF - PG| / MCSE``, which is
+O(1) when the two posteriors share a mean and grows with the chain length when
+the Laplace mode and the exact posterior mean genuinely differ (small samples,
+skewed posteriors). Shared latent plug-in
 diagnostics: ``latent_correlation``, ``latent_rmse``, and
 ``latent_variance_ratio`` between the LFP-smoothed design and simulated truth.
 
@@ -24,17 +30,22 @@ Requires float64 and the ``coupling`` extra (``polyagamma``).
 """
 
 import operator
+from collections.abc import Iterable
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from state_space_practice.coupling_ekf import fit_coupling_ekf
 from state_space_practice.coupling_model import (
     CouplingModelParams,
+    SimulatedCoupling,
     smooth_latent_from_lfp,
 )
 from state_space_practice.coupling_pg import fit_coupling_pg
 from state_space_practice.coupling_validation import (
     CouplingPosterior,
+    batch_means_mcse,
     phase_recovery_mae,
     roc_auc,
     summarize_posterior,
@@ -61,7 +72,7 @@ def scale_coupling(params: CouplingModelParams, scale: float) -> CouplingModelPa
     )
 
 
-def _score(post: CouplingPosterior, sim) -> dict:
+def _score(post: CouplingPosterior, sim: SimulatedCoupling) -> dict[str, float]:
     """Score one posterior against simulated ground truth."""
     mask = np.asarray(sim.coupling_mask)
     true_real = np.asarray(sim.beta_real_true)
@@ -109,7 +120,45 @@ def _score(post: CouplingPosterior, sim) -> dict:
     }
 
 
-def _latent_plugin_diagnostics(sim) -> dict:
+def _mean_disagreement(
+    ekf: CouplingPosterior, pg: CouplingPosterior
+) -> dict[str, float]:
+    """EKF-vs-PG posterior-mean disagreement on the PG Monte Carlo error scale.
+
+    Returns ``ekf_pg_mean_maxdiff`` (max abs mean difference over all real and
+    imaginary components), ``pg_mean_mcse_max`` (largest batch-means MCSE of a PG
+    mean) and ``ekf_pg_mean_max_z`` (largest per-component difference divided by
+    that component's MCSE). The z-score needs ``pg.samples`` with at least two
+    draws per batch; otherwise the two MCSE keys are ``nan``.
+    """
+    diff = np.concatenate(
+        [
+            (np.asarray(ekf.beta_real_mean) - np.asarray(pg.beta_real_mean)).ravel(),
+            (np.asarray(ekf.beta_imag_mean) - np.asarray(pg.beta_imag_mean)).ravel(),
+        ]
+    )
+    out = {
+        "ekf_pg_mean_maxdiff": float(np.max(np.abs(diff))),
+        "pg_mean_mcse_max": float("nan"),
+        "ekf_pg_mean_max_z": float("nan"),
+    }
+    n_batches = 20
+    if pg.samples is None or np.shape(pg.samples)[0] < 2 * n_batches:
+        return out
+    samples = np.asarray(pg.samples)
+    mcse = np.concatenate(
+        [
+            batch_means_mcse(samples.real, n_batches).ravel(),
+            batch_means_mcse(samples.imag, n_batches).ravel(),
+        ]
+    )
+    out["pg_mean_mcse_max"] = float(np.max(mcse))
+    if np.all(mcse > 0.0):
+        out["ekf_pg_mean_max_z"] = float(np.max(np.abs(diff) / mcse))
+    return out
+
+
+def _latent_plugin_diagnostics(sim: SimulatedCoupling) -> dict[str, float]:
     """Compare the shared plug-in smoother mean to the simulator's true latent."""
     if not all(hasattr(sim, name) for name in ("latent_true", "lfp", "params")):
         return {}
@@ -143,13 +192,13 @@ def _latent_plugin_diagnostics(sim) -> dict:
 
 def run_crosscheck(
     base_params: CouplingModelParams,
-    scales,
+    scales: Iterable[float],
     n_time: int,
     n_replicates: int,
     seed: int = 0,
     pg_n_iter: int = 400,
     pg_burn_in: int = 200,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Sweep coupling strength and compare EKF vs PG posteriors on identical data.
 
     Parameters
@@ -171,8 +220,10 @@ def run_crosscheck(
     -------
     list of dict
         One record per (scale, replicate) with keys ``scale``, ``coupling_mag``,
-        ``replicate``, ``ekf`` (dict from :func:`_score`), ``pg`` (dict), and
-        ``ekf_pg_mean_maxdiff``. Simulated runs also include
+        ``replicate``, ``ekf`` (dict from :func:`_score`), ``pg`` (dict),
+        ``ekf_pg_mean_maxdiff``, ``pg_mean_mcse_max`` and ``ekf_pg_mean_max_z``
+        (see :func:`_mean_disagreement`; the MCSE keys are ``nan`` when fewer
+        than 40 PG draws are kept). Simulated runs also include
         ``latent_correlation``, ``latent_rmse``, and ``latent_variance_ratio`` for
         the shared plug-in latent design.
     """
@@ -218,24 +269,6 @@ def run_crosscheck(
                 burn_in=pg_burn_in,
                 seed=cell_seed,
             )
-            mean_maxdiff = float(
-                np.max(
-                    np.abs(
-                        np.concatenate(
-                            [
-                                (
-                                    np.asarray(ekf.beta_real_mean)
-                                    - np.asarray(pg.beta_real_mean)
-                                ).ravel(),
-                                (
-                                    np.asarray(ekf.beta_imag_mean)
-                                    - np.asarray(pg.beta_imag_mean)
-                                ).ravel(),
-                            ]
-                        )
-                    )
-                )
-            )
             records.append(
                 {
                     "scale": float(scale),
@@ -243,34 +276,37 @@ def run_crosscheck(
                     "replicate": replicate,
                     "ekf": _score(ekf, sim),
                     "pg": _score(pg, sim),
-                    "ekf_pg_mean_maxdiff": mean_maxdiff,
+                    **_mean_disagreement(ekf, pg),
                     **latent_diagnostics,
                 }
             )
     return records
 
 
-def aggregate(records: list[dict]) -> dict:
+def aggregate(records: list[dict[str, Any]]) -> dict[float, dict[str, Any]]:
     """Average each metric across replicates, grouped by coupling magnitude.
 
     Returns a dict keyed by rounded ``coupling_mag`` -> {method -> {metric -> mean},
-    ``ekf_pg_mean_maxdiff`` -> mean, and mean latent diagnostics when present}.
+    ``ekf_pg_mean_maxdiff`` -> mean, and the means of ``pg_mean_mcse_max``,
+    ``ekf_pg_mean_max_z`` and the latent diagnostics when present}.
     """
     if not records:
         raise ValueError("records must contain at least one crosscheck result.")
 
-    by_mag: dict = {}
+    by_mag: dict[float, list[dict[str, Any]]] = {}
     for record in records:
         by_mag.setdefault(round(record["coupling_mag"], 4), []).append(record)
     out = {}
     for mag, cell in by_mag.items():
-        summary = {
+        summary: dict[str, Any] = {
             "n": len(cell),
             "ekf_pg_mean_maxdiff": float(
                 np.mean([c["ekf_pg_mean_maxdiff"] for c in cell])
             ),
         }
         for metric in (
+            "pg_mean_mcse_max",
+            "ekf_pg_mean_max_z",
             "latent_correlation",
             "latent_rmse",
             "latent_variance_ratio",
@@ -286,7 +322,7 @@ def aggregate(records: list[dict]) -> dict:
     return out
 
 
-def _mean_ignore_nan(values) -> float:
+def _mean_ignore_nan(values: npt.ArrayLike) -> float:
     """Mean of finite values, or NaN when every value is undefined."""
     values = np.asarray(values, dtype=float)
     finite = values[np.isfinite(values)]

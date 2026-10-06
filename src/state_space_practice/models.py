@@ -1,16 +1,48 @@
+import functools
+import logging
 import warnings
-from typing import Callable
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import psd_solve, stabilize_covariance
-from state_space_practice.point_process_kalman import _safe_expected_count
+from state_space_practice.point_process_kalman import (  # noqa: F401 -- re-exports
+    _safe_expected_count,
+    steepest_descent_point_process_filter,
+)
+from state_space_practice.point_process_kalman import (
+    get_confidence_interval as _get_confidence_interval,
+)
+from state_space_practice.utils import (
+    clip_eigenvalues_relative,
+    contains_tracer,
+    psd_solve,
+    typed_jit,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
+    """Log firing rate of a 1D Gaussian place field.
+
+    ``log(rate) = log_max_rate - (position - center)**2 / (2 * scale**2)``.
+
+    Parameters
+    ----------
+    position : ArrayLike, scalar or shape (n_time,)
+        Position(s) at which to evaluate the field.
+    params : ArrayLike, shape (3,)
+        ``(log_max_rate, place_field_center, scale)``: log of the peak rate,
+        field center (same units as ``position``) and Gaussian width.
+
+    Returns
+    -------
+    log_rate : Array, same shape as ``position``
+        Log firing rate at each position.
+    """
     params_arr = jnp.asarray(params)
     log_max_rate, place_field_center, scale = params_arr
     result: Array = log_max_rate - (jnp.asarray(position) - place_field_center) ** 2 / (
@@ -32,12 +64,12 @@ def stochastic_point_process_filter(
 ) -> tuple[Array, Array]:
     """Stochastic State Point Process Filter (SSPPF).
 
-    .. deprecated::
+    .. deprecated:: 0.1.0
         This implementation uses the **observed Hessian** (not Fisher scoring)
         and may produce indefinite posterior precision matrices. Use
         :func:`point_process_kalman.stochastic_point_process_filter` instead,
         which uses Fisher scoring and is numerically more stable. This function
-        will be removed in a future version.
+        will be removed in version 0.2.0.
 
     Parameters
     ----------
@@ -72,27 +104,68 @@ def stochastic_point_process_filter(
     warnings.warn(
         "stochastic_point_process_filter in models.py uses the observed Hessian "
         "(not Fisher scoring) and may produce indefinite posterior precision. "
-        "Use point_process_kalman.stochastic_point_process_filter instead.",
+        "Use point_process_kalman.stochastic_point_process_filter instead. "
+        "It will be removed in version 0.2.0.",
         DeprecationWarning,
         stacklevel=2,
     )
-    # Convert ArrayLike inputs to Array for internal use
-    init_mode_params_arr: Array = jnp.asarray(init_mode_params)
-    init_covariance_params_arr: Array = jnp.asarray(init_covariance_params)
-    x_arr: Array = jnp.asarray(x)
-    spike_indicator_arr: Array = jnp.asarray(spike_indicator)
-    transition_matrix_arr: Array = jnp.asarray(transition_matrix)
-    latent_state_covariance_arr: Array = jnp.asarray(latent_state_covariance)
+    posterior_mode, posterior_covariance, n_floored = (
+        _stochastic_point_process_filter_impl(
+            jnp.asarray(init_mode_params),
+            jnp.asarray(init_covariance_params),
+            jnp.asarray(x),
+            jnp.asarray(spike_indicator),
+            dt,
+            jnp.asarray(transition_matrix),
+            jnp.asarray(latent_state_covariance),
+            log_receptive_field_model=log_receptive_field_model,
+        )
+    )
+    if not contains_tracer(n_floored) and int(n_floored) > 0:
+        logger.warning(
+            "models.stochastic_point_process_filter: raised %d eigenvalue(s) "
+            "of the posterior precision / covariance to the scale-relative "
+            "PSD floor (the observed-Hessian update was indefinite). Use "
+            "point_process_kalman.stochastic_point_process_filter instead.",
+            int(n_floored),
+        )
+    return posterior_mode, posterior_covariance
 
+
+@functools.partial(typed_jit, static_argnames=("log_receptive_field_model",))
+def _stochastic_point_process_filter_impl(
+    init_mode_params: Array,
+    init_covariance_params: Array,
+    x: Array,
+    spike_indicator: Array,
+    dt: float,
+    transition_matrix: Array,
+    latent_state_covariance: Array,
+    *,
+    log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
+) -> tuple[Array, Array, Array]:
+    """Jitted scan of the deprecated observed-Hessian SSPPF.
+
+    ``log_receptive_field_model`` is static (hashed by identity), so repeated
+    calls with the same model function reuse one compilation; ``dt`` and all
+    arrays are traced.
+
+    Returns
+    -------
+    posterior_mode : Array, shape (n_time, n_params)
+    posterior_covariance : Array, shape (n_time, n_params, n_params)
+    n_floored : Array
+        Total number of eigenvalues raised to the relative PSD floor.
+    """
     # Compute the gradient and hessian of the log receptive field model
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
     hess_log_receptive_field_model = jax.hessian(log_receptive_field_model, argnums=1)
 
     # Define the update step
     def _update(
-        params_prev: tuple[Array, Array],
+        params_prev: tuple[Array, Array, Array],
         args: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step
 
         F : transition matrix
@@ -104,14 +177,14 @@ def stochastic_point_process_filter(
         """
 
         # Unpack previous parameters
-        mode_prev, covariance_prev = params_prev
+        mode_prev, covariance_prev, n_floored = params_prev
         x_t, spike_indicator_t = args
 
         # One-step prediction
-        one_step_mean = transition_matrix_arr @ mode_prev
+        one_step_mean = transition_matrix @ mode_prev
         one_step_variance = (
-            transition_matrix_arr @ covariance_prev @ transition_matrix_arr.T
-            + latent_state_covariance_arr
+            transition_matrix @ covariance_prev @ transition_matrix.T
+            + latent_state_covariance
         )
 
         # Compute the conditional intensity and innovation
@@ -134,30 +207,31 @@ def stochastic_point_process_filter(
             + (one_step_grad.T * conditional_intensity @ one_step_grad)
             - innovation * one_step_hess
         )
-        inverse_posterior_covariance = stabilize_covariance(
-            inverse_posterior_covariance, min_eigenvalue=1e-9
+        # Scale-relative eigenvalue floors (the observed Hessian can make the
+        # precision indefinite); counted and reported once after the scan.
+        inverse_posterior_covariance, n_prec = clip_eigenvalues_relative(
+            inverse_posterior_covariance
         )
         posterior_covariance = psd_solve(inverse_posterior_covariance, identity)
-        posterior_covariance = stabilize_covariance(
-            posterior_covariance, min_eigenvalue=1e-9
-        )
+        posterior_covariance, n_cov = clip_eigenvalues_relative(posterior_covariance)
 
         # sum over one_step_grad.squeeze() * innovation if multiple neurons
         posterior_mode = one_step_mean + posterior_covariance @ (
             one_step_grad.squeeze() * innovation
         )
 
-        return (posterior_mode, posterior_covariance), (
+        return (posterior_mode, posterior_covariance, n_floored + n_prec + n_cov), (
             posterior_mode,
             posterior_covariance,
         )
 
     # Run the SSPPF
-    return jax.lax.scan(
+    (_, _, n_floored), (posterior_mode, posterior_covariance) = jax.lax.scan(
         _update,
-        (init_mode_params_arr, init_covariance_params_arr),
-        (x_arr, spike_indicator_arr),
-    )[1]
+        (init_mode_params, init_covariance_params, jnp.zeros((), dtype=jnp.int32)),
+        (x, spike_indicator),
+    )
+    return posterior_mode, posterior_covariance, n_floored
 
 
 def get_confidence_interval(
@@ -173,81 +247,11 @@ def get_confidence_interval(
         Significance level in ``(0, 1)``, by default ``0.05``. Returns a
         ``1 - alpha`` confidence interval (i.e. the default 0.05 gives a
         95% CI, not a 5% CI). Matches the default in
-        :func:`point_process_kalman.get_confidence_interval`.
-    """
-    posterior_mode = jnp.asarray(posterior_mode)
-    posterior_covariance = jnp.asarray(posterior_covariance)
-    z = jax.scipy.stats.norm.ppf(1 - alpha / 2)
-    ci = z * jnp.sqrt(
-        jnp.diagonal(posterior_covariance, axis1=-2, axis2=-1)
-    )  # shape (n_time, n_params)
-
-    return jnp.stack((posterior_mode - ci, posterior_mode + ci), axis=-1)
-
-
-def steepest_descent_point_process_filter(
-    init_mean_params: ArrayLike,
-    x: ArrayLike,
-    spike_indicator: ArrayLike,
-    dt: float,
-    epsilon: ArrayLike,
-    log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
-) -> Array:
-    """Steepest Descent Point Process Filter (SDPPF)
-
-    Parameters
-    ----------
-    init_mean_params : ArrayLike, shape (n_params,)
-    x : ArrayLike, shape (n_time,)
-        Continuous-valued input signal
-    spike_indicator : ArrayLike, shape (n_time,)
-        Spike count
-    dt : float
-        Time step
-    epsilon : ArrayLike, shape (n_params, n_params)
-        Learning rate
-    log_receptive_field_model : callable
-        Function that takes in `x` and parameters and returns the log spike rate
+        :func:`point_process_kalman.get_confidence_interval`, which computes it.
 
     Returns
     -------
-    posterior_mode : Array, shape (n_time, n_params)
-
-    References
-    ----------
-    .. [1] Brown, E.N., Nguyen, D.P., Frank, L.M., Wilson, M.A., and Solo, V. (2001).
-    An analysis of neural receptive field plasticity by point process adaptive filtering.
-    Proceedings of the National Academy of Sciences 98, 12261–12266.
-    https://doi.org/10.1073/pnas.201409398.
-
-    .. [2] Eden, U. T., Frank, L. M., Barbieri, R., Solo, V. & Brown, E. N.
-      Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
-      Neural Computation 16, 971-998 (2004).
-
-    Notes
-    -----
-    Equation in [1] is for the likelihood while in [2] it is for the log likelihood.
-    This implementation follows the formulation in [2].
-
+    ci : Array, shape (n_time, n_params, 2)
+        Lower and upper bounds, ``posterior_mode -/+ z * sqrt(diag(cov))``.
     """
-    # Convert ArrayLike inputs to Array for internal use
-    init_mean_params_arr: Array = jnp.asarray(init_mean_params)
-    x_arr: Array = jnp.asarray(x)
-    spike_indicator_arr: Array = jnp.asarray(spike_indicator)
-    epsilon_arr: Array = jnp.asarray(epsilon)
-
-    grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
-
-    def _update(mode_prev: Array, args: tuple[Array, Array]) -> tuple[Array, Array]:
-        """Steepest Descent Point Process Filter update step"""
-        x_t, spike_indicator_t = args
-        conditional_intensity = _safe_expected_count(
-            log_receptive_field_model(x_t, mode_prev), dt
-        )
-        innovation = spike_indicator_t - conditional_intensity
-        one_step_grad = grad_log_receptive_field_model(x_t, mode_prev)
-        posterior_mode = mode_prev + epsilon_arr @ one_step_grad * innovation
-
-        return posterior_mode, posterior_mode
-
-    return jax.lax.scan(_update, init_mean_params_arr, (x_arr, spike_indicator_arr))[1]
+    return _get_confidence_interval(posterior_mode, posterior_covariance, alpha=alpha)

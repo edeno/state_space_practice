@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 """Tests for oscillator connectivity regularization penalties."""
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -7,6 +8,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.extend.core import ClosedJaxpr, Jaxpr
 
 from state_space_practice.oscillator_regularization import (
     OscillatorPenaltyConfig,
@@ -48,10 +50,12 @@ class TestEdgeL1Penalty:
 
 class TestAreaGroupPenalty:
     def test_groups_by_area_labels(self):
-        coupling = jnp.array([
-            [[0.0, 1.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
-            [[0.0, 2.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
-        ])
+        coupling = jnp.array(
+            [
+                [[0.0, 1.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[0.0, 2.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ]
+        )
         area_labels = jnp.array([0, 0, 1])
         value = area_group_penalty(coupling, area_labels)
         assert value > 0.0
@@ -91,14 +95,18 @@ class TestAreaGroupPenalty:
 
 class TestStateSharedAreaPenalty:
     def test_invariant_to_state_permutation(self):
-        coupling = jnp.array([
-            [[0.0, 1.0], [0.5, 0.0]],
-            [[0.0, 2.0], [0.5, 0.0]],
-            [[0.0, 0.5], [1.0, 0.0]],
-        ])
+        coupling = jnp.array(
+            [
+                [[0.0, 1.0], [0.5, 0.0]],
+                [[0.0, 2.0], [0.5, 0.0]],
+                [[0.0, 0.5], [1.0, 0.0]],
+            ]
+        )
         area_labels = jnp.array([0, 1])
         original = state_shared_area_penalty(coupling, area_labels)
-        permuted = state_shared_area_penalty(coupling[jnp.array([2, 0, 1])], area_labels)
+        permuted = state_shared_area_penalty(
+            coupling[jnp.array([2, 0, 1])], area_labels
+        )
         np.testing.assert_allclose(float(original), float(permuted), atol=1e-10)
 
     def test_reduces_to_area_penalty_for_single_state(self):
@@ -119,6 +127,112 @@ class TestStateSharedAreaPenalty:
         area_labels = jnp.array([0, 0, 1])
         g = jax.grad(lambda c: state_shared_area_penalty(c, area_labels))(coupling)
         assert jnp.all(jnp.isfinite(g))
+
+
+def _reference_block_sq(coupling, labels, exclude_diagonal):
+    """(n_states, n_areas, n_areas) sums of squared coupling per area pair,
+    accumulated entry by entry."""
+    c = np.asarray(coupling, dtype=float)
+    if exclude_diagonal:
+        c = c * (1.0 - np.eye(c.shape[-1]))
+    n_areas = int(labels.max()) + 1
+    block_sq = np.zeros((c.shape[0], n_areas, n_areas))
+    for i, a in enumerate(labels):
+        for j, b in enumerate(labels):
+            block_sq[:, a, b] += c[:, i, j] ** 2
+    return c, block_sq
+
+
+def _all_jaxpr_avals(jaxpr):
+    """Every intermediate abstract value of a (closed) jaxpr, recursively."""
+    if isinstance(jaxpr, ClosedJaxpr):
+        jaxpr = jaxpr.jaxpr
+    for eqn in jaxpr.eqns:
+        yield from (v.aval for v in eqn.outvars)
+        # Jaxpr and ClosedJaxpr are available on the oldest supported JAX;
+        # jaxprs_in_params was added after the Python 3.10 / JAX 0.6.2 pin.
+        for value in eqn.params.values():
+            values = value if isinstance(value, (tuple, list)) else (value,)
+            for sub in values:
+                if isinstance(sub, (Jaxpr, ClosedJaxpr)):
+                    yield from _all_jaxpr_avals(sub)
+
+
+@pytest.fixture(scope="module")
+def random_area_problem():
+    rng = np.random.default_rng(7)
+    n_states, n_osc, n_areas = 3, 11, 4
+    labels = rng.permutation(
+        np.concatenate([np.arange(n_areas), rng.integers(0, n_areas, n_osc - n_areas)])
+    )
+    coupling = rng.normal(size=(n_states, n_osc, n_osc))
+    return coupling, labels
+
+
+class TestAreaPenaltyBlockSums:
+    """Area penalties against an entry-by-entry reference on random inputs."""
+
+    @pytest.mark.parametrize("exclude_diagonal", [True, False])
+    def test_area_group_penalty_value_and_gradient(
+        self, random_area_problem, exclude_diagonal
+    ):
+        coupling, labels = random_area_problem
+        eps = 1e-8
+        c, block_sq = _reference_block_sq(coupling, labels, exclude_diagonal)
+        expected = np.sum(np.sqrt(block_sq + eps) - np.sqrt(eps))
+        # d/dc_sij sqrt(B_s,a(i),b(j) + eps) = c_sij / sqrt(B + eps).
+        expected_grad = c / np.sqrt(block_sq[:, labels][:, :, labels] + eps)
+
+        value, grad = jax.value_and_grad(area_group_penalty)(
+            jnp.asarray(coupling),
+            jnp.asarray(labels),
+            eps=eps,
+            exclude_diagonal=exclude_diagonal,
+        )
+
+        np.testing.assert_allclose(float(value), expected, rtol=1e-13)
+        np.testing.assert_allclose(grad, expected_grad, rtol=1e-12, atol=1e-15)
+
+    @pytest.mark.parametrize("exclude_diagonal", [True, False])
+    def test_state_shared_penalty_value_and_gradient(
+        self, random_area_problem, exclude_diagonal
+    ):
+        coupling, labels = random_area_problem
+        eps = 1e-8
+        c, block_sq = _reference_block_sq(coupling, labels, exclude_diagonal)
+        pooled = block_sq.sum(axis=0)
+        expected = np.sum(np.sqrt(pooled + eps) - np.sqrt(eps))
+        expected_grad = c / np.sqrt(pooled[labels][:, labels] + eps)[None]
+
+        value, grad = jax.value_and_grad(state_shared_area_penalty)(
+            jnp.asarray(coupling),
+            jnp.asarray(labels),
+            eps=eps,
+            exclude_diagonal=exclude_diagonal,
+        )
+
+        np.testing.assert_allclose(float(value), expected, rtol=1e-13)
+        np.testing.assert_allclose(grad, expected_grad, rtol=1e-12, atol=1e-15)
+
+    def test_summary_block_norms_match_reference(self, random_area_problem):
+        coupling, labels = random_area_problem
+        _, block_sq = _reference_block_sq(coupling, labels, exclude_diagonal=True)
+        summary = get_area_coupling_summary(coupling, labels)
+        np.testing.assert_allclose(
+            summary["block_norms"], np.sqrt(block_sq), rtol=1e-13
+        )
+
+    @pytest.mark.parametrize("penalty", [area_group_penalty, state_shared_area_penalty])
+    def test_memory_is_not_quartic_in_n_osc(self, penalty):
+        """No intermediate of the penalty or its gradient grows as n_osc**4
+        (a 4-D area-pair mask is ~800 MB at n_osc = 100)."""
+        n_states, n_osc = 2, 16
+        coupling = jnp.ones((n_states, n_osc, n_osc))
+        labels = jnp.arange(n_osc) % 3
+        jaxpr = jax.make_jaxpr(jax.value_and_grad(penalty))(coupling, labels)
+        largest = max(int(np.prod(aval.shape)) for aval in _all_jaxpr_avals(jaxpr))
+        assert largest >= n_states * n_osc**2  # guard: saw the coupling-sized values
+        assert largest < n_osc**4
 
 
 class TestOscillatorPenaltyConfig:
@@ -180,9 +294,7 @@ class TestOscillatorPenaltyConfig:
         p_100 = total_connectivity_penalty(coupling, config, n_timesteps=100)
         p_1000 = total_connectivity_penalty(coupling, config, n_timesteps=1000)
         # After dividing by T: p_100/100 ≈ p_1000/1000
-        np.testing.assert_allclose(
-            float(p_100) / 100, float(p_1000) / 1000, rtol=1e-10
-        )
+        np.testing.assert_allclose(float(p_100) / 100, float(p_1000) / 1000, rtol=1e-10)
 
     def test_scale_with_length_true(self):
         """scale_with_length=True: raw penalty, no T scaling."""
@@ -261,7 +373,9 @@ class TestRegularizedSGDIntegration:
         )
         config = OscillatorPenaltyConfig(edge_l1=0.5)
         model_reg.fit_sgd(
-            scenario["obs"], key=key, num_steps=40,
+            scenario["obs"],
+            key=key,
+            num_steps=40,
             connectivity_penalty=config,
         )
 
@@ -291,11 +405,14 @@ class TestRegularizedSGDIntegration:
         )
         area_labels = jnp.array([0, 1])  # 2 oscillators, 2 areas
         config = OscillatorPenaltyConfig(
-            area_group_l2=1.0, area_labels=area_labels,
+            area_group_l2=1.0,
+            area_labels=area_labels,
         )
         key = jax.random.PRNGKey(0)
         lls = model.fit_sgd(
-            scenario["obs"], key=key, num_steps=30,
+            scenario["obs"],
+            key=key,
+            num_steps=30,
             connectivity_penalty=config,
         )
 
@@ -346,10 +463,13 @@ class TestRegularizedSGDIntegration:
             coupling_strength=p["coupling_strength"],
         )
         config = OscillatorPenaltyConfig(
-            area_group_l2=2.0, area_labels=area_labels,
+            area_group_l2=2.0,
+            area_labels=area_labels,
         )
         model_reg.fit_sgd(
-            scenario["obs"], key=key, num_steps=40,
+            scenario["obs"],
+            key=key,
+            num_steps=40,
             connectivity_penalty=config,
         )
         c_reg = jnp.moveaxis(model_reg.coupling_strength, -1, 0)
@@ -362,3 +482,91 @@ class TestRegularizedSGDIntegration:
             f"Regularized cross-area ({cross_reg:.4f}) should be < "
             f"baseline ({cross_base:.4f})"
         )
+
+
+def _directed_influence_model(kind: str, max_spectral_radius: float):
+    """A DIM or DIM-PP model and its data, from the shared scenarios."""
+    from state_space_practice.oscillator_models import DirectedInfluenceModel
+    from state_space_practice.point_process_models import (
+        DirectedInfluencePointProcessModel,
+    )
+    from state_space_practice.simulate.scenarios import (
+        simulate_dim_pp_scenario,
+        simulate_dim_scenario,
+    )
+
+    if kind == "gaussian":
+        scenario = simulate_dim_scenario(n_time=100, seed=0)
+        p = scenario["params"]
+        model = DirectedInfluenceModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+            max_spectral_radius=max_spectral_radius,
+        )
+        return model, jnp.asarray(scenario["obs"])
+    scenario = simulate_dim_pp_scenario(n_time=100, seed=0)
+    p = scenario["params"]
+    model = DirectedInfluencePointProcessModel(
+        n_oscillators=p["n_oscillators"],
+        n_neurons=p["n_neurons"],
+        n_discrete_states=p["n_discrete_states"],
+        sampling_freq=p["sampling_freq"],
+        dt=p["dt"],
+        freqs=p["freqs"],
+        damping_coef=p["damping"],
+        process_variance=p["process_variance"],
+        phase_difference=p["phase_difference"],
+        coupling_strength=p["coupling_strength"],
+        max_spectral_radius=max_spectral_radius,
+    )
+    return model, jnp.asarray(scenario["spikes"])
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("kind", ["gaussian", "point_process"])
+def test_connectivity_penalty_applies_to_effective_coupling(kind):
+    """Both directed-influence models penalize the coupling that enters A --
+    the stability-scaled (effective) coupling -- not the raw parameter."""
+    from state_space_practice.oscillator_utils import (
+        compute_directed_influence_stability_scale,
+    )
+
+    # A tight spectral-radius bound makes the stability scale bite.
+    model, data = _directed_influence_model(kind, max_spectral_radius=0.5)
+    model.fit_sgd(data, key=jax.random.PRNGKey(0), num_steps=0)
+    params, _ = model._build_param_spec()
+    config = OscillatorPenaltyConfig(edge_l1=1.0)
+
+    model._connectivity_penalty = None
+    loss_without = float(model._sgd_loss_fn(params, data))
+    model._connectivity_penalty = config
+    loss_with = float(model._sgd_loss_fn(params, data))
+
+    coupling = params["coupling_strength"]
+    scale = compute_directed_influence_stability_scale(
+        params["freqs"],
+        params["damping_coef"],
+        coupling,
+        model.sampling_freq,
+        max_spectral_radius=model.max_spectral_radius,
+        phase_difference=params["phase_difference"],
+    )
+    assert float(scale) < 0.99  # guard: effective and raw coupling differ
+
+    def penalty(c):
+        return float(
+            total_connectivity_penalty(
+                jnp.moveaxis(c, -1, 0), config, n_timesteps=model._n_timesteps
+            )
+        )
+
+    expected = penalty(coupling * scale)
+    assert not np.isclose(expected, penalty(coupling))  # guard
+    np.testing.assert_allclose(loss_with - loss_without, expected, rtol=1e-9)

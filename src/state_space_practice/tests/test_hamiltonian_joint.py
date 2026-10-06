@@ -1,7 +1,10 @@
 """Tests for JointHamiltonianModel."""
 
+import copy
+
 import jax
 import jax.numpy as jnp
+import optax
 import pytest
 
 from state_space_practice.hamiltonian_joint import JointHamiltonianModel
@@ -251,6 +254,27 @@ class TestJointHamiltonianSmoke:
         with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
             model.fit_sgd(lfp, spikes, key=jax.random.PRNGKey(1), num_steps=0)
 
+    @pytest.mark.slow
+    def test_fit_sgd_accepts_named_data_and_positional_optimizer(self, model_and_data):
+        """The public signature is ``fit_sgd(lfp_obs, spike_obs, optimizer,
+        num_steps, ...)``: naming the data and passing the optimizer
+        positionally must fit exactly like the positional-data /
+        keyword-optimizer call."""
+        model, lfp, spikes = model_and_data
+        optimizer = optax.adam(1e-2)
+        ref, named, positional = (copy.deepcopy(model) for _ in range(3))
+
+        lls_ref = ref.fit_sgd(lfp, spikes, optimizer=optimizer, num_steps=2)
+        assert len(lls_ref) == 2
+
+        lls_named = named.fit_sgd(
+            lfp_obs=lfp, spike_obs=spikes, optimizer=optimizer, num_steps=2
+        )
+        assert lls_named == lls_ref
+        assert positional.fit_sgd(lfp, spikes, optimizer, 2) == lls_ref
+        assert jnp.array_equal(named.C_lfp, ref.C_lfp)
+        assert jnp.array_equal(positional.C_lfp, ref.C_lfp)
+
 
 class TestJointHamiltonianMultiOscillator:
     def test_construction_n_oscillators_2(self):
@@ -368,7 +392,8 @@ class TestJointHamiltonianSGDRecovery:
     """Verify fit_sgd learns omega from joint LFP + spike observations."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         omega_true = 2 * jnp.pi
         dt = 0.01
         n_time = 300

@@ -20,6 +20,8 @@ Design principles:
 - E-step with true parameters achieves >=0.70 accuracy for all scenarios
 """
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -54,7 +56,9 @@ Z = np.array([[0.98, 0.02], [0.02, 0.98]])
 # ============================================================================
 
 
-def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict:
+def simulate_com_scenario(
+    n_time: int = N_TIME_GAUSSIAN, seed: int = 42
+) -> dict[str, Any]:
     """COM scenario: measurement matrix H switches between states.
 
     State 0: sources observe theta oscillations (8 Hz).
@@ -65,15 +69,17 @@ def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     n_sources = 3
 
     # A: constant, uncoupled oscillators
-    A_single = np.array(construct_common_oscillator_transition_matrix(
-        freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
-    ))
+    A_single = np.array(
+        construct_common_oscillator_transition_matrix(
+            freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
+        )
+    )
     A = np.stack([A_single, A_single], axis=2)
 
     # Q: constant, block-diagonal
-    Q_single = np.array(construct_common_oscillator_process_covariance(
-        variance=jnp.array([0.1, 0.1])
-    ))
+    Q_single = np.array(
+        construct_common_oscillator_process_covariance(variance=jnp.array([0.1, 0.1]))
+    )
     Q = np.stack([Q_single, Q_single], axis=2)
 
     # H: state 0 sees theta, state 1 sees beta
@@ -99,7 +105,11 @@ def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
         "true_states": true_states,
         "true_continuous": true_continuous,
         "params": {
-            "A": A, "Q": Q, "H": H, "R": R, "Z": Z,
+            "A": A,
+            "Q": Q,
+            "H": H,
+            "R": R,
+            "Z": Z,
             "n_oscillators": N_OSCILLATORS,
             "n_sources": n_sources,
             "n_discrete_states": N_DISCRETE_STATES,
@@ -112,7 +122,9 @@ def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     }
 
 
-def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict:
+def simulate_cnm_scenario(
+    n_time: int = N_TIME_GAUSSIAN, seed: int = 42
+) -> dict[str, Any]:
     """CNM scenario: process noise covariance Q switches between states.
 
     State 0: independent noise (diagonal Q).
@@ -124,9 +136,11 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     n_sources = N_OSCILLATORS
 
     # A: constant, uncoupled oscillators
-    A_single = np.array(construct_common_oscillator_transition_matrix(
-        freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
-    ))
+    A_single = np.array(
+        construct_common_oscillator_transition_matrix(
+            freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
+        )
+    )
     A = np.stack([A_single, A_single], axis=2)
 
     # Q: state 0 = independent, state 1 = correlated
@@ -134,19 +148,23 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     # Q1 eigvals [0.1, 0.1, 0.5, 0.5] vs Q0 [0.3, 0.3, 0.3, 0.3] —
     # same total variance but different structure.
     variance = jnp.array([0.3, 0.3])
-    coupling_strength_corr = jnp.zeros(
-        (N_OSCILLATORS, N_OSCILLATORS)
-    ).at[0, 1].set(0.2).at[1, 0].set(0.2)
-    Q0 = np.array(construct_correlated_noise_process_covariance(
-        variance=variance,
-        phase_difference=jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)),
-        coupling_strength=jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)),
-    ))
-    Q1 = np.array(construct_correlated_noise_process_covariance(
-        variance=variance,
-        phase_difference=jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)),
-        coupling_strength=coupling_strength_corr,
-    ))
+    coupling_strength_corr = (
+        jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)).at[0, 1].set(0.2).at[1, 0].set(0.2)
+    )
+    Q0 = np.array(
+        construct_correlated_noise_process_covariance(
+            variance=variance,
+            phase_difference=jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)),
+            coupling_strength=jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)),
+        )
+    )
+    Q1 = np.array(
+        construct_correlated_noise_process_covariance(
+            variance=variance,
+            phase_difference=jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)),
+            coupling_strength=coupling_strength_corr,
+        )
+    )
     Q = np.stack([Q0, Q1], axis=2)
 
     # H: constant
@@ -169,7 +187,11 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
         "true_states": true_states,
         "true_continuous": true_continuous,
         "params": {
-            "A": A, "Q": Q, "H": H, "R": R, "Z": Z,
+            "A": A,
+            "Q": Q,
+            "H": H,
+            "R": R,
+            "Z": Z,
             "n_oscillators": N_OSCILLATORS,
             "n_sources": n_sources,
             "n_discrete_states": N_DISCRETE_STATES,
@@ -194,7 +216,9 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     }
 
 
-def simulate_dim_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict:
+def simulate_dim_scenario(
+    n_time: int = N_TIME_GAUSSIAN, seed: int = 42
+) -> dict[str, Any]:
     """DIM scenario: transition matrix A switches between states.
 
     State 0: oscillator 1 drives oscillator 2 (osc1 -> osc2).
@@ -208,21 +232,29 @@ def simulate_dim_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     coupling_1 = jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)).at[0, 1].set(0.3)
     phase_diffs = jnp.zeros((N_OSCILLATORS, N_OSCILLATORS))
 
-    A0 = np.array(construct_directed_influence_transition_matrix(
-        freqs=FREQS, damping_coeffs=DAMPING,
-        coupling_strengths=coupling_0, phase_diffs=phase_diffs,
-        sampling_freq=SAMPLING_FREQ,
-    ))
-    A1 = np.array(construct_directed_influence_transition_matrix(
-        freqs=FREQS, damping_coeffs=DAMPING,
-        coupling_strengths=coupling_1, phase_diffs=phase_diffs,
-        sampling_freq=SAMPLING_FREQ,
-    ))
+    A0 = np.array(
+        construct_directed_influence_transition_matrix(
+            freqs=FREQS,
+            damping_coeffs=DAMPING,
+            coupling_strengths=coupling_0,
+            phase_diffs=phase_diffs,
+            sampling_freq=SAMPLING_FREQ,
+        )
+    )
+    A1 = np.array(
+        construct_directed_influence_transition_matrix(
+            freqs=FREQS,
+            damping_coeffs=DAMPING,
+            coupling_strengths=coupling_1,
+            phase_diffs=phase_diffs,
+            sampling_freq=SAMPLING_FREQ,
+        )
+    )
     A = np.stack([A0, A1], axis=2)
 
-    Q_single = np.array(construct_common_oscillator_process_covariance(
-        variance=jnp.array([0.1, 0.1])
-    ))
+    Q_single = np.array(
+        construct_common_oscillator_process_covariance(variance=jnp.array([0.1, 0.1]))
+    )
     Q = np.stack([Q_single, Q_single], axis=2)
 
     H_single = np.array(construct_directed_influence_measurement_matrix(n_sources))
@@ -243,7 +275,11 @@ def simulate_dim_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
         "true_states": true_states,
         "true_continuous": true_continuous,
         "params": {
-            "A": A, "Q": Q, "H": H, "R": R, "Z": Z,
+            "A": A,
+            "Q": Q,
+            "H": H,
+            "R": R,
+            "Z": Z,
             "n_oscillators": N_OSCILLATORS,
             "n_sources": n_sources,
             "n_discrete_states": N_DISCRETE_STATES,
@@ -267,7 +303,7 @@ def simulate_dim_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
 # ============================================================================
 
 
-def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
+def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[str, Any]:
     """COM-PP scenario: spike observation params switch between states.
 
     All neurons are active in both states with similar overall firing rates.
@@ -296,10 +332,10 @@ def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     baseline = jnp.full((n_neurons, N_DISCRETE_STATES), 1.5)
     weights = jnp.zeros((n_neurons, N_LATENT, N_DISCRETE_STATES))
     for i in range(n_neurons):
-        weights = weights.at[i, i % 2, 0].set(0.5)       # theta dims
-        weights = weights.at[i, 2 + i % 2, 1].set(0.5)   # beta dims
+        weights = weights.at[i, i % 2, 0].set(0.5)  # theta dims
+        weights = weights.at[i, 2 + i % 2, 1].set(0.5)  # beta dims
 
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.key(seed)
     spikes, true_continuous, true_discrete = simulate_switching_spike_oscillator(
         n_time=n_time,
         transition_matrices=A,
@@ -316,7 +352,9 @@ def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
         "true_states": np.array(true_discrete),
         "true_continuous": np.array(true_continuous),
         "params": {
-            "A": A, "Q": Q, "Z": Z,
+            "A": A,
+            "Q": Q,
+            "Z": Z,
             "n_oscillators": N_OSCILLATORS,
             "n_neurons": n_neurons,
             "n_discrete_states": N_DISCRETE_STATES,
@@ -331,7 +369,7 @@ def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     }
 
 
-def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
+def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[str, Any]:
     """CNM-PP scenario: process noise Q switches, observed through spikes.
 
     State 0: low process noise (Q variance = 0.05).
@@ -359,9 +397,7 @@ def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     Q0 = construct_common_oscillator_process_covariance(
         variance=jnp.array([0.05, 0.05])
     )
-    Q1 = construct_common_oscillator_process_covariance(
-        variance=jnp.array([0.3, 0.3])
-    )
+    Q1 = construct_common_oscillator_process_covariance(variance=jnp.array([0.3, 0.3]))
     Q = jnp.stack([Q0, Q1], axis=2)
 
     # Shared spike params: one neuron per latent dim, ~7.4 Hz
@@ -370,7 +406,7 @@ def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     for i in range(n_neurons):
         weights = weights.at[i, i % N_LATENT].set(0.3)
 
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.key(seed)
     _, k2 = jax.random.split(key)
     spikes, true_continuous, true_discrete = simulate_switching_spike_oscillator(
         n_time=n_time,
@@ -388,7 +424,9 @@ def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
         "true_states": np.array(true_discrete),
         "true_continuous": np.array(true_continuous),
         "params": {
-            "A": A, "Q": Q, "Z": Z,
+            "A": A,
+            "Q": Q,
+            "Z": Z,
             "n_oscillators": N_OSCILLATORS,
             "n_neurons": n_neurons,
             "n_discrete_states": N_DISCRETE_STATES,
@@ -411,7 +449,7 @@ def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     }
 
 
-def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
+def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[str, Any]:
     """DIM-PP scenario: transition matrix A switches, observed through spikes.
 
     State 0: oscillator 1 drives oscillator 2 (osc1 -> osc2).
@@ -429,13 +467,17 @@ def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     phase_diffs = jnp.zeros((N_OSCILLATORS, N_OSCILLATORS))
 
     A0 = construct_directed_influence_transition_matrix(
-        freqs=FREQS, damping_coeffs=DAMPING,
-        coupling_strengths=coupling_0, phase_diffs=phase_diffs,
+        freqs=FREQS,
+        damping_coeffs=DAMPING,
+        coupling_strengths=coupling_0,
+        phase_diffs=phase_diffs,
         sampling_freq=SAMPLING_FREQ,
     )
     A1 = construct_directed_influence_transition_matrix(
-        freqs=FREQS, damping_coeffs=DAMPING,
-        coupling_strengths=coupling_1, phase_diffs=phase_diffs,
+        freqs=FREQS,
+        damping_coeffs=DAMPING,
+        coupling_strengths=coupling_1,
+        phase_diffs=phase_diffs,
         sampling_freq=SAMPLING_FREQ,
     )
     A = jnp.stack([A0, A1], axis=2)
@@ -451,7 +493,7 @@ def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     for i in range(n_neurons):
         weights = weights.at[i, i % N_LATENT].set(0.3)
 
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.key(seed)
     _, k2 = jax.random.split(key)
     spikes, true_continuous, true_discrete = simulate_switching_spike_oscillator(
         n_time=n_time,
@@ -469,7 +511,9 @@ def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
         "true_states": np.array(true_discrete),
         "true_continuous": np.array(true_continuous),
         "params": {
-            "A": A, "Q": Q, "Z": Z,
+            "A": A,
+            "Q": Q,
+            "Z": Z,
             "n_oscillators": N_OSCILLATORS,
             "n_neurons": n_neurons,
             "n_discrete_states": N_DISCRETE_STATES,
@@ -478,12 +522,8 @@ def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
             "freqs": FREQS,
             "damping": DAMPING,
             "process_variance": jnp.array([0.1, 0.1]),
-            "phase_difference": jnp.stack(
-                [phase_diffs, phase_diffs], axis=2
-            ),
-            "coupling_strength": jnp.stack(
-                [coupling_0, coupling_1], axis=2
-            ),
+            "phase_difference": jnp.stack([phase_diffs, phase_diffs], axis=2),
+            "coupling_strength": jnp.stack([coupling_0, coupling_1], axis=2),
             "spike_baseline": baseline,
             "spike_weights": weights,
         },

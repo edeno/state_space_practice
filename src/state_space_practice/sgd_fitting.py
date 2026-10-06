@@ -7,21 +7,241 @@ finalization.
 Models must implement:
 - _build_param_spec() -> tuple[dict, dict]
 - _sgd_loss_fn(params, *args, **kwargs) -> Array
-- _store_sgd_params(params: dict) -> None
-- _finalize_sgd(*args, **kwargs) -> None
-- _check_sgd_initialized() -> None
+- _finalize_sgd(*args, **kwargs) -> float  (final inference; returns the
+  marginal log-likelihood at the stored parameters)
 - _n_timesteps: int (property or attribute)
+
+and either declare ``_sgd_param_attrs`` (param key -> attribute name, used by
+the default ``_store_sgd_params``) or override ``_store_sgd_params``.
+Optional hook: ``_prepare_sgd_data`` (model-specific setup; default: pass the
+data through unchanged).
 """
 
+from __future__ import annotations
+
+import contextlib
+import hashlib
 import logging
 import math
-import operator
-from typing import Optional
+import weakref
+from collections.abc import Callable, Hashable, Iterator, Mapping
+from typing import Any, ClassVar, Protocol, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import optax
+from jax import Array
+from jax.typing import ArrayLike
+
+from state_space_practice.em_driver import clear_attributes
+from state_space_practice.exceptions import NonFiniteLikelihoodError
+from state_space_practice.fitted_state import FittedAttribute
+from state_space_practice.parameter_transforms import (
+    ParameterTransform,
+    transform_to_constrained,
+    transform_to_unconstrained,
+)
+from state_space_practice.utils import typed_jit, validate_int, validate_scalar
 
 logger = logging.getLogger(__name__)
+
+
+#: Default optimizer for ``fit_sgd``. A single module-level instance, so the
+#: per-model compiled-step cache (keyed on the optimizer's identity) is reused
+#: by every ``fit_sgd`` call that does not pass its own optimizer.
+_DEFAULT_OPTIMIZER = optax.chain(
+    optax.clip_by_global_norm(10.0),
+    optax.adam(1e-2),
+)
+
+#: Compiled SGD steps kept per model instance (least recently used evicted).
+_MAX_CACHED_STEPS_PER_MODEL = 4
+
+#: ``id(model) -> {cache key -> _CompiledSGDStep}``. Keyed by id (models need
+#: not be hashable) and emptied by a ``weakref.finalize`` when the model is
+#: collected; the compiled steps only hold a weak reference to their model.
+#: Kept outside the instance so models stay deep-copyable and picklable.
+_SGD_STEP_CACHE: dict[int, dict[Hashable, _CompiledSGDStep]] = {}
+
+_MISSING = object()
+
+#: Trainable parameters by name: what ``_build_param_spec`` returns and
+#: ``_sgd_loss_fn`` / ``_store_sgd_params`` receive.
+SGDParams = dict[str, Array]
+#: The constraint transform for each trainable parameter.
+SGDParamSpec = dict[str, ParameterTransform]
+
+
+class _Uncacheable(Exception):
+    """A value whose identity cannot be captured by a fingerprint."""
+
+
+def _fingerprint(value: object, keepalive: list[object]) -> Hashable:
+    """Hashable summary of ``value`` that changes whenever its content does.
+
+    Arrays are summarized by shape, dtype and a digest of their bytes; plain
+    scalars and strings by value (floats by ``repr``, so ``-0.0`` and ``nan``
+    compare as themselves); containers recursively. Any other object is
+    summarized by identity and appended to ``keepalive`` so its id cannot be
+    reused while the fingerprint is alive.
+
+    Raises
+    ------
+    _Uncacheable
+        If ``value`` contains a JAX tracer.
+    """
+    if value is _MISSING or value is None:
+        return ("const", value is None)
+    if isinstance(value, jax.core.Tracer):
+        raise _Uncacheable
+    if isinstance(value, (jax.Array, np.ndarray, np.generic)):
+        try:
+            arr = np.asarray(value)
+        except (TypeError, ValueError):  # e.g. typed PRNG keys
+            keepalive.append(value)
+            return ("object", id(value))
+        digest = hashlib.blake2b(
+            np.ascontiguousarray(arr).tobytes(), digest_size=16
+        ).digest()
+        return ("array", arr.shape, arr.dtype.str, digest)
+    if isinstance(value, (bool, int, str, bytes)):
+        return ("value", type(value), value)
+    if isinstance(value, (float, complex)):
+        return ("value", type(value), repr(value))
+    if isinstance(value, (tuple, list)):
+        return (type(value), tuple(_fingerprint(v, keepalive) for v in value))
+    if isinstance(value, dict):
+        return (
+            dict,
+            tuple((k, _fingerprint(v, keepalive)) for k, v in value.items()),
+        )
+    keepalive.append(value)
+    return ("object", id(value))
+
+
+@contextlib.contextmanager
+def _recording_attribute_reads(obj: object, reads: set[str]) -> Iterator[bool]:
+    """Record the attribute names read on ``obj`` inside the block.
+
+    Temporarily swaps ``obj.__class__`` for a subclass whose
+    ``__getattribute__`` logs each name, so reads made by any method or
+    property of the model are captured. Yields ``False`` (and records
+    nothing) when the class cannot be swapped, e.g. for ``__slots__`` layouts.
+    """
+    cls = type(obj)
+
+    def __getattribute__(self: object, name: str) -> Any:
+        reads.add(name)
+        return cls.__getattribute__(self, name)
+
+    swapped = False
+    try:
+        obj.__class__ = cast(Any, type(cls))(
+            cls.__name__,
+            (cls,),
+            {
+                "__getattribute__": __getattribute__,
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__,
+            },
+        )
+        swapped = True
+    except TypeError:
+        pass
+    try:
+        yield swapped
+    finally:
+        if swapped:
+            obj.__class__ = cls
+
+
+#: ``(treedef, is_array_mask, static_leaves)`` from :func:`_split_leaves`.
+_LeafStructure = tuple[Any, tuple[bool, ...], tuple[Any, ...]]
+
+
+def _split_leaves(tree: object) -> tuple[list[Any], _LeafStructure]:
+    """Split a pytree into its array leaves and a hashable static remainder.
+
+    Array leaves become jit arguments; every other leaf (Python scalars,
+    strings, ...) stays a compile-time constant and is part of the returned
+    structure, which keys the compiled-step cache.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    is_array = tuple(isinstance(leaf, (jax.Array, np.ndarray)) for leaf in leaves)
+    dynamic = [leaf for leaf, dyn in zip(leaves, is_array, strict=True) if dyn]
+    static = tuple(leaf for leaf, dyn in zip(leaves, is_array, strict=True) if not dyn)
+    return dynamic, (treedef, is_array, static)
+
+
+def _merge_leaves(dynamic: list[Any], structure: _LeafStructure) -> Any:
+    """Inverse of :func:`_split_leaves`."""
+    treedef, is_array, static = structure
+    dynamic_iter, static_iter = iter(dynamic), iter(static)
+    leaves = [next(dynamic_iter) if dyn else next(static_iter) for dyn in is_array]
+    return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
+def _unbuilt_step(*args: Any) -> Any:
+    raise RuntimeError("SGD step used before it was built.")
+
+
+class _CompiledSGDStep:
+    """A jitted SGD step plus the model state its traces baked in.
+
+    ``_sgd_loss_fn`` may read model attributes (design matrices, fixed
+    hyperparameters, ...); jit freezes whatever values those reads returned
+    while tracing. Each trace therefore records the attributes it read and a
+    fingerprint of their values, and the step is reused only while every
+    recorded attribute still has the same fingerprint.
+    """
+
+    def __init__(self, keepalive: list[object]) -> None:
+        self.train_step: Callable[..., Any] = _unbuilt_step
+        self.state_fingerprints: dict[str, Hashable] = {}
+        self.cacheable = True
+        self.keepalive = keepalive
+
+    def record_trace(self, model: object, reads: set[str], recorded: bool) -> None:
+        """Fingerprint the attributes one trace read (called while tracing)."""
+        if not recorded:
+            self.cacheable = False
+            return
+        instance_dict = vars(model)
+        try:
+            for name in reads:
+                if name.startswith("__"):
+                    continue
+                self.state_fingerprints[name] = _fingerprint(
+                    instance_dict.get(name, _MISSING), self.keepalive
+                )
+        except _Uncacheable:
+            self.cacheable = False
+
+    def matches(self, model: object) -> bool:
+        """Whether ``model``'s recorded attributes still hold the traced values."""
+        instance_dict = vars(model)
+        scratch: list[object] = []
+        try:
+            return all(
+                _fingerprint(instance_dict.get(name, _MISSING), scratch) == fp
+                for name, fp in self.state_fingerprints.items()
+            )
+        except _Uncacheable:
+            return False
+
+
+def _model_step_cache(model: object) -> dict[Hashable, _CompiledSGDStep] | None:
+    """Per-model compiled-step cache, or None if the model is not weakref-able."""
+    model_id = id(model)
+    cache = _SGD_STEP_CACHE.get(model_id)
+    if cache is None:
+        try:
+            weakref.finalize(model, _SGD_STEP_CACHE.pop, model_id, None)
+        except TypeError:
+            return None
+        cache = _SGD_STEP_CACHE[model_id] = {}
+    return cache
 
 
 def _tree_all_finite(tree: object) -> bool:
@@ -43,27 +263,363 @@ def _tree_all_finite_array(tree: object) -> jax.Array:
     return jnp.all(jnp.stack(checks))
 
 
+def reconstruct_per_state_array(
+    params: SGDParams, prefix: str, fallback: ArrayLike, n_discrete_states: int
+) -> Array:
+    """Reassemble a ``(..., n_discrete_states)`` array from per-state SGD params.
+
+    Per-state PSD parameters are exposed to the optimizer as separate keys
+    (``"init_cov_0"``, ``"init_cov_1"``, ...). If ``params`` holds none of
+    them the ``fallback`` array is returned unchanged; otherwise each state's
+    slice comes from ``params`` when present and from ``fallback`` otherwise.
+
+    Parameters
+    ----------
+    params : SGDParams
+        Optimized parameters; the per-state entries are keyed
+        ``f"{prefix}_{j}"`` and each has shape ``fallback.shape[:-1]``, e.g.
+        ``(n_latent, n_latent)`` for ``init_cov``.
+    prefix : str
+        Key prefix of the per-state entries, e.g. ``"init_cov"``.
+    fallback : ArrayLike, shape (..., n_discrete_states)
+        Current stacked array, discrete-state axis last, e.g.
+        ``(n_latent, n_latent, n_discrete_states)``. Supplies every state
+        slice absent from ``params``.
+    n_discrete_states : int
+        Number of discrete states (length of the trailing axis).
+
+    Returns
+    -------
+    Array, shape (..., n_discrete_states)
+        ``fallback`` as a JAX array (the same object when it already is
+        one) when ``params`` has no ``f"{prefix}_*"`` key, else the
+        restacked array.
+    """
+    fallback = jnp.asarray(fallback)
+    if not any(k.startswith(f"{prefix}_") for k in params):
+        return fallback
+    return jnp.stack(
+        [
+            params.get(f"{prefix}_{j}", fallback[..., j])
+            for j in range(n_discrete_states)
+        ],
+        axis=-1,
+    )
+
+
+#: Errors raised when a loss needs concrete values of its data (e.g. host-side
+#: validation of the data inside ``_sgd_loss_fn``).
+_DATA_TRACING_ERRORS = (
+    jax.errors.ConcretizationTypeError,
+    jax.errors.TracerArrayConversionError,
+    jax.errors.TracerBoolConversionError,
+    jax.errors.TracerIntegerConversionError,
+)
+
+
+def _build_sgd_step(
+    model_ref: Callable[[], Any],
+    optimizer: Any,
+    param_spec: SGDParamSpec,
+    n_timesteps: float,
+    data_structure: _LeafStructure,
+    frozen_structure: _LeafStructure,
+    baked_leaves: tuple[list[Any], list[Any]] | None = None,
+) -> _CompiledSGDStep:
+    """Build the jitted SGD step ``(unc_p, opt_st, frozen_leaves, data_leaves)``.
+
+    With ``baked_leaves=(frozen_leaves, data_leaves)`` those values are closed
+    over as compile-time constants and the corresponding arguments are
+    ignored -- the fallback for losses that need concrete data while tracing.
+    """
+    # Keep the optimizer (and hence its id) alive as long as the entry.
+    entry = _CompiledSGDStep(keepalive=[optimizer])
+
+    def _loss_inner(
+        unc_p: SGDParams, frozen_leaves: list[Any], data_leaves: list[Any]
+    ) -> Array:
+        model: SGDFittableMixin = model_ref()
+        frozen = _merge_leaves(frozen_leaves, frozen_structure)
+        args, kwargs = _merge_leaves(data_leaves, data_structure)
+        p = transform_to_constrained(unc_p, param_spec, static_params=frozen)
+        return model._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
+
+    def _sgd_train_step(
+        unc_p: SGDParams,
+        opt_st: optax.OptState,
+        frozen_leaves: list[Any],
+        data_leaves: list[Any],
+    ) -> tuple[Array, SGDParams, optax.OptState, Array]:
+        if baked_leaves is not None:
+            frozen_leaves, data_leaves = baked_leaves
+        # Runs only while tracing: record which model attributes the loss
+        # reads, so a cached step is never reused with stale values.
+        model = model_ref()
+        reads: set[str] = set()
+        with _recording_attribute_reads(model, reads) as recorded:
+            loss, grads = jax.value_and_grad(_loss_inner)(
+                unc_p, frozen_leaves, data_leaves
+            )
+        entry.record_trace(model, reads, recorded)
+        updates, new_opt_st = optimizer.update(grads, opt_st, unc_p)
+        new_unc_p = optax.apply_updates(unc_p, updates)
+        step_finite = (
+            _tree_all_finite_array(grads)
+            & _tree_all_finite_array(updates)
+            & _tree_all_finite_array(new_unc_p)
+        )
+        return loss, new_unc_p, new_opt_st, step_finite
+
+    entry.train_step = typed_jit(_sgd_train_step)
+    return entry
+
+
+class _TimeSeriesModel(Protocol):
+    """Readable sequence length, implemented as a property or an attribute."""
+
+    @property
+    def _n_timesteps(self) -> int: ...
+
+
 class SGDFittableMixin:
     """Mixin providing fit_sgd() for state-space models.
 
     Models must implement:
     - _build_param_spec() -> tuple[dict, dict]
     - _sgd_loss_fn(params, *args, **kwargs) -> Array
-    - _store_sgd_params(params: dict) -> None
-    - _finalize_sgd(*args, **kwargs) -> None
-    - _check_sgd_initialized() -> None
+    - _finalize_sgd(*args, **kwargs) -> float  (final inference; returns the
+      marginal log-likelihood at the stored parameters)
     - _n_timesteps: int (property or attribute)
+
+    and store the optimized parameters either by declaring
+    ``_sgd_param_attrs`` (consumed by the default ``_store_sgd_params``) or
+    by overriding ``_store_sgd_params``.
+
+    All model-specific setup for a fit -- validating and binding the data,
+    recording its length for ``_n_timesteps``, initializing or warm-starting
+    parameters -- belongs in ``_prepare_sgd_data``, which ``fit_sgd`` calls
+    only after validating its own settings; it must validate before it
+    mutates the model. A model may re-declare ``fit_sgd`` only as a typed
+    wrapper that forwards its arguments to this one.
+
+    Every fit (``fit_sgd`` and a model's EM ``fit``) records its results with
+    ``_record_fit_result``; a fit that cannot produce a result clears the
+    model's fit outputs (``_fit_output_attrs``) with ``_clear_fit_state``
+    before raising.
     """
 
-    def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
-        """Record the EM convergence flag and warn if the fit did not converge.
+    #: Optimized-parameter key -> model attribute name, consumed by the
+    #: default ``_store_sgd_params``. A subclass attribute *replaces* (does
+    #: not merge with) the parent's mapping; extend it explicitly with
+    #: ``{**Parent._sgd_param_attrs, "key": "attr"}``.
+    _sgd_param_attrs: ClassVar[Mapping[str, str]] = {}
 
-        Shared terminal-convergence policy for the EM fitters that subclass this
-        mixin: sets ``self.converged_`` and, on max-iter exhaustion, logs a
-        warning under the model's own module logger. The per-loop convergence
-        criterion (which differs across fitters) stays in each ``fit`` method.
+    #: Attributes a fit writes besides the shared results below (posteriors,
+    #: cached inference results, uncertainty summaries). ``_clear_fit_state``
+    #: unsets them, so a failed fit cannot leave an earlier fit's (or its own
+    #: non-finite) outputs looking fitted.
+    _fit_output_attrs: ClassVar[tuple[str, ...]] = ()
+
+    # Set by fitting (see ``_record_fit_result``); reading one before then
+    # raises NotFittedError.
+    converged_: FittedAttribute[bool] = FittedAttribute()
+    #: Marginal log-likelihood at the fitted parameters (never a penalized
+    #: training objective).
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    #: The last fit's trajectory: one log-likelihood per accepted EM E-step,
+    #: or the per-step SGD training objective (log-likelihood plus any
+    #: penalty term).
+    log_likelihood_history_: FittedAttribute[list[float]] = FittedAttribute()
+    #: Length of ``log_likelihood_history_`` after an EM fit (EM's final
+    #: synchronising E-step can make it ``max_iter + 1``); ``None`` before
+    #: fitting and after ``fit_sgd``.
+    n_iter_: int | None = None
+
+    def _build_param_spec(
+        self,
+    ) -> tuple[SGDParams, SGDParamSpec]:
+        raise NotImplementedError
+
+    def _sgd_loss_fn(self, params: SGDParams, *args: Any, **kwargs: Any) -> Array:
+        raise NotImplementedError
+
+    def _finalize_sgd(self, *args: Any, **kwargs: Any) -> float:
+        """Run inference at the stored parameters; return its marginal LL.
+
+        The returned value becomes ``log_likelihood_``. It must be the model's
+        log-likelihood, not the training objective: with a penalty (or any
+        other loss term) the two differ, and ``log_likelihood_history_``
+        already records the objective.
         """
+        raise NotImplementedError
+
+    def _sgd_param(self, params: SGDParams, key: str, attr: str | None = None) -> Array:
+        """Value of ``key`` for ``_sgd_loss_fn``: optimized if present, else stored.
+
+        Use this instead of ``params.get(key, self.<attr>)``. The compiled-step
+        cache fingerprints every model attribute the loss reads while tracing,
+        and fitting rewrites trained attributes, so reading them unconditionally
+        makes every repeat ``fit_sgd`` miss the cache and recompile. This reads
+        the attribute only when ``key`` is not being optimized.
+
+        Parameters
+        ----------
+        params : SGDParams
+            The constrained parameters passed to the loss.
+        key : str
+            Parameter name in ``params``.
+        attr : str or None
+            Model attribute to fall back to; defaults to ``key``.
+
+        Returns
+        -------
+        Array
+        """
+        if key in params:
+            return params[key]
+        return jnp.asarray(getattr(self, key if attr is None else attr))
+
+    def _sgd_per_state_param(
+        self,
+        params: SGDParams,
+        prefix: str,
+        n_discrete_states: int,
+        attr: str | None = None,
+    ) -> Array:
+        """Per-state stack of the ``f"{prefix}_{j}"`` SGD params.
+
+        States absent from ``params`` keep their slice of the model attribute
+        ``attr`` (default ``prefix``; see :func:`reconstruct_per_state_array`).
+        Like :meth:`_sgd_param`, the attribute is read only when some state is
+        not optimized, so the compiled SGD step stays reusable after a fit
+        rewrites it.
+
+        Parameters
+        ----------
+        params : SGDParams
+            The constrained parameters passed to the loss.
+        prefix : str
+            Key prefix of the per-state entries (``f"{prefix}_{j}"``).
+        n_discrete_states : int
+            Number of discrete states (length of the trailing axis).
+        attr : str or None
+            Model attribute supplying states absent from ``params``; defaults
+            to ``prefix``.
+
+        Returns
+        -------
+        Array, shape (..., n_discrete_states)
+        """
+        keys = [f"{prefix}_{j}" for j in range(n_discrete_states)]
+        if all(k in params for k in keys):
+            return jnp.stack([params[k] for k in keys], axis=-1)
+        fallback = getattr(self, prefix if attr is None else attr)
+        return reconstruct_per_state_array(params, prefix, fallback, n_discrete_states)
+
+    def _prepare_sgd_data(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Model-specific setup for ``fit_sgd``: validate data, then prepare.
+
+        Called by ``fit_sgd`` after it validates ``num_steps``, the optimizer
+        and ``convergence_tol``, with the positional data and any
+        model-specific keyword arguments (everything except those settings).
+        The returned ``(args, kwargs)`` replace the originals and are
+        forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``. A model may
+        coerce and validate the data, bind it, record the length
+        ``_n_timesteps`` reports, and initialize or warm-start parameters
+        here; it must validate before mutating anything, so a call rejected
+        for its settings or its data leaves the model unchanged. (Checks
+        ``fit_sgd`` runs after this hook -- learnable parameters exist, are
+        finite, ``_n_timesteps`` is positive -- see the prepared model.)
+        The default is the identity.
+        """
+        return args, kwargs
+
+    def _store_sgd_params(self, params: SGDParams) -> None:
+        """Copy the optimized parameters onto the model.
+
+        Default implementation driven by ``_sgd_param_attrs``: every mapped
+        key present in ``params`` is assigned to its attribute; absent keys
+        are skipped, so a param spec may drop entries. Models with derived
+        storage (a per-state slot, a re-stabilized covariance, a matrix
+        rebuilt from scientific parameters) override this method and call
+        ``super()._store_sgd_params(params)`` for the plain keys.
+        """
+        attrs = self._sgd_param_attrs
+        if not attrs:
+            raise NotImplementedError(
+                f"{type(self).__name__} must declare `_sgd_param_attrs` or "
+                "override `_store_sgd_params` to store optimized parameters."
+            )
+        for key, attr in attrs.items():
+            if key in params:
+                setattr(self, attr, params[key])
+
+    def _record_fit_result(
+        self,
+        log_likelihoods: list[float],
+        converged: bool,
+        *,
+        n_iter: int | None,
+        log_likelihood: float | None = None,
+    ) -> None:
+        """Record a finished fit, replacing whatever an earlier fit recorded.
+
+        Every ``fit`` (EM) and ``fit_sgd`` calls this, so switching fitters
+        never leaves the previous fitter's results behind.
+
+        Parameters
+        ----------
+        log_likelihoods : list[float]
+            The fit's history (``log_likelihood_history_``): per-iteration EM
+            log-likelihoods, or per-step SGD training objective (the
+            log-likelihood plus any penalty term).
+        converged : bool
+            Whether the fit met its convergence criterion (``converged_``).
+        n_iter : int or None
+            EM iterations (``n_iter_``); ``None`` for SGD.
+        log_likelihood : float or None
+            Log-likelihood at the stored parameters (``log_likelihood_``).
+            Defaults to the last history entry; with an empty history and no
+            value, ``log_likelihood_`` is unset.
+        """
+        self.log_likelihood_history_ = log_likelihoods
         self.converged_ = converged
+        self.n_iter_ = n_iter
+        if log_likelihood is None and log_likelihoods:
+            log_likelihood = log_likelihoods[-1]
+        if log_likelihood is None:
+            del self.log_likelihood_
+        else:
+            self.log_likelihood_ = float(log_likelihood)
+
+    def _clear_fit_state(self) -> None:
+        """Unset every fit output (``_fit_output_attrs`` and the shared results).
+
+        Called before a fit raises because it could not produce a usable
+        result, so the model reads as unfitted instead of serving an earlier
+        fit's outputs alongside newly bound data, or non-finite ones.
+        """
+        clear_attributes(
+            self,
+            (
+                "converged_",
+                "log_likelihood_",
+                "log_likelihood_history_",
+                *self._fit_output_attrs,
+            ),
+        )
+        self.n_iter_ = None
+
+    def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
+        """Warn if a hand-rolled EM loop ran out of iterations.
+
+        Shared terminal-convergence policy for the EM fitters that run their own
+        loop (``run_em`` reports this itself): logs a warning under the model's
+        own module logger. The per-loop convergence criterion (which differs
+        across fitters) stays in each ``fit`` method.
+        """
         if not converged and max_iter > 1:
             logging.getLogger(type(self).__module__).warning(
                 "%s.fit did not converge in %d EM iterations; the returned "
@@ -73,55 +629,145 @@ class SGDFittableMixin:
                 max_iter,
             )
 
-    def fit_sgd(
+    def _compiled_sgd_step(
         self,
-        *args,
-        optimizer: Optional[object] = None,
-        num_steps: int = 200,
-        verbose: bool = False,
-        convergence_tol: Optional[float] = None,
-        **kwargs,
-    ) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent.
+        optimizer: Any,
+        param_spec: SGDParamSpec,
+        n_timesteps: float,
+        data_structure: _LeafStructure,
+        frozen_structure: _LeafStructure,
+    ) -> tuple[_CompiledSGDStep, dict[Hashable, _CompiledSGDStep] | None, Hashable]:
+        """Return a jitted SGD step, reusing this model's cached one if valid.
+
+        The step fuses loss + grad + ``optimizer.update`` + ``apply_updates``
+        into one compiled graph; without jit the optimizer update and the
+        softplus/adam primitives dispatch one at a time through Python (~65x
+        slower on CPU; worse on GPU due to per-primitive sync). Its
+        ``train_step`` takes ``(unc_params, opt_state, frozen_leaves,
+        data_leaves)``.
+
+        Steps are cached per model instance under ``(id(optimizer),
+        param_spec, n_timesteps, static data / frozen structure)``; jit's own
+        cache handles new array shapes. Because ``_sgd_loss_fn`` may read
+        model attributes, which jit freezes at trace time, a cached step is
+        reused only while every attribute its traces read still holds the
+        same value (see :class:`_CompiledSGDStep`). Nothing on the model may
+        change *during* one ``fit_sgd`` loop: ``_store_sgd_params`` only runs
+        after it.
+
+        Returns
+        -------
+        entry : _CompiledSGDStep
+        cache : dict or None
+            The model's step cache (None when the model cannot be cached).
+        key : hashable or None
+            The entry's key in ``cache``.
+        """
+        cache = _model_step_cache(self)
+        key: Hashable = None
+        if cache is not None:
+            key = (
+                id(optimizer),
+                tuple(sorted(param_spec.items())),
+                n_timesteps,
+                data_structure,
+                frozen_structure,
+            )
+            try:
+                cached = cache.pop(key, None)
+            except TypeError:  # an unhashable static leaf or transform
+                cache, key, cached = None, None, None
+            if cache is not None and cached is not None and cached.matches(self):
+                cache[key] = cached  # re-insert as most recently used
+                return cached, cache, key
+
+        entry = _build_sgd_step(
+            weakref.ref(self) if cache is not None else (lambda: self),
+            optimizer,
+            param_spec,
+            n_timesteps,
+            data_structure,
+            frozen_structure,
+        )
+        if cache is not None:
+            cache[key] = entry
+            while len(cache) > _MAX_CACHED_STEPS_PER_MODEL:
+                cache.pop(next(iter(cache)))
+        return entry, cache, key
+
+    # Declared as ``(*args, **kwargs)`` so subclasses can replace the data
+    # arguments with their own signature without an [override] violation.
+    # The optimizer settings are keyword-only, exactly as before.
+    def fit_sgd(self, *args: Any, **kwargs: Any) -> list[float]:
+        """Fit by gradient descent on the model's SGD loss.
+
+        The loss is the negative marginal log-likelihood plus any penalty term
+        the model adds (e.g. a connectivity penalty). Settings are validated
+        before ``_prepare_sgd_data`` binds data or initializes the model, so a
+        call rejected for its settings leaves the model unchanged.
 
         Parameters
         ----------
         *args, **kwargs
-            Passed to _sgd_loss_fn and _finalize_sgd.
+            Data arguments, passed through ``_prepare_sgd_data`` and then to
+            _sgd_loss_fn and _finalize_sgd. The settings below are
+            keyword-only and are removed from ``kwargs`` first.
         optimizer : optax optimizer or None
             Default: adam(1e-2) with gradient clipping.
         num_steps : int
             Number of optimization steps.
         verbose : bool
-            Log progress every 10 steps.
+            Log progress every 10 steps at INFO level on the
+            ``state_space_practice.sgd_fitting`` logger (enable with e.g.
+            ``logging.basicConfig(level=logging.INFO)``).
         convergence_tol : float or None
-            If set, stop early when the direction-agnostic relative change
-            ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive steps.
-            This is a dimensionless fraction (e.g., ``1e-4`` means 0.01%
-            relative change), consistent with the EM convergence check.
+            If set (finite, >= 0), stop early when the direction-agnostic
+            relative change ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive
+            steps. This is a dimensionless fraction (e.g., ``1e-4`` means
+            0.01% relative change), consistent with the EM convergence check.
 
         Returns
         -------
         log_likelihoods : list of float
-            One entry per evaluated optimization step that produced a finite
-            loss. When the final candidate is finite, the final entry is
-            rewritten to the log likelihood of the stored final parameters.
+            The training objective (log-likelihood plus any penalty), one
+            entry per evaluated step that produced a finite loss; when the
+            final candidate is finite, the last entry is re-evaluated at the
+            stored parameters. Also stored as ``log_likelihood_history_``.
+            ``log_likelihood_`` is instead the marginal log-likelihood from
+            the final inference (``_finalize_sgd``); ``n_iter_`` is ``None``.
+
+        Raises
+        ------
+        ValueError
+            If ``num_steps``, the optimizer or ``convergence_tol`` is invalid
+            (before the model is touched); if the model has no learnable
+            parameters, non-finite initial parameters or a non-positive
+            ``_n_timesteps``.
+        NonFiniteLikelihoodError
+            If the log-likelihood at the stored parameters is non-finite (e.g.
+            unusable starting parameters); the fit outputs are cleared first.
         """
-        import optax
+        optimizer: optax.GradientTransformation | None = kwargs.pop("optimizer", None)
+        num_steps: int = kwargs.pop("num_steps", 200)
+        verbose: bool = kwargs.pop("verbose", False)
+        convergence_tol: float | None = kwargs.pop("convergence_tol", None)
 
-        from state_space_practice.parameter_transforms import (
-            transform_to_constrained,
-            transform_to_unconstrained,
-        )
+        # Validate the plain settings before the hook: ``_prepare_sgd_data`` may
+        # mutate the model (e.g. record the sequence length).
+        num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
+        if convergence_tol is not None:
+            convergence_tol = validate_scalar(
+                convergence_tol, "convergence_tol", nonnegative=True
+            )
+        if optimizer is None:
+            optimizer = _DEFAULT_OPTIMIZER
+        if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
+            raise ValueError(
+                "optimizer must be an optax GradientTransformation with "
+                "init and update methods."
+            )
+        args, kwargs = self._prepare_sgd_data(*args, **kwargs)
 
-        try:
-            num_steps = operator.index(num_steps)
-        except TypeError as exc:
-            raise ValueError("num_steps must be a non-negative integer.") from exc
-        if num_steps < 0:
-            raise ValueError("num_steps must be a non-negative integer.")
-
-        self._check_sgd_initialized()
         params, param_spec = self._build_param_spec()
 
         if not param_spec or not any(spec.trainable for spec in param_spec.values()):
@@ -135,36 +781,22 @@ class SGDFittableMixin:
             param_spec,
             include_non_trainable=False,
         )
-        n_timesteps = float(self._n_timesteps)
+        # Subclasses supply this readable member. Keep its structural contract
+        # separate from the mixin so no inherited descriptor blocks assignment.
+        n_timesteps = float(cast(_TimeSeriesModel, self)._n_timesteps)
         if not math.isfinite(n_timesteps) or n_timesteps <= 0.0:
-            raise ValueError("_n_timesteps must be positive and finite for SGD fitting.")
+            raise ValueError(
+                "_n_timesteps must be positive and finite for SGD fitting."
+            )
         if not _tree_all_finite(unc_params):
             raise ValueError(
                 "Initial unconstrained SGD parameters contain NaN or inf. "
                 "Check the model's initial parameter values."
             )
 
-        if optimizer is None:
-            optimizer = optax.chain(
-                optax.clip_by_global_norm(10.0),
-                optax.adam(1e-2),
-            )
-        if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
-            raise ValueError(
-                "optimizer must be an optax GradientTransformation with "
-                "init and update methods."
-            )
         opt_state = optimizer.init(unc_params)
 
-        # jit fuses loss + grad + optimizer.update + apply_updates into a
-        # single compiled graph. Without this the optimizer update and the
-        # softplus/adam primitives dispatch one at a time through Python
-        # (~65x slower on CPU; worse on GPU due to per-primitive sync).
-        # Safe because nothing inside self mutates during the SGD loop —
-        # _store_sgd_params only runs after the loop. If a subclass ever
-        # mutates self attributes inside _sgd_loss_fn, jit will silently
-        # freeze stale values; keep that invariant.
-        def _loss_inner(unc_p):
+        def _loss_inner(unc_p: SGDParams) -> Array:
             p = transform_to_constrained(
                 unc_p,
                 param_spec,
@@ -172,17 +804,15 @@ class SGDFittableMixin:
             )
             return self._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
-        @jax.jit
-        def train_step(unc_p, opt_st):
-            loss, grads = jax.value_and_grad(_loss_inner)(unc_p)
-            updates, new_opt_st = optimizer.update(grads, opt_st, unc_p)
-            new_unc_p = optax.apply_updates(unc_p, updates)
-            step_finite = (
-                _tree_all_finite_array(grads)
-                & _tree_all_finite_array(updates)
-                & _tree_all_finite_array(new_unc_p)
-            )
-            return loss, new_unc_p, new_opt_st, step_finite
+        # The data and the frozen parameters are jit *arguments* (array leaves
+        # only; other leaves stay compile-time constants and key the cache),
+        # so a later fit_sgd call on this model with same-shaped data reuses
+        # the compiled step instead of re-tracing and re-compiling it.
+        data_dynamic, data_structure = _split_leaves((args, kwargs))
+        frozen_dynamic, frozen_structure = _split_leaves(frozen_params)
+        step_entry, step_cache, cache_key = self._compiled_sgd_step(
+            optimizer, param_spec, n_timesteps, data_structure, frozen_structure
+        )
 
         log_likelihoods: list[float] = []
         converged = False
@@ -197,11 +827,45 @@ class SGDFittableMixin:
         # Python loop (not lax.scan) to support NaN checks and verbose
         # logging without JIT closure issues with self.
         for step in range(num_steps):
-            loss, new_unc_params, new_opt_state, step_finite = train_step(
-                unc_params, opt_state
-            )
+            try:
+                loss, new_unc_params, new_opt_state, step_finite = (
+                    step_entry.train_step(
+                        unc_params, opt_state, frozen_dynamic, data_dynamic
+                    )
+                )
+            except _DATA_TRACING_ERRORS:
+                if step > 0:
+                    raise
+                # The loss needs concrete data while tracing (e.g. it validates
+                # its inputs on the host): bake the data in as constants for
+                # this call instead, uncached (the pre-cache behaviour).
+                logger.debug(
+                    "%s._sgd_loss_fn needs concrete data; compiling an uncached "
+                    "SGD step with the data baked in.",
+                    type(self).__name__,
+                )
+                if step_cache is not None:
+                    step_cache.pop(cache_key, None)
+                step_cache = None
+                step_entry = _build_sgd_step(
+                    lambda: self,
+                    optimizer,
+                    param_spec,
+                    n_timesteps,
+                    data_structure,
+                    frozen_structure,
+                    baked_leaves=(frozen_dynamic, data_dynamic),
+                )
+                loss, new_unc_params, new_opt_state, step_finite = (
+                    step_entry.train_step(
+                        unc_params, opt_state, frozen_dynamic, data_dynamic
+                    )
+                )
 
-            if not bool(jnp.isfinite(loss)):
+            # One device->host round trip per step; ``float`` / ``bool`` on
+            # each value separately would block three times.
+            loss_host, step_finite_host = jax.device_get((loss, step_finite))
+            if not math.isfinite(loss_host):
                 logger.warning(
                     "SGD step %d: NaN/inf loss — restoring last valid params "
                     "and stopping.",
@@ -210,10 +874,10 @@ class SGDFittableMixin:
                 unc_params = last_valid_unc_params
                 break
 
-            ll = -float(loss) * n_timesteps
+            ll = -float(loss_host) * n_timesteps
             log_likelihoods.append(ll)
 
-            if not bool(step_finite):
+            if not bool(step_finite_host):
                 last_valid_unc_params = unc_params
                 logger.warning(
                     "SGD step %d: NaN/inf gradient or parameter update -- keeping "
@@ -232,7 +896,7 @@ class SGDFittableMixin:
             opt_state = new_opt_state
 
             if verbose and (step % 10 == 0 or step == num_steps - 1):
-                print(f"SGD step {step}: LL={ll:.2f}")
+                logger.info("SGD step %d: LL=%.2f", step, ll)
 
             if convergence_tol is not None and len(log_likelihoods) >= 2:
                 # Use relative change for convergence, consistent with EM's
@@ -247,11 +911,13 @@ class SGDFittableMixin:
                 else:
                     stall_count = 0
                 if stall_count >= 5:
-                    if verbose:
-                        print(f"SGD converged at step {step}.")
                     logger.info("SGD converged at step %d.", step)
                     converged = True
                     break
+
+        if step_cache is not None and not step_entry.cacheable:
+            # A trace read state that cannot be fingerprinted: never reuse it.
+            step_cache.pop(cache_key, None)
 
         final_loss = _loss_inner(unc_params)
         if not bool(jnp.isfinite(final_loss)):
@@ -269,8 +935,19 @@ class SGDFittableMixin:
             static_params=frozen_params,
         )
         self._store_sgd_params(final_params)
-        self.log_likelihood_history_ = log_likelihoods
-        self.converged_ = converged
-        self._finalize_sgd(*args, **kwargs)
+        final_log_likelihood = float(self._finalize_sgd(*args, **kwargs))
+        if not math.isfinite(final_log_likelihood):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError(
+                f"Log-likelihood at the fitted parameters is non-finite "
+                f"({final_log_likelihood}); the starting parameters are likely "
+                "unusable."
+            )
+        self._record_fit_result(
+            log_likelihoods,
+            converged,
+            n_iter=None,
+            log_likelihood=final_log_likelihood,
+        )
 
         return log_likelihoods

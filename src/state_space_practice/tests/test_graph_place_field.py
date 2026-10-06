@@ -10,6 +10,14 @@ misalignment, wrong Laplacian weighting, and off-by-component null modes.
 import networkx as nx
 import numpy as np
 import pytest
+import scipy.sparse as sp
+
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
+from state_space_practice.fitted_state import is_set
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 
 neurospatial = pytest.importorskip("neurospatial")
 from neurospatial import Environment  # noqa: E402
@@ -304,6 +312,39 @@ def test_basis_fingerprint_distinguishes_equal_aggregate_graphs():
             np.array([0.0]),
             np.zeros((1, 2)),
         )
+
+
+def test_basis_cache_distinguishes_same_size_reweighting(monkeypatch):
+    """Moving weight between edges changes the Laplacian without changing its size,
+    sparsity or total absolute weight; the basis must still be rebuilt and the old
+    basis refused."""
+    pos = np.random.default_rng(7).uniform(0, 20, (400, 2))
+    env = Environment.from_samples(pos, bin_size=5.0)
+    basis0 = build_graph_basis(env)
+
+    d_original = env.get_differential_operator().tocsc()
+    # Edge e contributes (sum_i |D_ie|)^2 to sum |L|; rescale two edges with equal
+    # contributions by sqrt(1.5) and sqrt(0.5) so that sum is unchanged.
+    contribution = np.asarray(abs(d_original).sum(axis=0)).ravel() ** 2
+    e1, e2 = np.flatnonzero(np.isclose(contribution, contribution[0], rtol=0))[:2]
+    scale = np.ones(d_original.shape[1])
+    scale[[e1, e2]] = np.sqrt([1.5, 0.5])
+    d_reweighted = d_original @ sp.diags(scale)
+    monkeypatch.setattr(env, "get_differential_operator", lambda: d_reweighted)
+
+    lap0 = (d_original @ d_original.T).tocsr()
+    lap1 = (d_reweighted @ d_reweighted.T).tocsr()
+    # Guard: invisible to a (n_bins, nnz, |L|-sum) fingerprint, yet a different L.
+    assert lap0.nnz == lap1.nnz
+    np.testing.assert_allclose(abs(lap0).sum(), abs(lap1).sum(), rtol=1e-12)
+    assert abs(lap0 - lap1).max() > 0.1
+
+    basis1 = build_graph_basis(env)
+    assert not np.allclose(basis0.eigvals, basis1.eigvals)
+    times = np.array([0.0, 0.1])
+    traj = np.vstack([env.bin_centers[0], env.bin_centers[0]])
+    with pytest.raises(ValueError, match="different"):
+        graph_design_matrix(env, basis0, times, traj)
 
 
 def test_consumers_reject_mismatched_env(small_grid_env, two_component_env):
@@ -998,9 +1039,9 @@ def _simulate_field_drift_spikes(env, basis, dt, n_time, q_c, seed, rate_hz=30.0
 
 def test_predict_rate_map_requires_fit_and_valid_neuron(small_grid_env):
     model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         model.predict_rate_map()
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         model.predict_log_rate_trajectory()
 
 
@@ -1345,10 +1386,10 @@ def test_constructor_rejects_bad_max_newton_iter(small_grid_env, bad):
 def test_predict_and_score_require_fit(small_grid_env):
     model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
     assert model._is_fitted is False
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         model.predict_rate_map()
     times, traj = _toy_trajectory(small_grid_env, 5, seed=0)
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         model.score(times, traj, np.zeros(5))
 
 
@@ -1373,11 +1414,11 @@ def test_failed_first_estep_clears_posteriors_and_stays_unfitted(small_grid_env)
     model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
     # Inject a non-finite initial mean so the first E-step's LL is non-finite.
     model.init_mean = jnp.full((1, model.rank), jnp.inf)
-    with pytest.raises(RuntimeError, match="first E-step"):
+    with pytest.raises(NonFiniteLikelihoodError, match="Non-finite log-likelihood"):
         model.fit(times, traj, spikes, warm_start=False, verbose=False)
     assert model._is_fitted is False
-    assert model.smoother_mean is None  # NaN posteriors cleared
-    with pytest.raises(RuntimeError, match="not fitted"):
+    assert not is_set(model, "smoother_mean")  # NaN posteriors cleared
+    with pytest.raises(NotFittedError, match="not fitted"):
         model.predict_rate_map()
 
 
@@ -1398,8 +1439,8 @@ def test_rejected_refit_leaves_model_cleanly_unfitted(small_grid_env):
     with pytest.raises(ValueError, match="no in-bounds"):
         model.fit(times, outside, two_neuron, max_iter=1, verbose=False)
     assert model._is_fitted is False
-    assert model.smoother_mean is None
-    with pytest.raises(RuntimeError, match="not fitted"):
+    assert not is_set(model, "smoother_mean")
+    with pytest.raises(NotFittedError, match="not fitted"):
         model.predict_rate_map(0)
 
 
@@ -1413,3 +1454,55 @@ def test_score_rejects_wrong_ndim_spikes(small_grid_env):
         model.score(times, traj, np.float64(3.0))  # 0-d scalar
     with pytest.raises(ValueError, match="spikes must be 1D"):
         model.score(times, traj, np.zeros((40, 1, 1)))  # 3-d
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("invalid_data", ["time_rows", "spike_shape", "out_of_bounds"])
+def test_rejected_sgd_data_preserves_previous_fit(small_grid_env, invalid_data):
+    times, traj = _toy_trajectory(small_grid_env, 30, seed=3)
+    spikes = np.random.default_rng(4).poisson(0.1, size=30).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model.fit_sgd(times, traj, spikes, num_steps=2, verbose=False)
+    assert is_set(model, "log_likelihood_")
+    before = snapshot_model_state(model)
+
+    if invalid_data == "time_rows":
+        spikes = spikes[:-1]
+    elif invalid_data == "spike_shape":
+        spikes = spikes[:, None, None]
+    else:
+        traj = np.full_like(traj, 1e9)
+    with pytest.raises(ValueError):
+        model.fit_sgd(times, traj, spikes, num_steps=2, warm_start=True)
+
+    assert_model_state_unchanged(model, before)
+
+
+@pytest.mark.slow
+def test_nonfinite_sgd_final_inference_clears_previous_fit(small_grid_env, monkeypatch):
+    times, traj = _toy_trajectory(small_grid_env, 30, seed=3)
+    spikes = np.random.default_rng(4).poisson(0.1, size=30).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    assert is_set(model, "log_likelihood_")
+    e_step = model._e_step
+
+    def nonfinite_e_step(*args):
+        e_step(*args)
+        return float("nan")
+
+    monkeypatch.setattr(model, "_e_step", nonfinite_e_step)
+    with pytest.raises(NonFiniteLikelihoodError, match="final E-step"):
+        model.fit_sgd(times, traj, spikes, num_steps=0, warm_start=False)
+
+    for attr in (
+        *model._fit_output_attrs,
+        "log_likelihood_",
+        "log_likelihood_history_",
+        "converged_",
+    ):
+        assert not is_set(model, attr)
+    assert model.n_iter_ is None
+    assert model.log_likelihoods == []
+    with pytest.raises(NotFittedError):
+        model.predict_log_rate_trajectory()

@@ -9,10 +9,20 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.point_process_models import (
     CommonOscillatorPointProcessModel,
     CorrelatedNoisePointProcessModel,
     DirectedInfluencePointProcessModel,
+)
+from state_space_practice.simulate.scenarios import (
+    simulate_cnm_pp_scenario,
+    simulate_dim_pp_scenario,
+)
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    assert_snapshots_equal,
+    snapshot_model_state,
 )
 
 # Enable 64-bit precision for numerical stability
@@ -127,6 +137,12 @@ class TestCommonOscillatorPointProcessModel:
         assert model.n_neurons == com_pp_params["n_neurons"]
         assert model.n_discrete_states == com_pp_params["n_discrete_states"]
         assert model.n_latent == 2 * com_pp_params["n_oscillators"]
+
+    @pytest.mark.parametrize("method", ["decode", "predict_proba"])
+    def test_posterior_before_fit_raises_not_fitted(self, com_pp_params, method):
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        with pytest.raises(NotFittedError, match=f"before {method}"):
+            getattr(model, method)()
 
     def test_repr(self, com_pp_params) -> None:
         """__repr__ should include class name and key parameters."""
@@ -391,6 +407,54 @@ class TestCommonOscillatorPointProcessModel:
         with pytest.raises(ValueError, match=match):
             model.fit(bad_spikes, max_iter=1, key=jax.random.PRNGKey(0))
 
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    @pytest.mark.parametrize(
+        ("shape", "match"),
+        [((200,), "must be 2D"), ((200, 7), "must match n_neurons=5")],
+    )
+    def test_fit_and_fit_sgd_validate_spike_shape_alike(
+        self, com_pp_params, method, shape, match
+    ) -> None:
+        """fit and fit_sgd reject a wrong spike shape with the same message,
+        before touching the model."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match=match):
+            getattr(model, method)(jnp.zeros(shape), key=jax.random.PRNGKey(0))
+        assert_model_state_unchanged(model, before)
+
+    def test_restarts_propagate_errors_other_than_nonfinite_ll(
+        self, com_pp_params, synthetic_spikes, monkeypatch
+    ) -> None:
+        """Only a non-finite log-likelihood counts as a failed restart; any other
+        ValueError (e.g. from initialization) surfaces with its own message."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+
+        def _broken_init(key: jax.Array) -> None:
+            raise ValueError("broken initialization")
+
+        monkeypatch.setattr(model, "_initialize_parameters", _broken_init)
+        with pytest.raises(ValueError, match="broken initialization"):
+            model.fit(synthetic_spikes, max_iter=1, n_restarts=2)
+
+    def test_restarts_skip_nonfinite_ll_restart(
+        self, com_pp_params, synthetic_spikes, monkeypatch
+    ) -> None:
+        """A restart whose first E-step is non-finite is skipped, not fatal."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        e_step = model._e_step
+        calls = {"n": 0}
+
+        def _first_restart_nonfinite(spikes: jax.Array) -> float:
+            calls["n"] += 1
+            ll = e_step(spikes)
+            return float("nan") if calls["n"] == 1 else ll
+
+        monkeypatch.setattr(model, "_e_step", _first_restart_nonfinite)
+        lls = model.fit(synthetic_spikes, max_iter=1, n_restarts=2)
+        assert calls["n"] > 1  # the second restart ran
+        assert np.isfinite(lls[-1])
+
 
 # ============================================================================
 # Tests for CorrelatedNoisePointProcessModel
@@ -407,13 +471,15 @@ class TestCorrelatedNoisePointProcessModel:
         assert model.n_neurons == cnm_pp_params["n_neurons"]
         assert model.n_discrete_states == cnm_pp_params["n_discrete_states"]
 
-    def test_constrained_mstep_is_opt_in(self, cnm_pp_params) -> None:
+    def test_constrained_mstep_is_the_default(self, cnm_pp_params) -> None:
+        """The exact fixed-A constrained Q update is the default M-step; the
+        generic estimate-then-project path is opt-out."""
         default = CorrelatedNoisePointProcessModel(**cnm_pp_params)
-        constrained = CorrelatedNoisePointProcessModel(
-            **cnm_pp_params, use_reparameterized_mstep=True
+        generic = CorrelatedNoisePointProcessModel(
+            **cnm_pp_params, use_reparameterized_mstep=False
         )
-        assert default.use_reparameterized_mstep is False
-        assert constrained.use_reparameterized_mstep is True
+        assert default.use_reparameterized_mstep is True
+        assert generic.use_reparameterized_mstep is False
 
     @pytest.mark.slow
     def test_constrained_mstep_fits_psd_reconstructable_q(
@@ -922,6 +988,7 @@ class TestDirectedInfluencePointProcessModel:
             model.damping_coef,
             model.coupling_strength,
             model.sampling_freq,
+            phase_difference=model.phase_difference,
         )
         for j in range(model.n_discrete_states):
             A = model.continuous_transition_matrix[:, :, j]
@@ -984,6 +1051,7 @@ class TestDirectedInfluencePointProcessModel:
             model.coupling_strength,
             model.sampling_freq,
             max_spectral_radius=max_spectral_radius,
+            phase_difference=model.phase_difference,
         )
         # Guard: the tightened bound must actually bind (scale < 1), else the
         # radius checks below would pass trivially for an unscaled matrix.
@@ -1045,6 +1113,7 @@ class TestDirectedInfluencePointProcessModel:
         model = DirectedInfluencePointProcessModel(
             **dim_pp_params, max_spectral_radius=0.7
         )
+        # Damping 0.95 already exceeds the 0.7 bound, so every rebuild clamps.
         model._initialize_parameters(jax.random.PRNGKey(0))
         n_osc, n_disc = model.n_oscillators, model.n_discrete_states
         strong = (
@@ -1063,6 +1132,7 @@ class TestDirectedInfluencePointProcessModel:
             model.coupling_strength,
             model.sampling_freq,
             max_spectral_radius=0.7,
+            phase_difference=model.phase_difference,
         )
         assert float(scale) < 1.0  # guard: the bound binds for this coupling
         for j in range(n_disc):
@@ -1111,6 +1181,7 @@ class TestDirectedInfluencePointProcessModel:
             model.coupling_strength,
             model.sampling_freq,
             max_spectral_radius=model.max_spectral_radius,
+            phase_difference=model.phase_difference,
         )
         for j in range(model.n_discrete_states):
             A = model.continuous_transition_matrix[:, :, j]
@@ -1519,3 +1590,477 @@ class TestPointProcessValidation:
         model = CorrelatedNoisePointProcessModel(**params)
         with pytest.raises(ValueError, match="process_cov"):
             model._initialize_parameters(jax.random.PRNGKey(0))
+
+
+class TestSharedSwitchingPointProcessBase:
+    """The structured models reuse ``SwitchingSpikeOscillatorModel``'s EM core."""
+
+    def test_em_core_is_inherited_from_the_shared_base(self) -> None:
+        from state_space_practice.point_process_models import (
+            BaseSwitchingPointProcessModel,
+        )
+        from state_space_practice.switching_point_process import (
+            SwitchingPointProcessBase,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        assert issubclass(BaseSwitchingPointProcessModel, SwitchingPointProcessBase)
+        for name in ("_e_step", "_m_step_dynamics", "_m_step_spikes", "fit_sgd"):
+            assert getattr(BaseSwitchingPointProcessModel, name) is getattr(
+                SwitchingSpikeOscillatorModel, name
+            ), name
+
+    def test_one_bin_m_step_updates_only_the_initial_state(self, com_pp_params) -> None:
+        """A single time bin carries no transition information: the dynamics
+        M-step must leave A/Q/Z alone and set the initial state from the
+        smoother posterior at t=0 instead of raising."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(3))
+        one_bin = jax.random.poisson(
+            jax.random.PRNGKey(2), 1.0, shape=(1, model.n_neurons)
+        ).astype(float)
+        model._e_step(one_bin)
+
+        A_before = model.continuous_transition_matrix
+        Z_before = model.discrete_transition_matrix
+        expected_mean = model.smoother_state_cond_mean[0]
+        expected_cov = model.smoother_state_cond_cov[0]
+        # Guard: the smoother moved the initial state, so equality is non-vacuous.
+        assert not jnp.allclose(model.init_mean, expected_mean)
+
+        model._m_step_dynamics()
+
+        np.testing.assert_allclose(model.init_mean, expected_mean)
+        np.testing.assert_allclose(model.init_cov, expected_cov)
+        np.testing.assert_array_equal(model.continuous_transition_matrix, A_before)
+        np.testing.assert_array_equal(model.discrete_transition_matrix, Z_before)
+        np.testing.assert_allclose(float(jnp.sum(model.init_discrete_state_prob)), 1.0)
+
+    @pytest.mark.slow
+    def test_e_step_reuses_module_level_log_intensity(self, monkeypatch) -> None:
+        """Every E-step must pass the single ``_linear_log_intensity`` object,
+        which the jitted filter caches by identity (see the matching
+        ``SwitchingSpikeOscillatorModel`` regression test)."""
+        import state_space_practice.switching_point_process as spp
+
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(40, 5)).astype(
+            float
+        )
+        model = CommonOscillatorPointProcessModel(
+            n_oscillators=1,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            freqs=jnp.array([8.0]),
+            damping_coef=jnp.array([0.95]),
+            process_variance=jnp.array([0.1]),
+        )
+
+        captured = []
+
+        # The GPB1 E-step calls the filter variant without pair-conditional
+        # outputs, GPB2 the public filter; spy on both.
+        def make_spy(real_filter):
+            def spy(*args, **kwargs):
+                captured.append(kwargs["log_intensity_func"])
+                return real_filter(*args, **kwargs)
+
+            return spy
+
+        for name in (
+            "switching_point_process_filter",
+            "_switching_point_process_filter_gpb1",
+        ):
+            monkeypatch.setattr(spp, name, make_spy(getattr(spp, name)))
+        model.fit(spikes, max_iter=2, key=jax.random.PRNGKey(42))
+
+        assert len(captured) >= 2
+        assert all(f is spp._linear_log_intensity for f in captured)
+
+
+class TestRelativeInitCovClip:
+    """The M-step init_cov clip is relative to the latent scale."""
+
+    def test_bounds_follow_the_latent_units(self, com_pp_params, caplog) -> None:
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        n, k = model.n_latent, model.n_discrete_states
+        eye = jnp.stack([jnp.eye(n)] * k, axis=-1)
+
+        # Latent state expressed in units 100x smaller: variances 1e-4x.
+        model.init_cov = 1e-4 * eye
+        model._record_init_cov_latent_scale()
+        small = 1e-6 * eye  # would be raised to 1e-4 by an absolute floor
+        with caplog.at_level("WARNING"):
+            np.testing.assert_allclose(
+                model._regularize_init_cov_update(small), small, rtol=1e-12
+            )
+        assert "init_cov eigenvalues clipped" not in caplog.text
+
+        with caplog.at_level("WARNING"):
+            clipped = model._regularize_init_cov_update(eye)  # 1.0 > 2e-4 cap
+        np.testing.assert_allclose(clipped, 2e-4 * eye, rtol=1e-10)
+        assert "init_cov eigenvalues clipped" in caplog.text
+
+    def test_warm_restarts_keep_the_initial_bounds(
+        self, com_pp_params, monkeypatch
+    ) -> None:
+        """``fit(skip_init=True)`` keeps the latent scale recorded by the
+        initialising fit, so a clipped init_cov cannot raise its own ceiling."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        n, k = model.n_latent, model.n_discrete_states
+        spikes = jnp.zeros((20, model.n_neurons))
+
+        # A numerically diffuse smoother at t=0: every M-step proposes an
+        # init_cov 10x the current one, which the clip must cap.
+        def diffuse_m_step_dynamics() -> None:
+            model.init_cov = model._regularize_init_cov_update(10.0 * model.init_cov)
+
+        monkeypatch.setattr(model, "_e_step", lambda _spikes: jnp.asarray(0.0))
+        monkeypatch.setattr(model, "_m_step_dynamics", diffuse_m_step_dynamics)
+        monkeypatch.setattr(model, "_m_step_spikes", lambda _spikes: None)
+        monkeypatch.setattr(model, "_warm_initialize_states", lambda _spikes: None)
+
+        model.fit(spikes, max_iter=1)
+        reference_scale = model._init_cov_latent_scale()
+        cap = 2.0 * reference_scale
+        # Guard: the first fit already hit the ceiling.
+        np.testing.assert_allclose(
+            model.init_cov, cap * jnp.stack([jnp.eye(n)] * k, -1)
+        )
+
+        for _ in range(3):
+            model.fit(spikes, max_iter=1, skip_init=True)
+            assert model._init_cov_latent_scale() == reference_scale
+            max_eig = float(jnp.max(jnp.linalg.eigvalsh(model.init_cov[..., 0])))
+            np.testing.assert_allclose(max_eig, cap, rtol=1e-12)
+
+    def test_non_finite_trace_warns_on_fallback_scale(
+        self, com_pp_params, caplog
+    ) -> None:
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        model.init_cov = model.init_cov.at[0, 0, 0].set(jnp.nan)
+        with caplog.at_level("WARNING"):
+            assert model._record_init_cov_latent_scale() == 1.0
+        assert "latent scale" in caplog.text
+
+    def test_default_identity_init_cov_keeps_the_absolute_bounds(
+        self, com_pp_params
+    ) -> None:
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        assert model._record_init_cov_latent_scale() == 1.0
+        n, k = model.n_latent, model.n_discrete_states
+        big = jnp.stack([5.0 * jnp.eye(n)] * k, axis=-1)
+        np.testing.assert_allclose(
+            model._regularize_init_cov_update(big),
+            jnp.stack([2.0 * jnp.eye(n)] * k, axis=-1),
+            rtol=1e-10,
+        )
+
+
+# ============================================================================
+# M-step exactness for the structured point-process models
+# ============================================================================
+
+
+def _pp_model_after_e_step(model):
+    """Simulate spikes from the model's own dynamics and run one E-step."""
+    from state_space_practice.simulate.simulate_switching_spikes import (
+        simulate_switching_spike_oscillator,
+    )
+    from state_space_practice.switching_point_process import SpikeObsParams
+
+    n_latent = model.n_latent
+    weights = jax.random.normal(jax.random.PRNGKey(3), (8, n_latent)) * 0.6
+    spikes, _, _ = simulate_switching_spike_oscillator(
+        n_time=400,
+        transition_matrices=model.continuous_transition_matrix,
+        process_covs=model.process_cov,
+        discrete_transition_matrix=jnp.array([[0.98, 0.02], [0.02, 0.98]]),
+        spike_weights=weights,
+        spike_baseline=jnp.full(8, 3.0),
+        dt=model.dt,
+        key=jax.random.PRNGKey(11),
+    )
+    model.spike_params = SpikeObsParams(
+        baseline=jnp.full((8, 2), 3.0),
+        weights=jnp.stack([weights, weights], axis=-1),
+    )
+    model.discrete_transition_matrix = jnp.array([[0.98, 0.02], [0.02, 0.98]])
+    return spikes
+
+
+@pytest.mark.slow
+class TestStructuredPointProcessMStepStationarity:
+    """Dynamics M-steps of CNM-PP / DIM-PP versus the expected objective
+    written out in ``recovery_helpers`` (GPB2 posterior, no Q regularization)."""
+
+    def test_cnm_pp_constrained_q_is_stationary(self):
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        coupling = jnp.zeros((2, 2, 2)).at[0, 1, 0].set(0.03)
+        phase = jnp.zeros((2, 2, 2)).at[0, 1, 0].set(0.5)
+        model = CorrelatedNoisePointProcessModel(
+            n_oscillators=2,
+            n_neurons=8,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            freqs=jnp.array([6.0, 11.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.array([[0.06, 0.02], [0.05, 0.02]]),
+            phase_difference=phase,
+            coupling_strength=coupling,
+            smoother_type="gpb2",
+            q_regularization=QRegularizationConfig(enabled=False),
+            update_spike_params=False,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = _pp_model_after_e_step(model)
+        # Start the Q update from a perturbed noise structure.
+        model.process_variance = model.process_variance * 1.5
+        model.coupling_strength = model.coupling_strength.at[0, 1, 1].set(0.01)
+        model._initialize_process_covariance()
+        model._e_step(spikes)
+        stats = rh.switching_posterior_stats(model)
+        Q_before = model.process_cov
+        model._m_step_dynamics()
+        model._project_parameters()
+
+        def Q_of(theta):
+            return jnp.stack(
+                [
+                    construct_correlated_noise_process_covariance(
+                        variance=jnp.asarray(theta[4 * j : 4 * j + 2]),
+                        phase_difference=jnp.zeros((2, 2))
+                        .at[0, 1]
+                        .set(theta[4 * j + 3]),
+                        coupling_strength=jnp.zeros((2, 2))
+                        .at[0, 1]
+                        .set(theta[4 * j + 2]),
+                    )
+                    for j in range(2)
+                ],
+                axis=-1,
+            )
+
+        theta = np.concatenate(
+            [
+                np.r_[
+                    np.asarray(model.process_variance)[:, j],
+                    np.asarray(model.coupling_strength)[0, 1, j],
+                    np.asarray(model.phase_difference)[0, 1, j],
+                ]
+                for j in range(2)
+            ]
+        )
+        np.testing.assert_allclose(Q_of(theta), model.process_cov, atol=1e-12)
+        A = model.continuous_transition_matrix
+
+        def f(t):
+            return rh.transition_objective(A, Q_of(t), stats)
+
+        grad = rh.central_difference_gradient(f, theta, 1e-8)
+        scale = np.max(np.abs(theta[[0, 1, 4, 5]]))
+
+        def _scale_derivative(Q):
+            return rh.central_difference_gradient(
+                lambda c: rh.transition_objective(A, Q * (1.0 + c[0]), stats),
+                np.zeros(1),
+                1e-7,
+            )[0]
+
+        grad_start = _scale_derivative(Q_before)
+        grad_end = _scale_derivative(np.asarray(model.process_cov))
+        # Guard: the start must be clearly non-stationary along the overall
+        # scale of Q, and the M-step must remove almost all of that slope.
+        assert abs(grad_start) > 0.1, "guard: the start is not optimal"
+        assert abs(grad_start) > 1e3 * abs(grad_end), (grad_start, grad_end)
+        # Relative to the objective's own scale (n_trans / variance).
+        assert np.max(np.abs(grad)) * scale < 1e-6 * stats["n_trans"].sum(), grad
+        assert float(rh.transition_objective(A, model.process_cov, stats)) > float(
+            rh.transition_objective(A, Q_before, stats)
+        )
+
+    @pytest.mark.parametrize("use_reparameterized_mstep", [False, True])
+    def test_dim_pp_transition_update_never_lowers_objective(
+        self, use_reparameterized_mstep
+    ):
+        """Start at a constrained point that beats the bare projection: the
+        standard DIM-PP M-step must keep it (generalized-EM safeguard) and the
+        reparameterized M-step must not lose objective."""
+        from state_space_practice.oscillator_utils import (
+            optimize_dim_transition_params_joint_until_stationary,
+        )
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        coupling = jnp.zeros((2, 2, 2)).at[1, 0, 0].set(0.3).at[0, 1, 1].set(0.3)
+        phase = jnp.zeros((2, 2, 2)).at[1, 0, 0].set(0.4).at[0, 1, 1].set(-0.4)
+        model = DirectedInfluencePointProcessModel(
+            n_oscillators=2,
+            n_neurons=8,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            freqs=jnp.array([6.0, 11.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.array([0.05, 0.03]),
+            phase_difference=phase,
+            coupling_strength=coupling,
+            smoother_type="gpb2",
+            q_regularization=QRegularizationConfig(enabled=False),
+            update_spike_params=False,
+            use_reparameterized_mstep=use_reparameterized_mstep,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = _pp_model_after_e_step(model)
+        model._e_step(spikes)
+        stats = rh.switching_posterior_stats(model)
+        Q = model.process_cov
+
+        projected = rh.dim_projected_mstep_parameters(stats, model)
+        obj_projected = float(
+            rh.transition_objective(projected["transition_matrix"], Q, stats)
+        )
+        polished = optimize_dim_transition_params_joint_until_stationary(
+            gamma1=jnp.asarray(stats["gamma1"]),
+            beta=jnp.asarray(stats["beta"]),
+            init_params=projected,
+            sampling_freq=model.sampling_freq,
+            process_cov=Q,
+            max_spectral_radius=model.max_spectral_radius,
+            max_damping=model.max_damping,
+        )
+        rh.set_dim_public_params(model, polished)
+        obj_start = float(
+            rh.transition_objective(model.continuous_transition_matrix, Q, stats)
+        )
+        # Guard: the bare projection would lower the objective from this start.
+        assert obj_start > obj_projected + 1e-3, (obj_start, obj_projected)
+
+        model._m_step_dynamics()
+        model._project_parameters()
+        obj_after = float(
+            rh.transition_objective(model.continuous_transition_matrix, Q, stats)
+        )
+        assert obj_after >= obj_start - 1e-8 * abs(obj_start), (obj_after, obj_start)
+
+
+# ============================================================================
+# Refitting restarts from the constructor's initial parameters
+# ============================================================================
+
+_REFIT_KEY = jax.random.key(0)
+# Constructor parameters that seed initialization; fitting overwrites some.
+_REFIT_INIT_ATTRS = (
+    "freqs",
+    "damping_coef",
+    "process_variance",
+    "phase_difference",
+    "coupling_strength",
+)
+
+
+def _refit_case(kind: str):
+    """A model factory and spikes from the ``kind`` scenario."""
+    simulate = (
+        simulate_cnm_pp_scenario if kind == "CNM-PP" else simulate_dim_pp_scenario
+    )
+    scenario = simulate(n_time=100, seed=42)
+    p = scenario["params"]
+    cls = (
+        CorrelatedNoisePointProcessModel
+        if kind == "CNM-PP"
+        else DirectedInfluencePointProcessModel
+    )
+    kwargs = {"use_reparameterized_mstep": True} if kind == "DIM-PP-reparam" else {}
+
+    def make():
+        return cls(
+            n_oscillators=p["n_oscillators"],
+            n_neurons=p["n_neurons"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            dt=p["dt"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+            **kwargs,
+        )
+
+    return make, jnp.asarray(scenario["spikes"])
+
+
+def _run_fitter(model, method: str, spikes, **kwargs) -> list[float]:
+    if method == "fit":
+        return model.fit(spikes, key=_REFIT_KEY, max_iter=3, **kwargs)
+    return model.fit_sgd(spikes, key=_REFIT_KEY, num_steps=5, **kwargs)
+
+
+def _init_params(model) -> dict:
+    return {name: np.asarray(getattr(model, name)) for name in _REFIT_INIT_ATTRS}
+
+
+@pytest.mark.slow
+class TestRefitRestartsFromConstructorParameters:
+    """``fit`` starts from the constructor's parameters on every call.
+
+    Fitting overwrites public parameters that seed initialization (CNM-PP:
+    noise variance, coupling and phase; DIM-PP: frequency, damping, coupling
+    and phase), so a repeat ``fit`` must not read them back: it reproduces a
+    fresh model. ``skip_init=True`` is the explicit warm start. (``fit_sgd``
+    initializes only on a model's first fit and otherwise continues from the
+    current parameters, so only ``fit`` is the second call here.)
+    """
+
+    @pytest.mark.parametrize("kind", ["CNM-PP", "DIM-PP", "DIM-PP-reparam"])
+    @pytest.mark.parametrize("first", ["fit", "fit_sgd"])
+    def test_repeat_fit_reproduces_fresh_model(self, kind, first) -> None:
+        make, spikes = _refit_case(kind)
+        fresh = make()
+        fresh_history = _run_fitter(fresh, "fit", spikes)
+
+        model = make()
+        constructed = _init_params(model)
+        _run_fitter(model, first, spikes)
+        # Guard: the first fit moved parameters that seed initialization.
+        fitted = _init_params(model)
+        assert any(not np.array_equal(constructed[k], fitted[k]) for k in fitted)
+
+        history = model.fit(spikes, key=_REFIT_KEY, max_iter=3)
+
+        assert history == fresh_history
+        # Every attribute of the fresh fit is bit-identical on the refit model
+        # (attributes only the refit model has, e.g. the SGD sequence length,
+        # are bookkeeping of its earlier fit and are not compared).
+        fresh_state = snapshot_model_state(fresh)
+        refit_state = snapshot_model_state(model)
+        assert_snapshots_equal({k: refit_state[k] for k in fresh_state}, fresh_state)
+
+    @pytest.mark.parametrize("kind", ["CNM-PP", "DIM-PP", "DIM-PP-reparam"])
+    def test_skip_init_continues_from_fitted_parameters(self, kind) -> None:
+        make, spikes = _refit_case(kind)
+        model = make()
+        fresh_history = _run_fitter(model, "fit", spikes)
+        ll_at_fitted = float(model._e_step(spikes))
+
+        history = _run_fitter(model, "fit", spikes, skip_init=True)
+
+        # The resumed fit starts at the fitted parameters (initialization was
+        # not rerun), not where a fresh fit starts.
+        np.testing.assert_allclose(history[0], ll_at_fitted, rtol=1e-8)
+        assert history[0] != fresh_history[0]

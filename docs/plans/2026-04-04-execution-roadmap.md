@@ -44,6 +44,7 @@ Both tracks share the same dependency constraints. The scientific track has a "m
 | Hamiltonian Oscillator SSM | **DONE** (hamiltonian_spikes/lfp/joint/switching.py, 34 tests, nonlinear>linear baseline verified) |
 | Hamiltonian Review Fixes | **DONE** (all 7 phases: runtime crashes, state layout, PRNG split, Phase 4 weighted-Jacobian smoother, smoke tests, API cleanup) |
 | Review Remediation | **PARTIAL/DONE IN CODE** (fast suite green; remaining items are deferred hygiene, not blockers) |
+| [Drifting Graph-GP Place Fields](2026-07-16-drifting-graph-gp-place-field.md) | **DONE, STAGES 0–2** (`GraphPlaceFieldModel`, static estimator, masked inference, EM/SGD, field trajectories and scoring; drift-scale learning experimental; richer dynamics and external comparisons deferred) |
 | Spike-field coupling cross-check | **DONE** (`coupling_*` modules; LFP-conditioned two-stage path validated) |
 | Cross-region oscillator coupling | **BLOCKED AS SPECIFIED** (spike-only latent + loading inference is degenerate; requires LFP-conditioned rewrite) |
 | Switching spike oscillator plan | **CODED, SCIENCE CAVEAT** (numerically tested, but spike-only joint latent/loading interpretation is not identifiable) |
@@ -84,6 +85,68 @@ only shared test/data scaffolding.
   `lax.scan` SGD if benchmarks show meaningful speedup.
 - **Phase E:** Keep joint-learning/drift and dual-latent CA1-mPFC plans
   prototype-first until their prerequisites exist as checked-in modules.
+
+## Extension Queue (2026-09-28)
+
+Eleven phased plans drafted on 2026-09-28 from a brainstorm against recent
+literature. Each lives in `docs/plans/<slug>/` with its own `PLAN.md` (router,
+`Status:`), `overview.md`, phase files and, where needed, `shared-contracts.md`
+/ `designs.md`. Policy shared by all eleven: every change is an additive,
+keyword-only option whose default reproduces today's numbers bit-for-bit; no
+signature breaks, no deprecation phases. Each plan's decisions and open
+questions are recorded in its `overview.md` — do not restate them here.
+
+| Order | Plan | Phases | Depends on | Notes |
+|---|---|---|---|---|
+| **E1** | `identifiability-diagnostics/` | 2 | — | Observed-Fisher-information report; gate for E6 phase 2, E9 phase 2 and E10. |
+| **E2** | `wolf-robust-updates/` | 3 | — | Generalised-Bayes weighted updates. Oscillator models go through the *switching* filter, hence their own phase. Spike weights use unit-deviance residuals, not Pearson. |
+| **E3** | `glm-families-nb-zig/` | 2 | — | Negative binomial, then zero-inflated gamma. Makes `family=` first-class on the point-process filters (they currently call the Poisson-only legacy update directly). |
+| **E4** | `masks-and-multi-sequence/` | 5 | — | `obs_mask=` at `kalman_filter` (the parallel smoother never sees `H`/`R`/`y`); masks reach the oscillator models through `switching_kalman_filter` / its M-step. Multi-sequence batching lives in the models, not `run_em`. |
+| **E5** | `iterated-parallel-laplace-smoother/` | 4 | E3 (`family=`); E4 optional | Gauss–Newton re-linearisation + parallel information-form filter. Phase 3 is the position decoder; phase 4 retires `temporal_rate_gp`'s private Newton loop onto the shared core. |
+| **E6** | `recurrent-switching-transitions/` | 5 (1a/1b/1c, 2a/2b) | E1 gate for phase 2 | Covariate- then state-dependent transition logits across the Gaussian / point-process / choice switching families. `switching_kalman_filter` becomes a validating wrapper over a jitted core (**Changed** entry). |
+| **E7** | `multi-map-place-fields/` | 1 (+1b) | 1b gated on E6 phase 1 | Static-maps HMM with a shared discrete state. Per-map drift is deferred with a three-part trigger (storage runs to 10²–10³× the single-map covariance store). |
+| **E8** | `successor-representation-basis/` | 1 | — | Planning prototype showed the held-out gain over the Laplacian basis comes from movement-graph adaptation, not direction (a symmetrised SR ties the directed one); the plan carries a `symmetrize=True` control arm and restates the tests accordingly. |
+| **E9** | `volatile-kalman-choice/` | 3 | E1 gate for phase 2 | Piray & Daw VKF transcribed from the authors' code; hybrid `CovariateChoiceModel(dynamics="volatile")`; comparison harness against fixed-q and switching models. Motivation: Comrie et al. 2024 (spatial bandit). |
+| **E10** | `theta-sweep-amplitude/` | 3 (1, 2a, 2b) | E1 gate; E4 optional | 1-D linearised track; requires LFP theta phase as an input (the J16 session has none), so synthetic validation is the gate. |
+| **E11** | `streaming-filters/` | 4 (1, 2, 3a, 3b) | E2 / E4 optional | Pre-jitted single-step API, fixed-lag smoothing, delta-method phase intervals. Measured CPU step latency: 8–80 µs Gaussian, 50–100 µs point process, 0.45–1.35 ms decoder KDE path. |
+
+### Shared-code sequencing hazards
+
+Several plans edit the same function. Merge order matters more than plan order:
+
+- `position_decoder._run_filter_scan` — E11 phase 3b is a pure, bitwise-checked
+  extraction of the step body; land it **first**, then E2 phase 3 and E5 phase 3
+  build on the extracted step rather than re-editing the scan.
+- `point_process_kalman.GLMFamily` — optional fields are appended by E3
+  (`score`, `validate_observations`, `loglik_per_obs`) and E2 (`unit_deviance`).
+  E2/E3/E4 share one `loglik_per_obs` field: reuse it when already present.
+  Scalar `loglik_*` callbacks keep their three-argument signatures; E4 masks
+  per-observation terms and tiles masks over predictor groups for scores and
+  information. Preserve existing field order and four-positional-field
+  constructors; pass optional additions by keyword.
+- The point-process filter `_step` — E3, E4, E2 and E5 each add a keyword branch
+  with a `None` default. Every one must leave the `None` path bit-identical;
+  `tests/test_em_golden_regression.py` is the gate for each PR.
+- `switching_kalman_filter` — E6 phase 1a restructures it (wrapper over a jitted
+  core); land that before E2 phase 2 and E4 phase 2 add their keywords.
+- `utils.hmm_viterbi` 3-D transition stack — owned by E6 phase 1a; E7 phase 1b
+  consumes it and must not re-add it.
+
+### Suggested order
+
+E1 → E3 → E4 → E2 → E11 (at least phase 3b) → E5 → E6 → E7 / E8 / E9 / E10 in
+any order. E1 phase 1, E3 phase 1 and E8 are small and independent and can run
+in parallel from the start.
+
+### Pre-existing issues noticed while planning (not fixed)
+
+- `src/state_space_practice/covariate_choice.py:20-21` (and two older plan
+  docs) cite Piray & Daw as 2021, 17(4); the paper is PLoS Comput Biol 2020,
+  16(7), e1007963. E9 phase 2 corrects the module docstring.
+- `src/state_space_practice/position_decoder.py:1799` raises `RuntimeError`
+  before fit where the project convention is `NotFittedError`.
+- The `.venv` has an editable install of the sibling `neurospatial` checkout at
+  commit `2522021f`, while `pyproject.toml` / `uv.lock` pin `e81dec62`.
 
 ## Dependency Notes
 

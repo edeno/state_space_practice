@@ -1,11 +1,30 @@
 # ruff: noqa: E402
 """Shared fixtures and Hypothesis strategies for state space model tests."""
 
-from typing import Tuple
+import ast
+import functools
+import inspect
+import os
+import textwrap
 
 import jax
 
 jax.config.update("jax_enable_x64", True)
+
+# Opt-in persistent XLA compilation cache. Much of the suite's wall time is
+# compiling the same jitted filters; setting SSP_JAX_CACHE_DIR to a directory
+# stores compiled executables there so that a *later, separate* pytest run
+# reuses them instead of recompiling. It is off by default because the cache
+# is not safe for concurrent writers: two pytest runs sharing one directory
+# can leave truncated entries, which JAX reports as "Error reading persistent
+# compilation cache entry" (a warning that ``filterwarnings = error`` turns
+# into a test failure). Give concurrent runs separate directories, and clear
+# the directory if it grows too large -- every compiled entry is kept.
+_cache_dir = os.environ.get("SSP_JAX_CACHE_DIR", "")
+if _cache_dir:
+    jax.config.update("jax_compilation_cache_dir", _cache_dir)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
 
 import jax.numpy as jnp
 import numpy as np
@@ -21,7 +40,113 @@ from jax import Array, random
 settings.register_profile("ci", max_examples=100, deadline=None, derandomize=True)
 # Dev profile: Faster iteration during development
 settings.register_profile("dev", max_examples=10, deadline=None)
-settings.load_profile("dev")
+# Select with HYPOTHESIS_PROFILE=ci (CI sets this); defaults to "dev".
+settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
+
+
+# --- Automatic ``slow`` marking ---------------------------------------------
+#
+# Any test that runs EM, SGD or a full fit must be marked slow so the fast
+# suite (``-m "not slow"``) stays quick. Rather than rely on every author
+# remembering the decorator, a test is marked slow at collection time when
+#
+# 1. its own source, or the source of any fixture it (transitively) requests,
+#    calls ``.fit(``, ``.fit_sgd(`` or ``run_em(`` outside a
+#    ``with pytest.raises(...)`` block (input-validation tests that expect
+#    ``fit`` to raise before doing any work stay in the fast suite), or
+# 2. its node id contains an entry of ``_SLOW_TEST_REGISTRY`` (for tests whose
+#    fitting happens in helper functions, which the source scan can't see).
+#
+# Explicit ``@pytest.mark.slow`` keeps working as before.
+
+_FIT_METHODS = frozenset({"fit", "fit_sgd"})
+_FIT_FUNCTIONS = frozenset({"run_em"})
+
+# Node-id substrings (``file.py::Class`` or ``file.py::Class::test``) for tests
+# that run EM / optimizers through helpers the source scan can't see. Chosen
+# from ``--durations`` of the fast suite.
+_SLOW_TEST_REGISTRY: tuple[str, ...] = (
+    # EM driven through conftest.assert_em_rolls_back_on_ll_decrease
+    "test_smith_learning_algorithm.py::TestSmithEMRollback::",
+    "test_oscillator_models.py::TestOscillatorEMRollback::",
+    # hand-rolled EM loops / optimizers
+    "test_oscillator_models.py::TestOscillatorPaperStructure::"
+    "test_em_pools_observation_covariance_across_states",
+    "test_switching_kalman.py::TestSwitchingEMMonotonicity::",
+    "test_switching_kalman.py::test_joint_dim_optimizer_improves_total_q_and_",
+    "test_switching_point_process.py::TestSwitchingSpikeOscillatorFitValidation::",
+    "test_switching_point_process.py::TestSecondOrderClippedWarmStart::"
+    "test_single_neuron_converges_from_clipped_warm_start",
+    "test_switching_point_process.py::TestSecondOrderClippedWarmStart::"
+    "test_mixture_converges_from_clipped_warm_start",
+)
+
+
+def _is_fit_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr in _FIT_METHODS or func.attr in _FIT_FUNCTIONS
+    return isinstance(func, ast.Name) and func.id in _FIT_FUNCTIONS
+
+
+def _is_pytest_raises_block(node: ast.AST) -> bool:
+    if not isinstance(node, ast.With):
+        return False
+    for item in node.items:
+        expr = item.context_expr
+        if isinstance(expr, ast.Call):
+            expr = expr.func
+        if isinstance(expr, ast.Attribute) and expr.attr == "raises":
+            return True
+    return False
+
+
+def _calls_fit_outside_raises(node: ast.AST) -> bool:
+    if _is_pytest_raises_block(node):
+        return False
+    if _is_fit_call(node):
+        return True
+    return any(_calls_fit_outside_raises(child) for child in ast.iter_child_nodes(node))
+
+
+@functools.cache
+def _function_runs_fit(function) -> bool:
+    try:
+        source = textwrap.dedent(inspect.getsource(function))
+        tree = ast.parse(source)
+    except (OSError, TypeError, SyntaxError):
+        return False
+    return _calls_fit_outside_raises(tree)
+
+
+def _fixture_functions(item):
+    """Functions of the fixtures ``item`` requests (closure), best effort."""
+    fixtureinfo = getattr(item, "_fixtureinfo", None)
+    if fixtureinfo is None:
+        return []
+    functions = []
+    for name in fixtureinfo.names_closure:
+        fixturedefs = fixtureinfo.name2fixturedefs.get(name) or ()
+        functions.extend(getattr(fd, "func", None) for fd in fixturedefs)
+    return [f for f in functions if f is not None]
+
+
+def _item_runs_fit(item) -> bool:
+    function = getattr(item, "function", None)
+    if function is not None and _function_runs_fit(function):
+        return True
+    return any(_function_runs_fit(f) for f in _fixture_functions(item))
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        if item.get_closest_marker("slow") is not None:
+            continue
+        in_registry = any(entry in item.nodeid for entry in _SLOW_TEST_REGISTRY)
+        if in_registry or _item_runs_fit(item):
+            item.add_marker(pytest.mark.slow)
 
 
 # --- Hypothesis Strategies for State Space Models ---
@@ -510,7 +635,7 @@ def to_jax(*arrays: np.ndarray) -> tuple[jax.Array, ...]:
 
 
 @pytest.fixture(scope="session")
-def simple_1d_model() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
+def simple_1d_model() -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Provides parameters and data for a simple 1D random walk model.
 
     Used by both test_kalman.py and test_switching_kalman.py.
@@ -531,7 +656,7 @@ def simple_1d_model() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
     obs = []
     k1, k2 = random.split(key)
 
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         w = random.multivariate_normal(k1, jnp.zeros(n_cont_states), process_cov)
         true_states.append(transition_matrix @ true_states[-1] + w)
         k1, _ = random.split(k1)
@@ -606,6 +731,26 @@ def assert_em_rolls_back_on_ll_decrease(
 
 
 # --- Spike-field coupling validation fixtures ---
+
+
+@pytest.fixture
+def sgd_step_builds(monkeypatch: pytest.MonkeyPatch) -> list[None]:
+    """One entry per compiled SGD step ``fit_sgd`` builds (a step-cache miss).
+
+    Refitting a model on same-shaped data should reuse its compiled step, so a
+    repeat ``fit_sgd`` call adds no entry.
+    """
+    from state_space_practice import sgd_fitting
+
+    builds: list[None] = []
+    build = sgd_fitting._build_sgd_step
+
+    def counting_build(*args: object, **kwargs: object) -> object:
+        builds.append(None)
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(sgd_fitting, "_build_sgd_step", counting_build)
+    return builds
 
 
 @pytest.fixture

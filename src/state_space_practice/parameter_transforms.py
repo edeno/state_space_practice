@@ -16,13 +16,19 @@ Usage::
     params = transform_to_constrained(unc_params, param_spec)
 """
 
+from __future__ import annotations
+
+import functools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import cast
 
 import jax
 import jax.numpy as jnp
 from jax import Array
+
+from state_space_practice.utils import contains_tracer
 
 
 @dataclass(frozen=True)
@@ -50,14 +56,9 @@ def _dtype_tiny(x: Array) -> Array:
 
 def _check_array(condition: Array, message: str) -> None:
     """Validate concrete arrays while leaving traced JAX values jittable."""
-    try:
-        ok = bool(jnp.all(condition))
-    except (
-        jax.errors.ConcretizationTypeError,
-        jax.errors.TracerBoolConversionError,
-    ):
+    if contains_tracer(condition):
         return
-    if not ok:
+    if not bool(jnp.all(condition)):
         raise ValueError(message)
 
 
@@ -118,7 +119,13 @@ def positive_capped(max_val: float = 50.0) -> ParameterTransform:
     """
     if not math.isfinite(max_val) or max_val <= 0.0:
         raise ValueError("max_val must be positive and finite.")
+    # One transform per cap: the SGD compiled-step cache keys on the parameter
+    # spec, and fresh closures would make equal specs compare unequal.
+    return _positive_capped(float(max_val))
 
+
+@functools.cache
+def _positive_capped(max_val: float) -> ParameterTransform:
     def _to_constrained(x: Array) -> Array:
         return max_val * jax.nn.sigmoid(x)
 
@@ -193,7 +200,7 @@ def _psd_to_real(P: Array) -> Array:
     # direction can use softplus rather than exp and avoid optimizer overflow.
     diag = jnp.maximum(jnp.diag(L) - _dtype_tiny(L), _dtype_tiny(L))
     L = L.at[jnp.diag_indices_from(L)].set(_inverse_softplus(diag))
-    return L[jnp.tril_indices_from(L)]
+    return cast(Array, L[jnp.tril_indices_from(L)])
 
 
 def _real_to_psd(flat: Array) -> Array:
@@ -245,9 +252,7 @@ def _real_to_stochastic(logits: Array) -> Array:
     logits = _as_float_array(logits)
     if logits.shape[-1] == 0:
         return jnp.ones(logits.shape[:-1] + (1,), dtype=logits.dtype)
-    full_logits = jnp.concatenate(
-        [logits, jnp.zeros_like(logits[..., :1])], axis=-1
-    )
+    full_logits = jnp.concatenate([logits, jnp.zeros_like(logits[..., :1])], axis=-1)
     return jax.nn.softmax(full_logits, axis=-1)
 
 
@@ -267,12 +272,12 @@ def frozen(transform: ParameterTransform) -> ParameterTransform:
 
 
 def _validate_matching_keys(
-    values: dict,
-    spec: dict,
+    values: dict[str, Array],
+    spec: dict[str, ParameterTransform],
     *,
     values_name: str,
     allow_missing_non_trainable: bool = False,
-    static_params: Optional[dict] = None,
+    static_params: dict[str, Array] | None = None,
 ) -> None:
     value_keys = set(values)
     spec_keys = set(spec)
@@ -291,11 +296,11 @@ def _validate_matching_keys(
 
 
 def transform_to_unconstrained(
-    params: dict,
-    spec: dict,
+    params: dict[str, Array],
+    spec: dict[str, ParameterTransform],
     *,
     include_non_trainable: bool = True,
-) -> dict:
+) -> dict[str, Array]:
     """Transform constrained parameters to unconstrained optimizer coordinates.
 
     Parameters marked ``trainable=False`` are included by default for backwards
@@ -312,11 +317,11 @@ def transform_to_unconstrained(
 
 
 def transform_to_constrained(
-    unc_params: dict,
-    spec: dict,
+    unc_params: dict[str, Array],
+    spec: dict[str, ParameterTransform],
     *,
-    static_params: Optional[dict] = None,
-) -> dict:
+    static_params: dict[str, Array] | None = None,
+) -> dict[str, Array]:
     """Transform a dict of unconstrained parameters back to constrained space.
 
     ``static_params`` supplies already-constrained parameters omitted from

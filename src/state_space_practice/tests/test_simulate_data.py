@@ -5,6 +5,7 @@ including receptive field models and Eden/Brown 2004 simulations.
 """
 
 import numpy as np
+import pytest
 
 from state_space_practice.simulate_data import (
     receptive_field_model,
@@ -78,7 +79,9 @@ class TestReceptiveFieldModel:
         params_narrow = np.array([np.log(10.0), center, 5.0])
         params_wide = np.array([np.log(10.0), center, 20.0])
 
-        rate_narrow = receptive_field_model(np.array([center + distance]), params_narrow)
+        rate_narrow = receptive_field_model(
+            np.array([center + distance]), params_narrow
+        )
         rate_wide = receptive_field_model(np.array([center + distance]), params_wide)
 
         assert rate_wide > rate_narrow
@@ -130,9 +133,44 @@ class TestSimulateEdenBrown2004Jump:
 
         # Observed mean should be within an order of magnitude of expected
         np.testing.assert_allclose(
-            observed_mean_count, expected_mean_count, rtol=1.0,
+            observed_mean_count,
+            expected_mean_count,
+            rtol=1.0,
             err_msg="Observed spike rate differs from model prediction by >2x",
         )
+
+
+@pytest.mark.parametrize(
+    "simulate", [simulate_eden_brown_2004_jump, simulate_eden_brown_2004_linear]
+)
+class TestEdenBrownSeeding:
+    """``seed`` makes the spike draws reproducible; the default stays
+    nondeterministic; ``seed`` and ``rng`` are mutually exclusive."""
+
+    def test_same_seed_same_spikes(self, simulate) -> None:
+        np.testing.assert_array_equal(
+            simulate(seed=3).spike_indicator, simulate(seed=3).spike_indicator
+        )
+
+    def test_seed_matches_equivalent_generator(self, simulate) -> None:
+        np.testing.assert_array_equal(
+            simulate(seed=3).spike_indicator,
+            simulate(rng=np.random.default_rng(3)).spike_indicator,
+        )
+
+    def test_different_seeds_differ(self, simulate) -> None:
+        assert not np.array_equal(
+            simulate(seed=3).spike_indicator, simulate(seed=4).spike_indicator
+        )
+
+    def test_default_is_nondeterministic(self, simulate) -> None:
+        assert not np.array_equal(
+            simulate().spike_indicator, simulate().spike_indicator
+        )
+
+    def test_rng_and_seed_together_raise(self, simulate) -> None:
+        with pytest.raises(ValueError, match="either rng or seed"):
+            simulate(rng=np.random.default_rng(0), seed=0)
 
 
 class TestSimulateEdenBrown2004Linear:

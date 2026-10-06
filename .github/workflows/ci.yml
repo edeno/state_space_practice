@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  schedule:
+    # Nightly full suite (including @pytest.mark.slow), 06:17 UTC.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: "Also run the full (slow) test suite"
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HYPOTHESIS_PROFILE: ci
+  JAX_PLATFORMS: cpu
+  # Plots in tests render off-screen.
+  MPLBACKEND: Agg
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs derives the version from tags
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked --extra test --extra coupling
+      - name: ruff check
+        run: uv run --no-sync ruff check src/ notebooks/ scripts/
+      - name: ruff format
+        run: uv run --no-sync ruff format --check src/ notebooks/ scripts/
+      - name: mypy (whole package)
+        run: uv run --no-sync mypy
+
+  test:
+    name: Tests (fast, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked --extra test --extra coupling
+      - name: pytest (not slow)
+        run: uv run --no-sync pytest -m "not slow" -q
+
+  full-suite:
+    name: Tests (full suite, Python 3.12)
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.full_suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked --extra test --extra coupling --extra spatial
+      - name: pytest (all tests)
+        run: uv run --no-sync pytest -q

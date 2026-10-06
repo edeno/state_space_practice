@@ -4,7 +4,7 @@
 
 **Goal:** Recover each neuron's time-varying, graph-respecting place-field trajectory `eta_{c,t} = Phi w_{c,t}` from position-aligned Poisson spikes. The drift scale `q_c` controls temporal flexibility and may be supplied or tuned; recovering its generating value is not an acceptance target.
 
-**Architecture:** Reuse the existing point-process Laplace-EKF primitives (`point_process_kalman.py`), Kalman EM helpers (`kalman.py`), and the SGD mixin (`sgd_fitting.py`). The novelty is (1) a geometry-aware basis `Φ` (the smoothest Laplacian eigenvectors) already built by the Stage-0 substrate in `graph_place_field.py`, and (2) a shared *diagonal-in-the-eigenbasis* spectral shape `S = (κ²I + diag(λ))^(−α)` that ties the prior `P₀ = τ²S`, the initial covariance, and the per-neuron drift `Q_c = q_c·S` together, so "smoothness" reduces to a handful of tunable scalars (`τ²`, `κ²`, per-neuron `q_c`). `τ²` and `κ²` are learnable; `q_c` is fixed by default and its learning path is experimental (Amendment 1). Neurons are conditionally independent given `Φ`, so the E-step is a `jax.vmap` of the single-neuron Laplace-EKF (dimension `rank`) over neurons — deliberately **not** the block-diagonal fast path, which requires identical per-neuron `Q`.
+**Architecture:** Reuse the existing point-process Laplace-EKF primitives (`point_process_kalman.py`), Kalman EM helpers (`kalman.py`), and the SGD mixin (`sgd_fitting.py`). The novelty is (1) a geometry-aware basis `Φ` (the smoothest Laplacian eigenvectors) already built by the Stage-0 substrate in `graph_place_field.py`, and (2) a shared *diagonal-in-the-eigenbasis* spectral shape `S = (κ²I + diag(λ))^(−α)` that ties the prior `P₀ = τ²S`, the initial covariance, and the per-neuron drift `Q_c = q_c·S` together, so "smoothness" reduces to a handful of tunable scalars (`τ²`, `κ²`, per-neuron `q_c`). `τ²` and `κ²` are learnable; `q_c` is fixed by default and its learning path is experimental (Amendment 1). Neurons are conditionally independent given `Φ`, so the E-step is a `jax.vmap` of the single-neuron Laplace-EKF (dimension `rank`) over neurons using the local masked full-grid filter described in Amendment 2.
 
 **Tech Stack:** Python 3.10–3.12, JAX (x64), `neurospatial` (spatial substrate), `optax` (SGD), `scipy` (eigensolve, independent-optimizer parity check), `pytest` + `hypothesis`. Managed by `uv`.
 
@@ -12,7 +12,7 @@
 
 ## Implementation status & amendments (post-implementation reconciliation)
 
-**Status:** Stages 0–2 (Tasks 1–8) are **implemented and committed** on `feat/graph-place-field`. The committed code in `graph_place_field.py` / `test_graph_place_field.py` is authoritative; several task sections **below describe the original design and were superseded during implementation** — the amendments here take precedence over the task text and code blocks that follow.
+**Status:** Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. The committed code in `graph_place_field.py` / `test_graph_place_field.py` is authoritative; several task sections **below describe the original design and were superseded during implementation** — the amendments here take precedence over the task text and code blocks that follow.
 
 1. **Latent field tracking is the primary acceptance target; `q_c` estimation is not.** The implementation must recover the time-varying log-rate field over time and every graph bin and substantially outperform both causal filtering and a single static field. `predict_log_rate_trajectory` exposes this primary posterior output without averaging away the drift. The synthetic tracking contract removes both the common rate baseline and each bin's temporal mean before scoring, so a static spatial pattern cannot pass. It uses the constructor's default `q_c`, deliberately 10x below the generating value, and validates three independent sessions after cold-start burn-in. `q_c` is fixed by default because the approximate Laplace-EKF marginal likelihood does not reliably identify its generating value: profiled with all else fixed, the marginal LL is monotone in `q_c` rather than peaking at the generating value, and the closed-form Gaussian M-step is a self-confirming fixed point (returns ~its initialization; the same is true of the sibling `PlaceFieldModel`). Enabling `update_drift_scale=True` (EM) or learning `q_c` via `fit_sgd` is an explicit, experimental opt-in and is **not** validated to recover the true drift scale. There is therefore no generating-`q_c` recovery test; instead, `test_default_model_tracks_drifting_field_over_time` validates full latent-trajectory recovery under timescale misspecification and `test_drift_scale_mstep_matches_closed_form` validates the optional M-step algebra. Future automatic timescale selection can use validation data or a redesigned likelihood without changing the trajectory-recovery goal.
 
@@ -26,6 +26,31 @@
 
 6. **CNM working-tree WIP excluded.** Unrelated `CorrelatedNoisePointProcessModel` changes that were in the working tree are stashed, not part of this branch.
 
+7. **Current fitting contracts (2026-10-05).** The integrated model uses the shared `run_em` driver, typed `FittedAttribute` posteriors, and `_record_fit_result` / `_clear_fit_state` for fit metadata. `fit_sgd` is a forwarding wrapper; data validation and initialization happen in `_prepare_sgd_data` after optimizer settings are validated. `_finalize_sgd` returns the marginal log-likelihood, and `_sgd_param` keeps repeated fits from invalidating the compiled-step cache. Invalid SGD settings/data preserve an earlier fit; a non-finite fit clears posteriors and shared results. Unfitted predictions raise `NotFittedError`; unusable likelihoods raise `NonFiniteLikelihoodError`. The historical task snippets below predate these contracts. The `spatial` extra now resolves the git commit pinned in `uv.lock`, rather than an editable sibling checkout. Both topology-collision and same-size edge-reweighting fingerprint regression tests are retained.
+
+
+---
+
+## Integration validation (2026-10-05)
+
+Validated with Python 3.11, x64 enabled, and the `neurospatial` git commit pinned
+in `uv.lock` (`uv sync --locked --extra test --extra coupling --extra spatial`).
+The editable sibling checkout is not used for this validation.
+
+- Graph and fitting-contract slice: **83 passed**, including every slow graph
+  test, three-seed drift tracking, fit metadata, failed-fit cleanup, and repeated
+  SGD step reuse. Command: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py src/state_space_practice/tests/test_fit_contract.py -k "graph or Graph" -q`.
+- Package fast suite: **2427 passed, 1 skipped, 949 deselected**. Command:
+  `LOKY_MAX_CPU_COUNT=4 uv run --no-sync pytest -m "not slow" -q`. The worker
+  limit prevents joblib's physical-core detection warning in the restricted
+  macOS execution environment.
+- Ruff lint and formatting checks pass for `src/`, `notebooks/`, and `scripts/`.
+- Whole-package mypy passes for all **47 source files**. The graph module also
+  passes with an untyped spatial dependency, matching CI without the spatial extra.
+
+The field-recovery acceptance thresholds were preserved. External estimator
+comparisons and Stage 3 remain deferred as described above and below.
+
 ---
 
 ## Global Constraints
@@ -33,10 +58,10 @@
 Every task's requirements implicitly include this section. Values copied verbatim from the spec and repo `CLAUDE.md`.
 
 - **x64 is mandatory.** The Laplace-EKF covariance propagation NaNs in float32 on long sequences. Tests inherit x64 from `tests/conftest.py` (`jax.config.update("jax_enable_x64", True)` at line 8). Any standalone script must set x64 **before** importing `jax.numpy` or this package.
-- **`neurospatial` dependency.** It is declared in the `spatial` optional extra and editable-pinned to `../neurospatial` (`pyproject.toml` lines 44, 98). The eventual goal (spec) is a *core* runtime dependency, but that must wait until `neurospatial>=0.8.0` publishes to PyPI. Until then: set up the environment with `uv sync --extra test --extra spatial`. Do **not** move `neurospatial` into the mandatory `dependencies` list in this plan.
+- **`neurospatial` dependency.** It is declared in the `spatial` optional extra and pinned to a git commit in `pyproject.toml` / `uv.lock`. Set up the environment with `uv sync --locked --extra test --extra coupling --extra spatial`. Do **not** replace the pinned dependency with an editable sibling checkout when validating this plan.
 - **Tests importing `neurospatial` must `pytest.importorskip("neurospatial")`** at module top (see `tests/test_graph_place_field.py:13`), so the fast suite still collects when the `spatial` extra is absent.
 - **`α` (smoothness exponent) is a fixed hyperparameter, default `1.0`.** It is never an EM scalar step. `κ²` is fit by SGD or an outer optimizer only, never inside the EM M-step (it reshapes `S` nonlinearly).
-- **Per-neuron `vmap`, not the block path.** The graph model needs a free per-neuron `q_c`; the block-diagonal fast path in `point_process_kalman` requires *identical* per-neuron `A`/`Q` and must not be used here.
+- **Per-neuron `vmap`.** Use the graph model's local masked full-grid filter with independent per-neuron `q_c` values. Preserve its row-zero prior and missing-observation conventions (Amendment 2).
 - **`PlaceFieldModel` is not modified.** All new code lives in `graph_place_field.py` and its test file.
 - **Behavioral assertions only** (recovery, ordering, LL improvement), per repo testing guidance — not shape/type checks on deterministic constructors. Every test must be able to fail.
 - **Mark any test that runs EM, SGD, or a full filter/smoother pipeline `@pytest.mark.slow`.** The fast suite (`-m "not slow"`) must finish in under a minute.
@@ -79,7 +104,7 @@ The static (drift-free) estimator: a penalized Poisson GLM in the eigenbasis wit
 - Test: `src/state_space_practice/tests/test_graph_place_field.py` (append)
 
 **Interfaces:**
-- Consumes: `spectral_shape(eigvals, kappa2, alpha)` and `GraphBasis` (already in this module); `psd_solve`, `symmetrize` from `state_space_practice.kalman`.
+- Consumes: `spectral_shape(eigvals, kappa2, alpha)` and `GraphBasis` (already in this module); `psd_solve`, `symmetrize` from `state_space_practice.utils`.
 - Produces:
   - `spectral_precision(eigvals: NDArray, tau2: float, kappa2: float, alpha: float = 1.0) -> NDArray` — diagonal prior precision `(κ²+λ)^α / τ²`, shape `(rank,)`.
   - `parity_penalty(eigvals: NDArray, n_components: int) -> NDArray` — pure `diag(λ)` penalty with the first `n_components` (null) modes set to `0.0`, shape `(rank,)`.
@@ -1469,7 +1494,7 @@ These are preferred via SGD (`fit_sgd`) because they add parameters without clea
 
 **2. Placeholder scan.** No "TBD"/"add validation"/"handle edge cases" placeholders; retained acceptance steps name concrete behavioral tests, and withdrawn criteria are explicitly documented.
 
-**3. Type consistency.** Names are consistent across tasks: `spectral_precision`/`parity_penalty`/`fit_static_graph_glm` (Task 1) are reused verbatim in Tasks 2, 3, 6, 8; `GraphPlaceFieldModel` attributes (`rank`, `drift_scale`, `init_mean`, `smoother_mean`, `tau2`, `kappa2`, `transition_matrix`, `_log_intensity_func`, `_max_log_count`) and the `_spectral_shape_current()` accessor (the spectral shape `S` is never cached — `kappa2` is fittable) are defined in Task 4 and consumed by Tasks 5–8; `_design_and_spikes`/`_e_step` (Task 5) are consumed by `fit` (Task 6), `_finalize_sgd`/`score` (Tasks 7–8). `drift_scale` (not `q_c`) is the canonical per-neuron array name throughout. The SGD protocol hooks match `SGDFittableMixin`'s required surface (`_build_param_spec`, `_sgd_loss_fn`, `_store_sgd_params`, `_finalize_sgd`, `_check_sgd_initialized`, `_n_timesteps`).
+**3. Type consistency.** Names are consistent across tasks: `spectral_precision`/`parity_penalty`/`fit_static_graph_glm` (Task 1) are reused verbatim in Tasks 2, 3, 6, 8; `GraphPlaceFieldModel` attributes (`rank`, `drift_scale`, `init_mean`, `smoother_mean`, `tau2`, `kappa2`, `transition_matrix`, `_log_intensity_func`, `_max_log_count`) and the `_spectral_shape_current()` accessor (the spectral shape `S` is never cached — `kappa2` is fittable) are defined in Task 4 and consumed by Tasks 5–8; `_design_and_spikes`/`_e_step` (Task 5) are consumed by `fit` (Task 6), `_finalize_sgd`/`score` (Tasks 7–8). `drift_scale` (not `q_c`) is the canonical per-neuron array name throughout. The SGD protocol hooks match `SGDFittableMixin`'s current surface (`_prepare_sgd_data`, `_build_param_spec`, `_sgd_loss_fn`, `_store_sgd_params`, `_finalize_sgd`, `_n_timesteps`). The unused `_check_sgd_initialized` hook was removed during integration.
 
 **Known soft spots (flag for the executor, not blockers):**
 - Retained statistical thresholds (static W-maze recovery, approximate static-limit error, posterior rate-map recovery, and drift-tracking ordering) may need recalibration against dependency or simulator changes. If one fails, first check coverage/`n_time`/seed and confirm it is not a genuine bug before adjusting it — never add a generating-`q_c` recovery threshold under the current model.
@@ -1479,7 +1504,7 @@ These are preferred via SGD (`fit_sgd`) because they add parameters without clea
 
 ## Execution Handoff
 
-**Plan complete and saved to `docs/superpowers/plans/2026-07-16-drifting-graph-gp-place-field.md`. Two execution options:**
+**Plan complete and saved to `docs/plans/2026-07-16-drifting-graph-gp-place-field.md`. Two execution options:**
 
 **1. Subagent-Driven (recommended)** — I dispatch a fresh subagent per task, review between tasks, fast iteration.
 

@@ -5,17 +5,17 @@ independent of the observation model.
 """
 
 import operator
-from typing import Callable, Dict, List, Tuple, cast
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
-from state_space_practice.kalman import psd_solve
-from state_space_practice.utils import symmetrize
+from state_space_practice.utils import psd_solve, symmetrize
 
 
-def _validate_state_vector(x: Array) -> Array:
+def _validate_state_vector(x: ArrayLike) -> Array:
     """Return a floating one-dimensional canonical ``[q, p]`` state."""
     x = jnp.asarray(x)
     if x.ndim != 1:
@@ -31,9 +31,9 @@ def _validate_state_vector(x: Array) -> Array:
 
 
 def leapfrog_step(
-    x: Array,
-    params: Dict[str, Array],
-    h_apply_fn: Callable[[Dict[str, Array], Array], Array],
+    x: ArrayLike,
+    params: dict[str, Array],
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     dt: float,
 ) -> Array:
     """Symplectic leapfrog integrator (shared engine).
@@ -44,6 +44,13 @@ def leapfrog_step(
     explicit approximation with no symplecticity guarantee (a symplectic scheme
     would require an implicit solve). ``apply_mlp`` is constructed to be
     separable, so the shipped pairing is symplectic.
+
+    For a separable ``H`` the scheme is the Stormer-Verlet method: second-order
+    accurate (global error ``O(dt^2)``), time-reversible (``dt`` steps are undone
+    by ``-dt`` steps to round-off), volume- and symplectic-form-preserving, and
+    its energy error stays bounded at ``O(dt^2)`` without secular drift. These
+    are checked against ``scipy.integrate.solve_ivp`` and RK4 in
+    ``tests/test_oracle_dynamics.py``.
     """
     x = _validate_state_vector(x)
     n = x.shape[0] // 2
@@ -55,7 +62,7 @@ def leapfrog_step(
     # Compute gradient function once, reuse for all three evaluations
     grad_H = jax.grad(H_func)
 
-    def get_grads(state: Array) -> Tuple[Array, Array]:
+    def get_grads(state: Array) -> tuple[Array, Array]:
         grads = grad_H(state)
         return grads[:n], grads[n:]
 
@@ -77,9 +84,9 @@ def leapfrog_step(
 
 
 def get_transition_jacobian(
-    x: Array,
-    params: Dict[str, Array],
-    h_apply_fn: Callable,
+    x: ArrayLike,
+    params: dict[str, Array],
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     dt: float,
 ) -> Array:
     """Compute local Jacobian F = df/dx for EKF-style covariance propagation.
@@ -93,8 +100,8 @@ def get_transition_jacobian(
 
 
 def init_mlp_params(
-    input_dim: int, hidden_dims: List[int], key: Array
-) -> Dict[str, Array]:
+    input_dim: int, hidden_dims: list[int], key: Array
+) -> dict[str, Array]:
     """Initialize a scalar MLP over position coordinates."""
     try:
         input_dim = operator.index(input_dim)
@@ -118,13 +125,13 @@ def init_mlp_params(
 
 
 def ekf_predict_step(
-    m_prev: Array,
-    P_prev: Array,
-    params: Dict[str, Array],
-    h_apply_fn: Callable,
-    Q: Array,
+    m_prev: ArrayLike,
+    P_prev: ArrayLike,
+    params: dict[str, Array],
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
+    Q: ArrayLike,
     dt: float,
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """EKF Prediction Step: x_t = f(x_{t-1}) + w_t."""
     m_pred, P_pred, _ = ekf_predict_step_with_jacobian(
         m_prev, P_prev, params, h_apply_fn, Q, dt
@@ -133,13 +140,13 @@ def ekf_predict_step(
 
 
 def ekf_predict_step_with_jacobian(
-    m_prev: Array,
-    P_prev: Array,
-    params: Dict[str, Array],
-    h_apply_fn: Callable,
-    Q: Array,
+    m_prev: ArrayLike,
+    P_prev: ArrayLike,
+    params: dict[str, Array],
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
+    Q: ArrayLike,
     dt: float,
-) -> Tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array]:
     """EKF Prediction Step that also returns the transition Jacobian.
 
     Use this in smoother forward passes to avoid recomputing the Jacobian.
@@ -150,14 +157,14 @@ def ekf_predict_step_with_jacobian(
 
 
 def _leapfrog_step_and_jacobian(
-    x: Array,
-    params: Dict[str, Array],
-    h_apply_fn: Callable,
+    x: ArrayLike,
+    params: dict[str, Array],
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     dt: float,
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """Compute leapfrog step and its Jacobian in a single pass."""
 
-    def step_fn(state):
+    def step_fn(state: Array) -> Array:
         return leapfrog_step(state, params, h_apply_fn, dt)
 
     x = _validate_state_vector(x)
@@ -169,22 +176,26 @@ def _leapfrog_step_and_jacobian(
 
 
 def ekf_smooth_step(
-    m_filt: Array,
-    P_filt: Array,
-    m_pred_next: Array,
-    P_pred_next: Array,
-    m_smooth_next: Array,
-    P_smooth_next: Array,
-    F_next: Array,
-) -> Tuple[Array, Array]:
+    m_filt: ArrayLike,
+    P_filt: ArrayLike,
+    m_pred_next: ArrayLike,
+    P_pred_next: ArrayLike,
+    m_smooth_next: ArrayLike,
+    P_smooth_next: ArrayLike,
+    F_next: ArrayLike,
+) -> tuple[Array, Array]:
     """EKF RTS Smoother Step (Backward Pass)."""
+    m_filt = jnp.asarray(m_filt)
+    m_smooth_next = jnp.asarray(m_smooth_next)
+    P_smooth_next = jnp.asarray(P_smooth_next)
+    F_next = jnp.asarray(F_next)
     G = psd_solve(P_pred_next, F_next @ P_filt).T
     m_smooth = m_filt + G @ (m_smooth_next - m_pred_next)
     P_smooth = symmetrize(P_filt + G @ (P_smooth_next - P_pred_next) @ G.T)
     return m_smooth, P_smooth
 
 
-def _mlp_layer_count(params: Dict[str, Array], input_dim: int) -> int:
+def _mlp_layer_count(params: dict[str, Array], input_dim: int) -> int:
     """Validate a contiguous scalar-output MLP and return its layer count."""
     weight_indices = sorted(
         int(key[1:]) for key in params if key.startswith("w") and key[1:].isdigit()
@@ -228,7 +239,7 @@ def _mlp_layer_count(params: Dict[str, Array], input_dim: int) -> int:
     return len(expected)
 
 
-def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
+def apply_mlp(params: dict[str, Array], x: ArrayLike) -> Array:
     """Apply the MLP to compute a separable scalar Hamiltonian H(q, p).
 
     The quadratic kinetic term depends on momentum, while the MLP residual is
@@ -247,7 +258,7 @@ def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
     q, p = x[:n], x[n:]
     n_layers = _mlp_layer_count(params, input_dim=n)
 
-    def mlp_forward(input_vec):
+    def mlp_forward(input_vec: Array) -> Array:
         curr = input_vec
         for i in range(n_layers - 1):
             curr = jnp.dot(curr, params[f"w{i}"]) + params[f"b{i}"]
@@ -258,4 +269,4 @@ def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
     h_prior = 0.5 * jnp.sum(p**2) + 0.5 * (omega**2) * jnp.sum(q**2)
     h_mlp = mlp_forward(q) - mlp_forward(jnp.zeros_like(q))
 
-    return cast(Array, h_prior + h_mlp)
+    return h_prior + h_mlp
