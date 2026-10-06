@@ -1307,8 +1307,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     The primary output is the posterior trajectory of the spatial log-rate field,
     available from :meth:`predict_log_rate_trajectory`. ``q_c`` controls how quickly
     that field may drift; recovering its generating value is not required for tracking.
-    Drift-scale learning is disabled by default because the approximate Laplace-EKF
-    marginal likelihood does not reliably identify ``q_c`` from spike observations.
+    Drift-scale learning is disabled by default because reliable automatic scale
+    selection has not been validated for the full spatial model. Original spatial
+    experiments showed biased approximate evidence profiles and EM updates that
+    depended strongly on initialization. This does not establish structural
+    non-identifiability.
     Setting ``update_drift_scale=True`` enables the closed-form update as an explicit
     experimental opt-in.
 
@@ -1375,6 +1378,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         init_drift_scale : float, optional
             Initial per-neuron drift scale ``q_c`` used to seed ``drift_scale``
             before fitting, by default 1e-3; must be non-negative.
+            This scales covariance per transition on the full time grid. For a
+            diffusion intensity per second, multiply that intensity by ``dt``;
+            changing ``dt`` does not automatically rescale ``q_c``.
         interpolation : {"nearest"}, optional
             Design-matrix lookup mode forwarded to :func:`graph_design_matrix`,
             by default ``"nearest"``. ``"linear"`` is accepted by the signature
@@ -1384,9 +1390,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             default ``"distance"``.
         update_drift_scale : bool, optional
             Whether ``fit``'s M-step updates the per-neuron drift scale ``q_c``,
-            by default **False**. The approximate Laplace-EKF marginal
-            likelihood does not reliably identify ``q_c`` from spike
-            observations, so learning it is an explicit opt-in.
+            by default **False**. Automatic drift-scale learning with the other
+            spatial parameters fitted jointly has not been validated, so it is an
+            experimental opt-in. Informative profiles with fixed known priors do
+            not establish reliable learning in the full spatial model.
         update_amplitude : bool, optional
             Whether ``fit``'s M-step updates ``tau2``, by default True.
         update_init_mean : bool, optional
@@ -1403,6 +1410,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_newton_iter : int, optional
             Maximum Newton iterations per time-step Laplace update in the
             filter, by default 1.
+            One iteration uses curvature at the predicted state and need not
+            reach the posterior mode. Larger values use damped iterative updates;
+            their Gaussian posterior is still an approximation.
         """
         # The compiled filter treats dt as static; normalize concrete scalar
         # array inputs to a finite, hashable Python float before caching it.
@@ -1484,7 +1494,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         return jnp.diag(self.tau2 * self._spectral_shape_current())
 
     def drift_cov(self, q_c: float) -> Array:
-        """Per-neuron drift covariance ``Q_c = q_c * diag(S)``, shape (rank, rank)."""
+        """Per-transition covariance ``Q_c = q_c * diag(S)``, shape (rank, rank).
+
+        ``q_c`` is variance scale per time row. A per-second diffusion scale must
+        first be multiplied by ``dt`` by the caller; no time scaling happens here.
+        """
         return jnp.diag(q_c * self._spectral_shape_current())
 
     def _design_and_spikes(

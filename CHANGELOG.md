@@ -7,6 +7,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Graph-field mathematical validation** against dense graph matrix functions,
+  independent Gaussian conditioning and EM optimization, finite-difference SGD
+  gradients, and converged scalar posterior integration. A reproducible study
+  records Newton-step approximation errors and drift-scale evidence profiles.
 - **Independent graph-field validation** with analytic moving fields, continuous
   trajectories, blocked held-out observations, static and time-varying occupancy-map
   baselines, validation-based parameter selection, and uncertainty coverage reports.

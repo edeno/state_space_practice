@@ -14,7 +14,7 @@
 
 **Status:** Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. The committed code in `graph_place_field.py` / `test_graph_place_field.py` is authoritative; several task sections **below describe the original design and were superseded during implementation** — the amendments here take precedence over the task text and code blocks that follow.
 
-1. **Latent field tracking is the primary acceptance target; `q_c` estimation is not.** The implementation must recover the time-varying log-rate field over time and every graph bin and substantially outperform both causal filtering and a single static field. `predict_log_rate_trajectory` exposes this primary posterior output without averaging away the drift. The synthetic tracking contract removes both the common rate baseline and each bin's temporal mean before scoring, so a static spatial pattern cannot pass. It uses the constructor's default `q_c`, deliberately 10x below the generating value, and validates three independent sessions after cold-start burn-in. `q_c` is fixed by default because the approximate Laplace-EKF marginal likelihood does not reliably identify its generating value: profiled with all else fixed, the marginal LL is monotone in `q_c` rather than peaking at the generating value, and the closed-form Gaussian M-step is a self-confirming fixed point (returns ~its initialization; the same is true of the sibling `PlaceFieldModel`). Enabling `update_drift_scale=True` (EM) or learning `q_c` via `fit_sgd` is an explicit, experimental opt-in and is **not** validated to recover the true drift scale. There is therefore no generating-`q_c` recovery test; instead, `test_default_model_tracks_drifting_field_over_time` validates full latent-trajectory recovery under timescale misspecification and `test_drift_scale_mstep_matches_closed_form` validates the optional M-step algebra. Future automatic timescale selection can use validation data or a redesigned likelihood without changing the trajectory-recovery goal.
+1. **Latent field tracking is the primary acceptance target; `q_c` estimation is not.** The implementation must recover the time-varying log-rate field over time and every graph bin and substantially outperform both causal filtering and a single static field. `predict_log_rate_trajectory` exposes this primary posterior output without averaging away the drift. The synthetic tracking contract removes both the common rate baseline and each bin's temporal mean before scoring, so a static spatial pattern cannot pass. It uses the constructor's default `q_c`, deliberately 10x below the generating value, and validates three independent sessions after cold-start burn-in. `q_c` is fixed by default because the original spatial-field experiments did not validate reliable automatic drift-scale learning: their approximate marginal-LL profiles favored larger values, and Gaussian M-steps stayed near initialization (also observed in the sibling `PlaceFieldModel`). These are observed failure cases, not a proof of structural non-identifiability. The original tracking generator also fixes baseline drift while the model allows it. The independent scalar math study below finds informative reference and approximate average evidence profiles when the other parameters are fixed and the generative model matches. Enabling `update_drift_scale=True` (EM) or learning `q_c` via `fit_sgd` remains an explicit, experimental opt-in and is **not** validated to recover drift scales in the full spatial model with other parameters fitted jointly. There is therefore no full-field generating-`q_c` recovery acceptance test; trajectory recovery and independent M-step optimality are the retained contracts. Future automatic timescale selection can use validation data or a redesigned approximation without changing the trajectory-recovery goal.
 
 2. **Architecture: a masked full-grid filter, not the library smoother.** The E-step, `fit`, `fit_sgd`, and `score` use a new local `_masked_graph_point_process_filter` (`glm_laplace_update` + `poisson_family`) plus `rts_backward_scan`, **not** `stochastic_point_process_filter/_smoother`. It runs each neuron on the **full** time grid: out-of-bounds trajectory rows advance the latent random walk but **skip their observation update** (rather than being dropped, as the original design had it). Row 0 is conditioned **directly on `(init_mean, P₀)`** (no predict-before-first-update; see the `point_process_kalman` docstring note documenting the library filter's differing convention). `_design_and_spikes` returns `(Z, spikes, valid)`.
 
@@ -31,6 +31,8 @@
 8. **Evidence search, diagnostics, and compilation (2026-10-05 review fixes).** Evidence can have multiple local maxima. `select_tau2_by_evidence` now samples 65 logarithmically spaced amplitudes, refines each candidate peak/boundary basin, and compares all evaluated values including the exact interval endpoints. This supersedes Task 2's single bounded-search sketch; the finite grid is a practical search, not a guarantee for arbitrarily narrow peaks. The static Newton solve and masked filter use stable module-level JIT functions with changing parameters passed as inputs. Repeated E-steps reuse compilation, including after parameter changes. The filter reports exhausted line searches through the existing host-side logging policy from eager, jit, and gradient paths. Failure fractions use observed rows; masked rows and fully unobserved grids do not cause spurious warnings. Regression coverage includes multimodal evidence, boundary optima, one-/two-neuron EM/scoring/SGD diagnostics, masking, and compilation reuse.
 
 9. **Independent evidence audit (2026-10-06).** The independent blocked-holdout experiment below demonstrates retrospective tracking beyond eigenbasis-generated truth. It also exposes limits: a simple time-varying occupancy map outperforms the tested graph configurations on smooth/sparse drift, static controls favor a static estimator, and nominal uncertainty intervals under-cover changing truth. Implementation completion is not evidence of superiority or calibrated biological drift inference. Fitted branching-track comparisons, real recordings, and causal forecasting remain open.
+
+10. **Mathematical contracts and reference inference (2026-10-06).** Independent tests now check graph matrix functions, Poisson modes/curvature/evidence constants, dense Gaussian smoothing, numerical EM optimality, and derivatives in both log and actual SGD coordinates. A converged scalar Bayes-integral reference measures posterior and evidence approximation error, including masking and row-zero conventions. It confirms informative drift-scale profiles in a correctly specified scalar study and exposes a rare-count failure of the default single Newton step. Exact algebra, converged-mode Laplace calculations, and one-step Gaussian updates have different guarantees; the math section below distinguishes them.
 
 
 ---
@@ -188,6 +190,167 @@ EM/SGD leakage checks. The predictive scorer matches independent adaptive integr
 across 48 count/rate/variance combinations (maximum absolute log-score error 1.3e-8),
 and its zero-variance limit matches the Poisson density. These checks validate the
 evaluation machinery; they do not remove the empirical limitations above.
+
+## Mathematical contracts and independent references (2026-10-06)
+
+The intended unclipped model, with a fixed basis and spectral shape, is
+
+```text
+S = diag((kappa2 + lambda_j)^(-alpha))
+w_c,0 ~ Normal(m_c,0, tau2 * S)
+w_c,t | w_c,t-1 ~ Normal(w_c,t-1, q_c * S)       (t = 1,...,T-1)
+y_c,t | w_c,t ~ Poisson(dt * exp(z_t.T @ w_c,t)) (observed rows only)
+```
+
+Missing observations contribute a likelihood factor of one, while every adjacent
+time-row pair contributes a transition. Row zero has the initial prior, without an
+additional Q. `q_c` is variance scale **per transition**: a per-second diffusion
+intensity requires `q_c = intensity * dt`. The public constructor and `drift_cov`
+docstrings now state this convention. Numerical clipping, covariance stabilization,
+and finite iteration limits are implementation safeguards/approximations, rather
+than identities of the ideal model.
+The derivations assume finite positive kappa2, tau2 and alpha. Positive q gives
+proper transition densities; q=0 is a degenerate static-state limit handled in
+the reduced state space, rather than by inverting a zero process covariance.
+
+### Exact identities and derivations
+
+1. **Graph prior.** For orthonormal Laplacian eigenvectors, `L Phi = Phi diag(lambda)`.
+   With a full basis, the field covariance is
+   `K = tau2 * Phi S Phi.T = tau2 * (kappa2 I + L)^(-alpha)`.
+   With a truncated basis this is a covariance on the retained subspace, not the
+   full graph resolvent. For any retained coefficient vector, the unregularized
+   energy is `w.T diag(lambda) w = eta.T L eta`, which equals the sum over unordered
+   edges of `edge_weight * (eta_i - eta_j)^2`. Sign changes and orthogonal rotations
+   within retained equal-eigenvalue subspaces preserve field predictions when
+   coefficients and their moments are transformed consistently.
+2. **Static objective.** For exposure `o_i`, counts `c_i`, and positive prior
+   precision `Lambda`, constants independent of w can be omitted:
+
+   ```text
+   J(w) = sum_i [o_i exp(phi_i.T w) - c_i phi_i.T w] + 0.5 w.T Lambda w
+   mu_i = o_i exp(phi_i.T w)
+   grad J = Phi.T (mu - c) + Lambda w
+   Hess J = Phi.T diag(mu) Phi + Lambda
+   ```
+
+   The Hessian is positive definite with the default proper prior, and J is
+   coercive, so the MAP exists and is unique. This guarantee does not apply to
+   an improper unpenalized-intercept parity configuration without additional
+   conditions. The returned inverse MAP Hessian is a Laplace covariance, not an
+   identity for the exact Poisson posterior covariance. Laplace evidence is
+   `log p(y | w_MAP) - 0.5 w_MAP.T Lambda w_MAP + 0.5 logdet(Lambda)
+   - 0.5 logdet(Hess J)`; Gaussian 2*pi constants cancel. The static evidence API
+   omits log(count!) constants. Grouped and per-time likelihoods also differ by
+   data/exposure constants, which must be restored for absolute evidence comparisons.
+3. **Gaussian smoothing.** For random-walk states, the joint prior block is
+   `Cov(w_t,w_s) = P0 + min(t,s)*Q`. Direct Gaussian conditioning gives a reference
+   independent of filtering/backward recurrences. RTS with Gaussian filtered
+   moments uses `G_t = P_f,t (P_f,t + Q)^(-1)` and lag covariance
+   `Cov(w_t,w_t+1 | y) = G_t P_s,t+1`. These are exact for Gaussian observations;
+   using approximate Poisson filtered moments gives an approximate smoother.
+4. **EM prior updates.** With S fixed and posterior moments held fixed, maximizing
+   the expected complete log density gives
+
+   ```text
+   q_c* = sum_t tr(S^(-1) E[(w_t-w_t-1)(w_t-w_t-1).T]) / (rank * (T-1))
+   m_c,0* = E[w_c,0]                              (if its update is enabled)
+   tau2* = sum_c tr(S^(-1) E[(w_c,0-m_c,0*)(w_c,0-m_c,0*).T]) / (n_cells*rank)
+   ```
+
+   Fixed initial means retain their squared mean residual; freely updated means
+   leave the initial posterior covariance term. Masked rows still count as
+   transitions. The formulas depend on second moments, not on Gaussianity of the
+   true posterior. Standard exact-EM ascent requires an exact E-step; rollback of
+   an approximate evidence cannot establish ascent of the true marginal likelihood.
+5. **One-step versus converged Laplace.** A single Fisher/Newton step from the
+   predicted mean uses curvature there, and need not reach the mode. Iteration
+   in a linear-log-rate, unclipped problem targets its unique conditional MAP;
+   the Laplace covariance is then curvature at that mode. Neither the MAP nor
+   its curvature is generally the exact posterior mean or variance. Finite
+   iterations do not constitute a universal convergence guarantee.
+
+### Implemented checks and numerical oracle
+
+[`test_graph_place_field_math.py`](../../src/state_space_practice/tests/test_graph_place_field_math.py)
+adds **33** checks covering connected/disconnected graphs, both Laplacian conventions,
+alpha 0.5/1/2, unequal and zero exposures, multiple neurons, missing rows, first-row
+priors, nonsymmetric lag covariances, fixed/free initial means, basis-coordinate
+changes, physical-time rescaling, and finite-difference gradients. Gradients are
+checked in both log coordinates and the real SGD softplus/identity transforms,
+through one-step and iterated forward inference. These are derivatives of the
+implemented approximation loss, not a claim of exact-evidence gradients.
+An additional three-mode observation check uses a scalar projection of a correlated
+Gaussian prior to independently verify the full-state MAP, curvature, evidence
+normalizer and unchanged nuisance directions; exact posterior moments remain
+distinct from the Laplace moments.
+
+The separate [`graph_math_reference.py`](../../src/state_space_practice/tests/graph_math_reference.py)
+imports no package graph/filter/smoother helpers. It conditions a dense joint
+Gaussian for the smoother/EM checks, evaluates Gaussian prior densities for the
+independent numerical M-step optimum, and integrates scalar Poisson Bayes updates
+and backward messages on a grid. Direct positive Gaussian convolution avoids FFT
+tail-cancellation artifacts. The reference itself is checked against adaptive
+one-dimensional integration and two-dimensional Gauss-Hermite integration in
+independent noise coordinates. Mesh refinement, domain expansion, and extending
+transition tails from 12 to 16 standard deviations check numerical convergence.
+Both filtered and smoothed boundary probability are checked; under-resolved or
+probability-losing grids raise rather than silently supplying a reference.
+
+The runnable study is
+[`graph_place_field_math_validation.py`](../../notebooks/graph_place_field_math_validation.py):
+
+```bash
+MPLCONFIGDIR=/private/tmp/ssp-matplotlib LOKY_MAX_CPU_COUNT=4 \
+  uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field_math.py -q
+MPLCONFIGDIR=/private/tmp/ssp-matplotlib LOKY_MAX_CPU_COUNT=4 \
+  uv run --no-sync python notebooks/graph_place_field_math_validation.py \
+  --output-dir docs/validation/graph-place-field-math
+```
+
+Its cases and profile grids are declared in the script; fixed known parameters
+isolate approximation error. The numerical rate ceiling is high enough to keep
+clipping inactive. The scalar coordinate is `eta = phi*w`, so the reported prior
+and drift variances include `phi^2`; they are not confused with coefficient-space
+amplitudes. Results are saved in
+[`results.json`](../validation/graph-place-field-math/results.json), and the command
+generates an ignored PNG at `docs/validation/graph-place-field-math/math.png`.
+
+### Reference-study findings
+
+| Case | One-step mean error, reference SD | Iterated mean error, reference SD | One-step log-evidence error | Iterated log-evidence error |
+| --- | ---: | ---: | ---: | ---: |
+| Benign, masked six-step chain | 0.009 | 0.008 | +0.0027 | +0.0016 |
+| Sparse, masked eight-step chain | 0.351 | 0.248 | +0.1117 | +0.0736 |
+| Unexpected eight-count observation | 7.862 | 0.172 | -117.8060 | -0.0064 |
+
+The table uses maximum smoothed-mean error and 25 Newton iterations for the
+iterated column. In the unexpected-count case, the nominal one-step 95% interval
+contains only approximately 1.2e-6 of the reference posterior mass; the iterated
+interval contains 94.1%. The benign case is near 95% for both methods. Converged
+mode/curvature checks pass, while the deliberately skewed example explicitly
+distinguishes the true posterior mean from its mode.
+
+Across twenty correctly specified scalar datasets (seeds 30–49), with prior mean,
+variance and kappa fixed, reference and both approximate **average** evidence
+profiles peak at the generating log-rate drift variance 0.03 on the declared
+six-point grid. A single realization need not prefer its generating value, and
+this is not a proof of joint identifiability or full-field drift-scale learning.
+It corrects the earlier overly broad interpretation of the spatial experiments.
+At the generating scale, mean reference posterior mass in nominal 95% smoothed
+intervals is 93.6% for one step and 94.0% for iteration. Thus even converged local
+updates retain error from Gaussian posterior approximations and their propagation.
+
+These checks establish the algebraic contracts and measure approximation errors
+on explicit examples. They do not establish calibrated uncertainty under arbitrary
+misspecification, superiority over the time-varying baseline, or universal accuracy
+of single-step Poisson filtering. Changing the default Newton budget should be
+evaluated with the independent application benchmark rather than assumed to solve
+the previously documented performance/coverage gaps.
+
+Validation: the graph/math/fitting-contract slice passes **132 tests**; the package
+fast suite passes **2449 tests, 1 skipped**. Ruff checks/formatting and whole-package
+mypy (47 source files) pass. The previous field-recovery thresholds are unchanged.
 
 ## Global Constraints
 
@@ -738,7 +901,7 @@ git commit -m "test(graph-pp): static-field parity vs independent optimizer + W-
 
 # Stage 2 — Drifting field
 
-`GraphPlaceFieldModel`: the coefficients drift as a random walk with per-neuron `Q_c = q_c·S`, inferred by the per-neuron `vmap` Laplace-EKF. EM/`fit_sgd` learn `τ²` (and `κ²` via SGD, `init_mean`); **`q_c` is a fixed hyperparameter by default** (learning it is an experimental opt-in — see Amendment 1: the marginal LL does not identify `q_c`).
+`GraphPlaceFieldModel`: the coefficients drift as a random walk with per-neuron `Q_c = q_c·S`, inferred by the per-neuron `vmap` Laplace-EKF. EM/`fit_sgd` learn `τ²` (and `κ²` via SGD, `init_mean`); **`q_c` is a fixed hyperparameter by default** (learning it is an experimental opt-in — see Amendment 1: full-field automatic drift-scale learning remains unvalidated).
 
 ## Task 4: `GraphPlaceFieldModel.__init__` and prior/`Q` construction
 

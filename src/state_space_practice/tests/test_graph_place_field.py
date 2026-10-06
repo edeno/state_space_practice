@@ -1135,15 +1135,16 @@ def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
     assert model.smoother_mean is not None
 
 
-# NOTE: there is deliberately no q_c-recovery test (EM/SGD recovering the simulated
-# drift scale). The Laplace-EKF marginal log-likelihood used here is monotonically
-# increasing in q_c rather than peaking at the generating value, so q_c is not
-# identified by this objective and EM returns approximately its initialization -- a
-# recovery test would assert a false claim. This is why update_drift_scale defaults
-# to False. The M-step algebra itself is correct (verified below in
-# test_drift_scale_mstep_matches_closed_form, and by feeding the exact generative
-# w_{c,t} trajectory into the M-step, which recovers q_c to ~1%). Drift *tracking*
-# (not q_c learning) is validated by test_default_model_tracks_drifting_field_over_time.
+# Generating-q recovery is not an acceptance claim for these spatial-field tests.
+# Original spatial simulations produced monotone approximate evidence profiles and
+# EM updates near initialization. Those observations do not establish structural
+# non-identifiability: the independent scalar math study, with fixed known priors,
+# has informative reference and approximate average q profiles. They also do not
+# validate automatic q learning with other graph-field parameters fitted jointly.
+# Drift learning therefore remains experimental and fixed by default. Its M-step
+# algebra is checked both below and against independent complete-density numerical
+# optimization in test_graph_place_field_math.py; trajectory recovery is checked
+# by test_default_model_tracks_drifting_field_over_time.
 
 
 @pytest.mark.slow
@@ -1209,11 +1210,11 @@ def test_static_limit_approximates_static_estimator(small_grid_env):
 def _simulate_field_drift_spikes(env, basis, dt, n_time, q_c, seed, rate_hz=30.0):
     """Poisson spikes from a field that drifts in the non-null modes only.
 
-    The null (constant/baseline) mode is pinned so the overall firing rate is stable
-    and only the spatial pattern drifts -- the identifiable, physiological regime (a
-    freely drifting baseline is both unrealistic and makes q_c unidentifiable). Returns
-    per-time truth so tests can score tracking. Uses the model's spectral shape S for
-    the drift so the simulation matches the model's Q_c = q_c * S on the field modes.
+    The null (constant/baseline) mode is pinned so the metric isolates changes in
+    the spatial pattern. This is a deliberate mismatch with the model, whose Q_c
+    also allows baseline drift; it is not a claim about drift-scale identifiability.
+    Returns per-time truth so tests can score tracking. Uses the model's spectral
+    shape S for the non-null field modes.
     """
     rng = np.random.default_rng(seed)
     S = spectral_shape(basis.eigvals, kappa2=1.0, alpha=1.0)
