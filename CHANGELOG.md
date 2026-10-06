@@ -663,6 +663,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Graph-field evidence selection compares separate amplitude peaks and interval
+  endpoints instead of assuming a unimodal objective.
+- Graph-field EM, scoring, and SGD report exhausted Fisher line searches using
+  observed-row counts; masked rows are excluded from the failure fraction.
+- Graph-field filtering and static Newton fits reuse compiled kernels across
+  repeated calls and parameter changes.
 - **Hamiltonian `fit_sgd` gradient memory no longer scales with the MLP
   size**: the EKF predict steps inside the Hamiltonian filter and smoother
   scans (`run_ekf_filter` / `run_ekf_smoother` and the switching

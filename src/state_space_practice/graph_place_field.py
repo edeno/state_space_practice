@@ -36,6 +36,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 import jax
@@ -59,6 +60,7 @@ from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedE
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.kalman import rts_backward_scan, sum_of_outer_products
 from state_space_practice.point_process_kalman import (
+    _log_line_search_failures,
     _validate_filter_numerics,
     glm_laplace_update,
     log_conditional_intensity,
@@ -68,6 +70,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDPar
 from state_space_practice.utils import (
     psd_solve,
     symmetrize,
+    typed_jit,
     validate_count_array,
     validate_int,
     validate_scalar,
@@ -727,6 +730,110 @@ def parity_penalty(
     return penalty
 
 
+@partial(typed_jit, static_argnames=("max_iter",))
+def _fit_static_graph_glm_core(
+    Phi: Array,
+    occ: Array,
+    counts_2d: Array,
+    penalty: Array,
+    tolerance: Array,
+    *,
+    max_iter: int,
+) -> tuple[Array, Array, Array]:
+    """Compiled Newton solve shared across static fits and evidence evaluations."""
+    rank = Phi.shape[1]
+    dtype = Phi.dtype
+    Lam = jnp.diag(penalty)
+    eye = jnp.eye(rank, dtype=dtype)
+    visited = occ > 0
+    # log-offset; unvisited bins contribute nothing (mu forced to 0 there).
+    log_occ = jnp.where(visited, jnp.log(jnp.where(visited, occ, 1.0)), 0.0)
+
+    def _loss(w: Array, y: Array) -> Array:
+        eta = Phi @ w + log_occ
+        mu = jnp.where(visited, jnp.exp(eta), 0.0)
+        poisson_nll = jnp.sum(jnp.where(visited, mu - y * eta, 0.0))
+        return poisson_nll + 0.5 * (w @ (penalty * w))
+
+    def _derivatives(w: Array, y: Array) -> tuple[Array, Array]:
+        mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
+        grad = Phi.T @ (mu - y) + penalty * w
+        hess = Phi.T @ (mu[:, None] * Phi) + Lam
+        return grad, hess
+
+    def _fit_one(y: Array) -> tuple[Array, Array, Array]:
+        gradient_scale = 1.0 + jnp.sum(y)
+
+        def _step(
+            carry: tuple[Array, Array], _: None
+        ) -> tuple[tuple[Array, Array], None]:
+            w, converged = carry
+            current_loss = _loss(w, y)
+            grad, hess = _derivatives(w, y)
+            delta = psd_solve(hess, grad)
+            directional_derivative = grad @ delta
+            is_descent = (
+                (~converged)
+                & jnp.isfinite(directional_derivative)
+                & (directional_derivative > 0.0)
+            )
+
+            def _backtrack(
+                line_carry: tuple[Array, Array, Array], _: None
+            ) -> tuple[tuple[Array, Array, Array], None]:
+                step_size, accepted, accepted_w = line_carry
+                trial_w = w - step_size * delta
+                trial_loss = _loss(trial_w, y)
+                sufficient_decrease = (
+                    (~accepted)
+                    & is_descent
+                    & jnp.isfinite(trial_loss)
+                    & (
+                        trial_loss
+                        <= current_loss - 1e-4 * step_size * directional_derivative
+                    )
+                )
+                accepted_w = jnp.where(sufficient_decrease, trial_w, accepted_w)
+                accepted = accepted | sufficient_decrease
+                step_size = jnp.where(accepted, step_size, 0.5 * step_size)
+                return (step_size, accepted, accepted_w), None
+
+            (_step_size, accepted, candidate_w), _backtrack_history = jax.lax.scan(
+                _backtrack,
+                (
+                    jnp.asarray(1.0, dtype=dtype),
+                    jnp.asarray(False),
+                    w,
+                ),
+                None,
+                length=60,
+            )
+            new_w = jnp.where(accepted & (~converged), candidate_w, w)
+            new_grad, _new_hessian = _derivatives(new_w, y)
+            new_converged = converged | (
+                jnp.max(jnp.abs(new_grad)) <= tolerance * gradient_scale
+            )
+            return (new_w, new_converged), None
+
+        initial_w = jnp.zeros(rank, dtype=dtype)
+        initial_grad, _ = _derivatives(initial_w, y)
+        initially_converged = (
+            jnp.max(jnp.abs(initial_grad)) <= tolerance * gradient_scale
+        )
+        (w, converged), _ = jax.lax.scan(
+            _step,
+            (initial_w, initially_converged),
+            None,
+            length=max_iter,
+        )
+        mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
+        cov = psd_solve(Phi.T @ (mu[:, None] * Phi) + Lam, eye)
+        return w, symmetrize(cov), converged
+
+    weights, cov, converged = jax.vmap(_fit_one, in_axes=1)(counts_2d)
+    return weights, cov, converged
+
+
 def fit_static_graph_glm(
     counts: ArrayLike,
     occupancy: ArrayLike,
@@ -826,95 +933,14 @@ def fit_static_graph_glm(
     single = counts_arr.ndim == 1
     counts_2d = counts_arr[:, None] if single else counts_arr
     penalty = jnp.asarray(penalty_np, dtype=dtype)
-    Lam = jnp.diag(penalty)
-    eye = jnp.eye(rank, dtype=dtype)
-    visited = occ > 0
-    # log-offset; unvisited bins contribute nothing (mu forced to 0 there).
-    log_occ = jnp.where(visited, jnp.log(jnp.where(visited, occ, 1.0)), 0.0)
-    tolerance = jnp.asarray(float(tol_arr), dtype=dtype)
-
-    def _loss(w: Array, y: Array) -> Array:
-        eta = Phi @ w + log_occ
-        mu = jnp.where(visited, jnp.exp(eta), 0.0)
-        poisson_nll = jnp.sum(jnp.where(visited, mu - y * eta, 0.0))
-        return poisson_nll + 0.5 * (w @ (penalty * w))
-
-    def _derivatives(w: Array, y: Array) -> tuple[Array, Array]:
-        mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
-        grad = Phi.T @ (mu - y) + penalty * w
-        hess = Phi.T @ (mu[:, None] * Phi) + Lam
-        return grad, hess
-
-    def _fit_one(y: Array) -> tuple[Array, Array, Array]:
-        gradient_scale = 1.0 + jnp.sum(y)
-
-        def _step(
-            carry: tuple[Array, Array], _: None
-        ) -> tuple[tuple[Array, Array], None]:
-            w, converged = carry
-            current_loss = _loss(w, y)
-            grad, hess = _derivatives(w, y)
-            delta = psd_solve(hess, grad)
-            directional_derivative = grad @ delta
-            is_descent = (
-                (~converged)
-                & jnp.isfinite(directional_derivative)
-                & (directional_derivative > 0.0)
-            )
-
-            def _backtrack(
-                line_carry: tuple[Array, Array, Array], _: None
-            ) -> tuple[tuple[Array, Array, Array], None]:
-                step_size, accepted, accepted_w = line_carry
-                trial_w = w - step_size * delta
-                trial_loss = _loss(trial_w, y)
-                sufficient_decrease = (
-                    (~accepted)
-                    & is_descent
-                    & jnp.isfinite(trial_loss)
-                    & (
-                        trial_loss
-                        <= current_loss - 1e-4 * step_size * directional_derivative
-                    )
-                )
-                accepted_w = jnp.where(sufficient_decrease, trial_w, accepted_w)
-                accepted = accepted | sufficient_decrease
-                step_size = jnp.where(accepted, step_size, 0.5 * step_size)
-                return (step_size, accepted, accepted_w), None
-
-            (_step_size, accepted, candidate_w), _backtrack_history = jax.lax.scan(
-                _backtrack,
-                (
-                    jnp.asarray(1.0, dtype=dtype),
-                    jnp.asarray(False),
-                    w,
-                ),
-                None,
-                length=60,
-            )
-            new_w = jnp.where(accepted & (~converged), candidate_w, w)
-            new_grad, _new_hessian = _derivatives(new_w, y)
-            new_converged = converged | (
-                jnp.max(jnp.abs(new_grad)) <= tolerance * gradient_scale
-            )
-            return (new_w, new_converged), None
-
-        initial_w = jnp.zeros(rank, dtype=dtype)
-        initial_grad, _ = _derivatives(initial_w, y)
-        initially_converged = (
-            jnp.max(jnp.abs(initial_grad)) <= tolerance * gradient_scale
-        )
-        (w, converged), _ = jax.lax.scan(
-            _step,
-            (initial_w, initially_converged),
-            None,
-            length=max_iter,
-        )
-        mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
-        cov = psd_solve(Phi.T @ (mu[:, None] * Phi) + Lam, eye)
-        return w, symmetrize(cov), converged
-
-    weights, cov, converged = jax.vmap(_fit_one, in_axes=1)(counts_2d)
+    weights, cov, converged = _fit_static_graph_glm_core(
+        Phi,
+        occ,
+        counts_2d,
+        penalty,
+        jnp.asarray(float(tol_arr), dtype=dtype),
+        max_iter=max_iter,
+    )
     n_unconverged = int(jnp.sum(~converged))
     if n_unconverged:
         # A non-converged solve returns a MAP far from the optimum and a Laplace
@@ -1013,8 +1039,11 @@ def select_tau2_by_evidence(
 ) -> float:
     """Return the ``tau2`` maximizing :func:`static_log_evidence`.
 
-    Optimizes over ``log tau2`` with a bounded scalar optimizer (the evidence is smooth
-    and unimodal in ``log tau2`` for a fixed ``kappa2``).
+    Samples a grid of 65 points in ``log tau2``, refines each candidate maximum
+    with a bounded scalar search, and compares the refined peaks, grid values,
+    and interval endpoints. The evidence need not be unimodal; the grid locates
+    candidate peaks rather than guaranteeing a global optimum for arbitrarily
+    narrow peaks or wide bounds.
 
     Parameters
     ----------
@@ -1049,24 +1078,71 @@ def select_tau2_by_evidence(
             f"got {bounds!r}."
         )
     lo, hi = np.log(bounds_arr)
+    evaluations: dict[float, float] = {}
 
     def _neg_ev(log_tau2: float) -> float:
-        return -static_log_evidence(
-            counts,
-            occupancy,
-            basis.eigvecs,
-            basis.eigvals,
-            tau2=float(np.exp(log_tau2)),
-            kappa2=kappa2,
-            alpha=alpha,
-        )
+        if log_tau2 not in evaluations:
+            value = -static_log_evidence(
+                counts,
+                occupancy,
+                basis.eigvecs,
+                basis.eigvals,
+                tau2=float(np.exp(log_tau2)),
+                kappa2=kappa2,
+                alpha=alpha,
+            )
+            if not np.isfinite(value):
+                raise RuntimeError(
+                    "tau2 evidence optimization produced non-finite evidence."
+                )
+            evaluations[log_tau2] = value
+        return evaluations[log_tau2]
 
-    result = scipy.optimize.minimize_scalar(_neg_ev, bounds=(lo, hi), method="bounded")
-    if not result.success or not np.isfinite(result.x) or not np.isfinite(result.fun):
-        raise RuntimeError(f"tau2 evidence optimization failed: {result.message}")
-    return float(np.exp(result.x))
+    grid = np.linspace(lo, hi, 65)
+    losses = np.array([_neg_ev(float(value)) for value in grid])
+    best = int(np.argmin(losses))
+    best_x, best_loss = float(grid[best]), float(losses[best])
+
+    if np.ptp(losses) > 0:
+        # Also refine boundary basins: a peak may lie between the endpoint and
+        # its first grid neighbour. Keep the endpoints themselves as candidates.
+        candidates = []
+        if losses[0] <= losses[1]:
+            candidates.append(0)
+        for i in range(1, grid.size - 1):
+            if (
+                losses[i] <= losses[i - 1]
+                and losses[i] <= losses[i + 1]
+                and (losses[i] < losses[i - 1] or losses[i] < losses[i + 1])
+            ):
+                candidates.append(i)
+        if losses[-1] <= losses[-2]:
+            candidates.append(grid.size - 1)
+        for i in candidates:
+            interval = (grid[max(0, i - 1)], grid[min(grid.size - 1, i + 1)])
+            result = scipy.optimize.minimize_scalar(
+                _neg_ev, bounds=interval, method="bounded"
+            )
+            if (
+                not result.success
+                or not np.isfinite(result.x)
+                or not np.isfinite(result.fun)
+            ):
+                raise RuntimeError(
+                    f"tau2 evidence optimization failed: {result.message}"
+                )
+            if result.fun < best_loss:
+                best_x, best_loss = float(result.x), float(result.fun)
+
+    # Preserve the exact supplied endpoints instead of exp(log(bound)) rounding.
+    if best_x == lo:
+        return float(bounds_arr[0])
+    if best_x == hi:
+        return float(bounds_arr[1])
+    return float(np.exp(best_x))
 
 
+@partial(typed_jit, static_argnames=("dt", "max_log_count", "max_newton_iter"))
 def _masked_graph_point_process_filter(
     init_mean: Array,
     init_cov: Array,
@@ -1129,15 +1205,15 @@ def _masked_graph_point_process_filter(
         design_row: Array,
         spike_count: Array,
         is_valid: Array,
-    ) -> tuple[Array, Array, Array]:
-        def _observed(_: None) -> tuple[Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array]:
+        def _observed(_: None) -> tuple[Array, Array, Array, Array]:
             def _eta(state: Array) -> Array:
                 return jnp.atleast_1d(log_conditional_intensity(design_row, state))
 
             def _grad_eta(_state: Array) -> Array:
                 return design_row[None, :]
 
-            return glm_laplace_update(
+            mean, cov, ll, n_failed_iterations = glm_laplace_update(
                 prior_mean,
                 prior_cov,
                 jnp.atleast_1d(spike_count),
@@ -1145,17 +1221,24 @@ def _masked_graph_point_process_filter(
                 family,
                 grad_eta_func=_grad_eta,
                 max_newton_iter=max_newton_iter,
+                return_line_search_failures=True,
+            )
+            return mean, cov, ll, (n_failed_iterations > 0).astype(jnp.int32)
+
+        def _missing(_: None) -> tuple[Array, Array, Array, Array]:
+            return (
+                prior_mean,
+                prior_cov,
+                jnp.zeros((), dtype=prior_mean.dtype),
+                jnp.zeros((), dtype=jnp.int32),
             )
 
-        def _missing(_: None) -> tuple[Array, Array, Array]:
-            return prior_mean, prior_cov, jnp.zeros((), dtype=prior_mean.dtype)
-
         return cast(
-            tuple[Array, Array, Array],
+            tuple[Array, Array, Array, Array],
             jax.lax.cond(is_valid, _observed, _missing, operand=None),
         )
 
-    first_mean, first_cov, first_ll = _observation_update(
+    first_mean, first_cov, first_ll, first_failed = _observation_update(
         init_mean,
         init_cov,
         design_matrix[0],
@@ -1164,16 +1247,16 @@ def _masked_graph_point_process_filter(
     )
 
     def _step(
-        carry: tuple[Array, Array, Array],
+        carry: tuple[Array, Array, Array, Array],
         args: tuple[Array, Array, Array],
-    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array]]:
-        previous_mean, previous_cov, marginal_ll = carry
+    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array]]:
+        previous_mean, previous_cov, marginal_ll, n_failed_bins = carry
         design_row, spike_count, is_valid = args
         prior_mean = transition_matrix @ previous_mean
         prior_cov = symmetrize(
             transition_matrix @ previous_cov @ transition_matrix.T + process_cov
         )
-        posterior_mean, posterior_cov, log_likelihood = _observation_update(
+        posterior_mean, posterior_cov, log_likelihood, failed = _observation_update(
             prior_mean,
             prior_cov,
             design_row,
@@ -1181,18 +1264,32 @@ def _masked_graph_point_process_filter(
             is_valid,
         )
         marginal_ll = marginal_ll + log_likelihood
-        return (posterior_mean, posterior_cov, marginal_ll), (
+        return (posterior_mean, posterior_cov, marginal_ll, n_failed_bins + failed), (
             posterior_mean,
             posterior_cov,
         )
 
-    (_, _, marginal_ll), (remaining_mean, remaining_cov) = jax.lax.scan(
+    (_, _, marginal_ll, n_failed_bins), (remaining_mean, remaining_cov) = jax.lax.scan(
         _step,
-        (first_mean, first_cov, first_ll),
+        (first_mean, first_cov, first_ll, first_failed),
         (design_matrix[1:], spikes[1:], valid[1:]),
     )
     filtered_mean = jnp.concatenate((first_mean[None, :], remaining_mean), axis=0)
     filtered_cov = jnp.concatenate((first_cov[None, :, :], remaining_cov), axis=0)
+    if max_newton_iter > 1:
+        # The observed-row denominator is dynamic under jit/grad; share the
+        # existing host-side warning policy through a callback. With no observed
+        # rows the failure count is zero; clamp the denominator to avoid 0/0.
+        jax.debug.callback(
+            partial(
+                _log_line_search_failures,
+                max_newton_iter=max_newton_iter,
+                name="GraphPlaceFieldModel",
+                unit="observed time bins",
+            ),
+            n_failed_bins,
+            n_units=jnp.maximum(jnp.sum(valid), 1),
+        )
     return filtered_mean, filtered_cov, marginal_ll
 
 
@@ -1307,8 +1404,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Maximum Newton iterations per time-step Laplace update in the
             filter, by default 1.
         """
-        if not dt > 0:
-            raise ValueError(f"dt must be positive, got {dt}.")
+        # The compiled filter treats dt as static; normalize concrete scalar
+        # array inputs to a finite, hashable Python float before caching it.
+        dt = validate_scalar(dt, "dt", positive=True)
         if not kappa2 > 0:
             raise ValueError(f"kappa2 must be positive, got {kappa2}.")
         if not tau2 > 0:

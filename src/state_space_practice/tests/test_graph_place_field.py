@@ -14,6 +14,7 @@ import scipy.sparse as sp
 
 from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import is_set
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 from state_space_practice.tests.model_state import (
     assert_model_state_unchanged,
     snapshot_model_state,
@@ -58,6 +59,14 @@ def two_component_env():
         np.random.default_rng(3).uniform(50, 60, (200, 2)),
     ]
     return Environment.from_samples(clusters, bin_size=2.5)
+
+
+@pytest.fixture(scope="module")
+def isolated_bins_env():
+    """Two isolated bins with one constant mode per component."""
+    return Environment.from_samples(
+        np.repeat(np.array([[0.0], [100.0]]), 20, axis=0), bin_size=1.0
+    )
 
 
 # --------------------------------------------------------------------------- Laplacian
@@ -561,6 +570,40 @@ def test_evidence_is_maximized_near_selected_tau2(small_grid_env):
     assert 1e-4 < tau2_hat < 1e4  # inside the search bounds (not railed)
 
 
+def test_evidence_selection_compares_separate_local_maxima(isolated_bins_env):
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    counts = np.array([991.0, 7.0])
+    occupancy = np.array([915.1023191776264, 1.9087187710789302])
+
+    def evidence(tau2):
+        return static_log_evidence(
+            counts, occupancy, basis.eigvecs, basis.eigvals, tau2=tau2, kappa2=1.0
+        )
+
+    small_peak, large_peak = 0.006627241795309415, 0.5011872336272725
+    small_evidence, large_evidence = evidence(small_peak), evidence(large_peak)
+    # Guard: the low-amplitude peak is a real local maximum, but loses to
+    # the separated peak. A single bounded search previously chose this trap.
+    assert small_evidence > evidence(small_peak / 2)
+    assert small_evidence > evidence(small_peak * 2)
+    assert large_evidence > small_evidence + 0.3
+
+    selected = select_tau2_by_evidence(counts, occupancy, basis, kappa2=1.0)
+    assert evidence(selected) >= large_evidence - 1e-6
+
+
+@pytest.mark.parametrize(
+    ("count", "bounds", "expected"),
+    [(1.0, (1e-4, 10.0), 1e-4), (15.0, (1e-4, 1e-3), 1e-3)],
+)
+def test_evidence_selection_includes_bounds(isolated_bins_env, count, bounds, expected):
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    selected = select_tau2_by_evidence(
+        np.full(2, count), np.ones(2), basis, kappa2=1.0, bounds=bounds
+    )
+    assert selected == expected
+
+
 # ------------------------------------------------- static parity + W-maze recovery
 @pytest.mark.slow
 def test_newton_map_matches_independent_optimizer(small_grid_env):
@@ -733,6 +776,138 @@ def test_graph_filter_uses_p0_at_row_zero_and_propagates_masked_rows():
     np.testing.assert_allclose(
         np.asarray(filtered_cov[:, 0, 0]), [2.0, 5.0, 8.0], atol=1e-7
     )
+
+
+@pytest.fixture
+def graph_line_search_problem(isolated_bins_env):
+    model = GraphPlaceFieldModel(
+        isolated_bins_env,
+        dt=0.02,
+        rank=2,
+        tau2=100.0,
+        max_firing_rate_hz=5.0,
+        max_newton_iter=3,
+        update_amplitude=False,
+        update_init_mean=False,
+    )
+    times = np.arange(20, dtype=float) * model.dt
+    trajectory = np.repeat(isolated_bins_env.bin_centers[:1], times.size, axis=0)
+    return model, times, trajectory, np.ones(times.size)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("dt", [np.array(0.02), jnp.array(0.02)])
+def test_compiled_graph_fit_accepts_scalar_array_dt(small_grid_env, dt):
+    model = GraphPlaceFieldModel(small_grid_env, dt=dt, rank=3)
+    times, trajectory = _toy_trajectory(small_grid_env, 20, seed=7)
+    likelihoods = model.fit(
+        times, trajectory, np.zeros(20), max_iter=1, warm_start=False, verbose=False
+    )
+    assert np.all(np.isfinite(likelihoods))
+    assert np.all(np.isfinite(model.predict_log_rate_trajectory()))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("method", ["fit", "score", "fit_sgd"])
+@pytest.mark.parametrize("n_neurons", [1, 2])
+def test_graph_fitters_report_exhausted_line_searches(
+    graph_line_search_problem, method, n_neurons, caplog
+):
+    model, times, trajectory, spikes = graph_line_search_problem
+    spikes = np.broadcast_to(spikes[:, None], (spikes.size, n_neurons)).copy()
+    if method == "score":
+        model.fit(
+            times, trajectory, spikes, max_iter=3, warm_start=False, verbose=False
+        )
+        jax.effects_barrier()
+        caplog.clear()
+    with caplog.at_level("WARNING", logger="state_space_practice.point_process_kalman"):
+        if method == "fit":
+            model.fit(
+                times, trajectory, spikes, max_iter=3, warm_start=False, verbose=False
+            )
+        elif method == "score":
+            assert np.isfinite(model.score(times, trajectory, spikes))
+        else:
+            model.fit_sgd(
+                times, trajectory, spikes, num_steps=1, warm_start=False, verbose=False
+            )
+        jax.effects_barrier()
+    messages = [
+        r.message
+        for r in caplog.records
+        if "GraphPlaceFieldModel" in r.message and "line search rejected" in r.message
+    ]
+    assert len(messages) >= n_neurons
+    assert all("20/20" in message and "100.0%" in message for message in messages)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("observed", [0, 2])
+def test_graph_line_search_diagnostics_exclude_masked_rows(observed, caplog):
+    from state_space_practice.graph_place_field import (
+        _masked_graph_point_process_filter,
+    )
+
+    valid = jnp.arange(20) < observed
+    with caplog.at_level("WARNING", logger="state_space_practice.point_process_kalman"):
+        result = _masked_graph_point_process_filter(
+            jnp.zeros(1),
+            100.0 * jnp.eye(1),
+            jnp.ones((20, 1)),
+            jnp.ones(20),
+            valid,
+            jnp.eye(1),
+            0.001 * jnp.eye(1),
+            dt=0.02,
+            max_log_count=float(np.log(5.0 * 0.02)),
+            max_newton_iter=3,
+        )
+        jax.block_until_ready(result)
+        jax.effects_barrier()
+    messages = [
+        r.message for r in caplog.records if "line search rejected" in r.message
+    ]
+    if observed:
+        assert any("2/2" in message and "100.0%" in message for message in messages)
+    else:
+        assert not messages
+        assert float(result[2]) == 0.0
+
+
+@pytest.mark.slow
+def test_repeated_estep_reuses_compilation_with_new_parameters(small_grid_env):
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=5)
+    times, trajectory = _toy_trajectory(small_grid_env, 37, seed=5)
+    spikes = np.random.default_rng(6).poisson(0.2, size=37).astype(float)
+    model.init_mean = jnp.zeros((1, model.rank))
+    model.drift_scale = jnp.full(1, 1e-3)
+    Z, spk, valid = model._design_and_spikes(times, trajectory, spikes)
+    new_mean = jnp.full((1, model.rank), 0.5, dtype=model.init_mean.dtype)
+    new_drift = jnp.full(1, 2e-3)
+    compiles = []
+
+    def listener(event, duration, **kwargs):
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiles.append(duration)
+
+    with listen_to_jax_durations(listener):
+        first_ll = model._e_step(Z, spk, valid)
+        first_mean = np.asarray(model.smoother_mean).copy()
+        n_first = len(compiles)
+        assert n_first > 0  # guard: the listener observed compilation
+
+        assert model._e_step(Z, spk, valid) == first_ll
+        np.testing.assert_array_equal(model.smoother_mean, first_mean)
+        model.tau2 = 2.0
+        model.kappa2 = 0.5
+        model.init_mean = new_mean
+        model.drift_scale = new_drift
+        changed_ll = model._e_step(Z, spk, valid)
+
+        assert len(compiles) == n_first
+    assert not np.isclose(changed_ll, first_ll)
+    assert not np.allclose(model.smoother_mean, first_mean)
 
 
 def test_tau_mstep_includes_fixed_prior_mean_residual(small_grid_env):

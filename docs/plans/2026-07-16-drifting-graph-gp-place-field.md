@@ -28,6 +28,8 @@
 
 7. **Current fitting contracts (2026-10-05).** The integrated model uses the shared `run_em` driver, typed `FittedAttribute` posteriors, and `_record_fit_result` / `_clear_fit_state` for fit metadata. `fit_sgd` is a forwarding wrapper; data validation and initialization happen in `_prepare_sgd_data` after optimizer settings are validated. `_finalize_sgd` returns the marginal log-likelihood, and `_sgd_param` keeps repeated fits from invalidating the compiled-step cache. Invalid SGD settings/data preserve an earlier fit; a non-finite fit clears posteriors and shared results. Unfitted predictions raise `NotFittedError`; unusable likelihoods raise `NonFiniteLikelihoodError`. The historical task snippets below predate these contracts. The `spatial` extra now resolves the git commit pinned in `uv.lock`, rather than an editable sibling checkout. Both topology-collision and same-size edge-reweighting fingerprint regression tests are retained.
 
+8. **Evidence search, diagnostics, and compilation (2026-10-05 review fixes).** Evidence can have multiple local maxima. `select_tau2_by_evidence` now samples 65 logarithmically spaced amplitudes, refines each candidate peak/boundary basin, and compares all evaluated values including the exact interval endpoints. This supersedes Task 2's single bounded-search sketch; the finite grid is a practical search, not a guarantee for arbitrarily narrow peaks. The static Newton solve and masked filter use stable module-level JIT functions with changing parameters passed as inputs. Repeated E-steps reuse compilation, including after parameter changes. The filter reports exhausted line searches through the existing host-side logging policy from eager, jit, and gradient paths. Failure fractions use observed rows; masked rows and fully unobserved grids do not cause spurious warnings. Regression coverage includes multimodal evidence, boundary optima, one-/two-neuron EM/scoring/SGD diagnostics, masking, and compilation reuse.
+
 
 ---
 
@@ -37,10 +39,11 @@ Validated with Python 3.11, x64 enabled, and the `neurospatial` git commit pinne
 in `uv.lock` (`uv sync --locked --extra test --extra coupling --extra spatial`).
 The editable sibling checkout is not used for this validation.
 
-- Graph and fitting-contract slice: **83 passed**, including every slow graph
+- Graph and fitting-contract slice: **97 passed**, including every slow graph
   test, three-seed drift tracking, fit metadata, failed-fit cleanup, and repeated
-  SGD step reuse. Command: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py src/state_space_practice/tests/test_fit_contract.py -k "graph or Graph" -q`.
-- Package fast suite: **2427 passed, 1 skipped, 949 deselected**. Command:
+  SGD step reuse, evidence-peak comparisons, masked line-search diagnostics, and
+  E-step compilation reuse. Command: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py src/state_space_practice/tests/test_fit_contract.py -k "graph or Graph" -q`.
+- Package fast suite: **2430 passed, 1 skipped**. Command:
   `LOKY_MAX_CPU_COUNT=4 uv run --no-sync pytest -m "not slow" -q`. The worker
   limit prevents joblib's physical-core detection warning in the restricted
   macOS execution environment.
@@ -344,7 +347,7 @@ git commit -m "feat(graph-pp): static penalized-Poisson estimator in the eigenba
 - Consumes: `fit_static_graph_glm`, `spectral_precision`, `spectral_shape`, `GraphBasis`.
 - Produces:
   - `static_log_evidence(counts, occupancy, eigvecs, eigvals, *, tau2, kappa2, alpha=1.0) -> float` — the Laplace log-evidence (summed over neurons), constant `log(count!)` terms dropped.
-  - `select_tau2_by_evidence(counts, occupancy, basis, *, kappa2, alpha=1.0, bounds=(1e-4, 1e4)) -> float` — the `τ²` maximizing `static_log_evidence` via `scipy.optimize.minimize_scalar` over `log τ²`.
+  - `select_tau2_by_evidence(counts, occupancy, basis, *, kappa2, alpha=1.0, bounds=(1e-4, 1e4)) -> float` — selects `τ²` by comparing a log-space grid, refined candidate peaks, and the interval endpoints (Amendment 8).
 
 - [x] **Step 1: Write the failing tests**
 
@@ -455,8 +458,8 @@ def select_tau2_by_evidence(
 ) -> float:
     """Return the ``tau2`` maximizing :func:`static_log_evidence`.
 
-    Optimizes over ``log tau2`` with a bounded scalar optimizer (the evidence is smooth
-    and unimodal in ``log tau2`` for a fixed ``kappa2``).
+    Historical single-basin search; superseded by the multi-peak grid search in
+    Amendment 8. Evidence is not necessarily unimodal.
     """
     lo, hi = np.log(bounds[0]), np.log(bounds[1])
 
