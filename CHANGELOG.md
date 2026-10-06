@@ -177,6 +177,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`GraphPlaceFieldModel` now uses five damped Newton iterations per observation**
+  by default (was one). Iterated inference logs observed bins whose remaining
+  relative log-rate Newton step exceeds 1e-6, including under JIT/SGD. Explicit
+  `max_newton_iter=1` preserves the previous single-step approximation. A paired
+  analytic-field benchmark and an SGD-only drift-scale objective/profile study
+  record accuracy, optimization, and runtime evidence; joint spatial drift-scale
+  learning remains experimental.
 - **Refitting an oscillator model restarts from the constructor's
   parameters**: `fit` (and the Gaussian models' `fit_sgd`) on
   `CorrelatedNoiseModel`, `DirectedInfluenceModel`,

@@ -32,7 +32,7 @@
 
 9. **Independent evidence audit (2026-10-06).** The independent blocked-holdout experiment below demonstrates retrospective tracking beyond eigenbasis-generated truth. It also exposes limits: a simple time-varying occupancy map outperforms the tested graph configurations on smooth/sparse drift, static controls favor a static estimator, and nominal uncertainty intervals under-cover changing truth. Implementation completion is not evidence of superiority or calibrated biological drift inference. Fitted branching-track comparisons, real recordings, and causal forecasting remain open.
 
-10. **Mathematical contracts and reference inference (2026-10-06).** Independent tests now check graph matrix functions, Poisson modes/curvature/evidence constants, dense Gaussian smoothing, numerical EM optimality, and derivatives in both log and actual SGD coordinates. A converged scalar Bayes-integral reference measures posterior and evidence approximation error, including masking and row-zero conventions. It confirms informative drift-scale profiles in a correctly specified scalar study and exposes a rare-count failure of the default single Newton step. Exact algebra, converged-mode Laplace calculations, and one-step Gaussian updates have different guarantees; the math section below distinguishes them.
+10. **Mathematical contracts and reference inference (2026-10-06).** Independent tests now check graph matrix functions, Poisson modes/curvature/evidence constants, dense Gaussian smoothing, numerical EM optimality, and derivatives in both log and actual SGD coordinates. A converged scalar Bayes-integral reference measures posterior and evidence approximation error, including masking and row-zero conventions. It confirms informative drift-scale profiles in a correctly specified scalar study and exposes a rare-count failure of the original single Newton step. Exact algebra, converged-mode Laplace calculations, and one-step Gaussian updates have different guarantees; the math section below distinguishes them.
 
 
 ---
@@ -118,13 +118,17 @@ Run from the repository root after installing the pinned spatial/test extras:
 ```bash
 MPLCONFIGDIR=/private/tmp/ssp-matplotlib LOKY_MAX_CPU_COUNT=4 \
   uv run --no-sync python notebooks/graph_place_field_validation.py \
-  --output-dir docs/validation/graph-place-field
+  --output-dir docs/validation/graph-place-field --max-newton-iter 1
 ```
 
 This experiment still leaves the fitted cross-arm graph-versus-spline/MRF comparison,
 longer gaps, broader movement/field families, causal forecasting and real-data
 validation open. The existing real-data notebook uses splines, and its local `data/`
 directory is absent from this checkout; it supplies no evidence for this graph model.
+
+The stored forty-session audit below used the original one-step Newton default.
+The explicit override above reproduces that approximation; the later Newton-budget
+comparison measures the new five-step default separately.
 
 ### Results and interpretation
 
@@ -351,6 +355,116 @@ the previously documented performance/coverage gaps.
 Validation: the graph/math/fitting-contract slice passes **132 tests**; the package
 fast suite passes **2449 tests, 1 skipped**. Ruff checks/formatting and whole-package
 mypy (47 source files) pass. The previous field-recovery thresholds are unchanged.
+
+## Multi-iteration default and SGD drift learning (2026-10-06)
+
+`GraphPlaceFieldModel.max_newton_iter` now defaults to **5**, retaining an explicit
+one-step option. Updates use the package's damped Fisher/Newton machinery and
+recompute curvature at the accepted state. A final convergence diagnostic reduces
+the rank-one observation to its scalar log-rate coordinate: with `eta=z.T w`,
+`eta0=z.T m_prior`, and `v=z.T P_prior z`, the remaining projected Newton correction
+is `(eta-eta0 + v*(mu-y))/(1+v*mu)`. Observed bins with correction larger than
+`1e-6*(1+abs(eta))` are logged, including from JIT/SGD and per-neuron batching.
+Missing rows are excluded. This is a local conditional-mode check; it does not
+establish a joint trajectory mode or calibrated Gaussian posterior moments.
+
+The unexpected-eight-count regression reaches the independent mode and inverse
+Hessian with the constructor default; one step overshoots by 7.86 reference
+posterior standard deviations. Separate tests show that accepted line-search
+steps can exhaust the iteration budget and that diagnostics report this under
+eager execution, JIT and differentiation without counting masked rows.
+
+The reproducible comparison is
+[`graph_place_field_estimation_validation.py`](../../notebooks/graph_place_field_estimation_validation.py):
+
+```bash
+MPLCONFIGDIR=/private/tmp/ssp-matplotlib LOKY_MAX_CPU_COUNT=4 \
+  uv run --no-sync python notebooks/graph_place_field_estimation_validation.py \
+  --section newton --output-dir docs/validation/graph-place-field-estimation
+MPLCONFIGDIR=/private/tmp/ssp-matplotlib LOKY_MAX_CPU_COUNT=4 \
+  uv run --no-sync python notebooks/graph_place_field_estimation_validation.py \
+  --section sgd --output-dir docs/validation/graph-place-field-estimation
+```
+
+### Paired Newton-budget comparison
+
+[`newton.json`](../validation/graph-place-field-estimation/newton.json) records the
+same analytic-field sessions at each budget, seeds 10/11 in all four conditions.
+The full-rank default EM pipeline is compared at one/five steps; a fixed rank-8,
+q=0.01, tau2=100 pipeline is compared at one/three/five/ten. No other settings or
+evaluation observations change. Pipeline timing includes setup, fitting, posterior
+prediction and validation scoring, excludes final-test metrics, and follows
+compilation warmup on separate pilot data, with budget order alternated by seed.
+
+| Condition | Default EM test-score gain, 5 vs 1 (nats) | Default EM pipeline-time ratio | Fixed rank-8 test-score gain, 5 vs 1 (nats) |
+| --- | ---: | ---: | ---: |
+| Stable | +0.111 | 1.38 | +0.439 |
+| Smooth drift | +1.066 | 1.33 | +1.264 |
+| Abrupt remap | +1.299 | 1.39 | +3.001 |
+| Sparse drift | +0.241 | 1.35 | +1.843 |
+
+Five steps improve held-out scores in all eight sessions in both pipelines. In the
+fixed pipeline, average field-RMSE changes between five and ten steps are below
+4e-7 and test-score changes below 1.2e-5 nats. Five is therefore the tested accuracy/
+cost choice, not a universal convergence guarantee: rare remaining-step warnings
+still occur, and increasing the budget is appropriate when reported. The default
+pipeline's uncertainty coverage remains poor in moving/sparse conditions (roughly
+47%/71%/56% for smooth/remap/sparse). This eight-session paired exploratory comparison
+does not replace the broader application audit or establish calibrated uncertainty.
+
+### Actual SGD drift-only fits
+
+[`sgd.json`](../validation/graph-place-field-estimation/sgd.json) reuses the twenty
+independently integrated scalar datasets above, each with 24 rows and four masked
+observations. Prior mean/variance, kappa2 and the basis are known and fixed; only q
+is learned through the public `fit_sgd`, with the new Newton default and the shared
+Adam(0.01)/positive-transform machinery. Reported q is **log-rate variance**, equal
+to `phi^2 * drift_scale`, rather than coefficient variance. Each dataset is fit
+from q=0.001/0.03/0.3 at 200 and 1,000 steps, with fresh optimizer state in each fit.
+
+A separate 81-point log-scale search over [0.0001,1] refines every sampled local
+maximum and includes endpoints. The criterion is an objective gap <=0.001 nat
+against this bounded search, not closeness of a single fitted q to generating q.
+Five-step likelihoods on the original six reference-profile points differ from
+25-step values by at most 1.6e-7 nats; their average profile still peaks at generating
+q=0.03. This checks the numerical approximation in this controlled regime.
+
+| Adam steps | Fits reaching or exceeding bounded profile objective to 0.001 nat | Median objective gap (nats) | Largest gap (nats) |
+| --- | ---: | ---: | ---: |
+| 200 (API default) | 10/60 | 0.1083 | 5.1197 |
+| 1,000 | 40/60 | about 2.5e-14 | 0.1212 |
+
+Eight dataset profiles peak at the lower search boundary; eight 1,000-step fits
+end below that boundary and achieve higher evidence than the bounded reference.
+Those count as reaching its objective, not as proof of a global optimum. Sixteen
+of the twenty remaining 1,000-step optimization gaps are on boundary-profile
+datasets, so shrinking a positive-transformed scale toward zero is a major observed
+limitation. The other gaps also prevent a general optimizer-convergence claim.
+Short datasets naturally have noisy q estimates; parameter recovery is distinct
+from optimizing the approximate evidence. These results establish that drift-only
+SGD can succeed and that 200 steps are not a reliable budget across starts. They
+do **not** validate joint learning of q, tau2, kappa2 and initial means in a full
+spatial model; drift learning remains opt-in. Next checks should span generating
+scales, durations/rates and occupancy, compare direct/profile optimization with
+Adam, include a q=0/static candidate, and evaluate final held-out predictions.
+
+### Minibatching
+
+The existing `fit_sgd` uses full-sequence gradients. Random time-row batches or
+resetting state at chunk boundaries change this state-space likelihood. Independent
+neurons/recordings are natural batch units conditional on shared parameters; time
+subsampling needs a designed approximation, such as buffered contiguous windows
+with bias checked against full-sequence gradients. Sparse observations and random-
+walk dynamics make a short-memory assumption unsafe without measurement. See
+[Aicher et al., Stochastic Gradient MCMC for State Space Models](https://arxiv.org/abs/1810.09098)
+for buffered-gradient methods; that machinery is not implemented here. Full-sequence
+optimization is retained while inference and drift-learning validity are assessed.
+
+Validation: **139 graph/math/fitting-contract checks pass**; 23 relevant checks
+also pass after the internal scan-result refactor. Whole-repository Ruff checks and
+formatting and whole-package mypy (47 source files) pass. Historical numerical
+reports retain their original one-step settings; the application script accepts
+`--max-newton-iter 1` to reproduce them and records the actual budget for new runs.
 
 ## Global Constraints
 
@@ -911,7 +1025,7 @@ git commit -m "test(graph-pp): static-field parity vs independent optimizer + W-
 
 **Interfaces:**
 - Consumes: `build_graph_basis`, `spectral_shape`, `GraphBasis`; `SGDFittableMixin` from `state_space_practice.sgd_fitting`.
-- Produces: `GraphPlaceFieldModel(env, dt, *, rank=None, sigma=None, kappa2=1.0, alpha=1.0, tau2=1.0, init_drift_scale=1e-3, interpolation="nearest", laplacian_convention="distance", update_drift_scale=False, update_amplitude=True, update_init_mean=True, max_firing_rate_hz=500.0, max_newton_iter=1)`. After construction: `self.basis` (`GraphBasis`), `self.rank` (int), and `self.prior_cov()` / `self.drift_cov(q_c)` helpers returning `(rank, rank)` diagonal PSD matrices. Later tasks rely on: `self._spectral_shape_current()`, `self.rank`, `self.kappa2`, `self.alpha`, `self.tau2`, `self.dt`, `self.basis.eigvecs`, `self.transition_matrix` (`= I(rank)`), `self._log_intensity_func`, `self.max_newton_iter`, `self._max_log_count`. **The spectral shape `S` is never cached on the instance** — `kappa2` is fittable, so a snapshot would go stale; always derive `S` from `_spectral_shape_current()`.
+- Produces: `GraphPlaceFieldModel(env, dt, *, rank=None, sigma=None, kappa2=1.0, alpha=1.0, tau2=1.0, init_drift_scale=1e-3, interpolation="nearest", laplacian_convention="distance", update_drift_scale=False, update_amplitude=True, update_init_mean=True, max_firing_rate_hz=500.0, max_newton_iter=5)`. After construction: `self.basis` (`GraphBasis`), `self.rank` (int), and `self.prior_cov()` / `self.drift_cov(q_c)` helpers returning `(rank, rank)` diagonal PSD matrices. Later tasks rely on: `self._spectral_shape_current()`, `self.rank`, `self.kappa2`, `self.alpha`, `self.tau2`, `self.dt`, `self.basis.eigvecs`, `self.transition_matrix` (`= I(rank)`), `self._log_intensity_func`, `self.max_newton_iter`, `self._max_log_count`. **The spectral shape `S` is never cached on the instance** — `kappa2` is fittable, so a snapshot would go stale; always derive `S` from `_spectral_shape_current()`.
 
 - [x] **Step 1: Write the failing tests**
 
@@ -989,7 +1103,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         update_amplitude: bool = True,
         update_init_mean: bool = True,
         max_firing_rate_hz: float = 500.0,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 5,
     ) -> None:
         if not dt > 0:
             raise ValueError(f"dt must be positive, got {dt}.")

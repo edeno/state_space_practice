@@ -230,6 +230,7 @@ def infer_graph(
     *,
     defaults: bool = False,
     max_em_iter: int = 100,
+    max_newton_iter: int | None = None,
 ) -> Prediction:
     settings = (
         {}
@@ -241,6 +242,8 @@ def infer_graph(
             update_kappa2=False,
         )
     )
+    if max_newton_iter is not None:
+        settings["max_newton_iter"] = max_newton_iter
     model = GraphPlaceFieldModel(env, dt=DT, rank=rank, init_drift_scale=q, **settings)
     masked_trajectory = session.trajectory.copy()
     masked_trajectory[~session.train] = 1e6
@@ -263,6 +266,7 @@ def infer_graph(
         dict(
             rank=model.rank,
             q=q,
+            max_newton_iter=model.max_newton_iter,
             tau2=model.tau2,
             fitting="default EM" if defaults else "fixed parameters",
             em_iteration_budget=max_em_iter if defaults else 1,
@@ -402,8 +406,14 @@ def metrics(session: Session, prediction: Prediction) -> dict:
     )
 
 
-def evaluate(env: Environment, session: Session) -> tuple[dict, dict[str, Prediction]]:
-    graph = [infer_graph(env, session, rank, q) for rank in RANKS for q in DRIFT_SCALES]
+def evaluate(
+    env: Environment, session: Session, *, max_newton_iter: int | None = None
+) -> tuple[dict, dict[str, Prediction]]:
+    graph = [
+        infer_graph(env, session, rank, q, max_newton_iter=max_newton_iter)
+        for rank in RANKS
+        for q in DRIFT_SCALES
+    ]
     static = [
         infer_static(env, session, rank, tau)
         for rank in RANKS
@@ -417,7 +427,9 @@ def evaluate(env: Environment, session: Session) -> tuple[dict, dict[str, Predic
     selected = max(graph, key=lambda p: p.validation_log_score)
     selected_static = max(static, key=lambda p: p.validation_log_score)
     selected_windowed = max(windowed, key=lambda p: p.validation_log_score)
-    defaults = infer_graph(env, session, None, 1e-3, defaults=True)
+    defaults = infer_graph(
+        env, session, None, 1e-3, defaults=True, max_newton_iter=max_newton_iter
+    )
     predictions = dict(
         selected=selected,
         defaults=defaults,
@@ -562,11 +574,18 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(10, 20)))
     parser.add_argument("--cases", choices=CASES, nargs="+", default=list(CASES))
+    parser.add_argument(
+        "--max-newton-iter",
+        type=int,
+        help="Override the constructor's Newton budget (use 1 to reproduce the original audit)",
+    )
     args = parser.parse_args()
     if len(set(args.seeds)) != len(args.seeds) or min(args.seeds) < 0:
         parser.error("Seeds must be distinct nonnegative integers.")
     if len(set(args.cases)) != len(args.cases):
         parser.error("Cases must be distinct.")
+    if args.max_newton_iter is not None and args.max_newton_iter < 1:
+        parser.error("Newton budget must be positive.")
     scorer_checks = check_predictive_scorer()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     env = Environment.from_samples(np.linspace(0, 100, 2001)[:, None], bin_size=2.5)
@@ -575,7 +594,9 @@ def main() -> None:
     for case in args.cases:
         for seed in args.seeds:
             session = simulate_session(env, case, seed)
-            result, predictions = evaluate(env, session)
+            result, predictions = evaluate(
+                env, session, max_newton_iter=args.max_newton_iter
+            )
             records.append(dict(case=case, seed=seed, **result))
             if seed == args.seeds[0]:
                 examples[case] = session, predictions
@@ -603,6 +624,7 @@ def main() -> None:
             selection="validation counts only; no truth or final test counts",
             quadrature_nodes=256,
             default_em_iteration_budget=100,
+            newton_iteration_override=args.max_newton_iter,
             uncertainty_coverage_models=("selected", "defaults", "static"),
             limitation="exploratory synthetic sessions on a linear track; bootstrap intervals are descriptive",
         ),

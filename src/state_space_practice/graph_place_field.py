@@ -1142,6 +1142,45 @@ def select_tau2_by_evidence(
     return float(np.exp(best_x))
 
 
+class _GraphObservationUpdate(NamedTuple):
+    mean: Array
+    covariance: Array
+    log_evidence: Array
+    failed_line_search: Array
+    relative_newton_step: Array
+
+
+class _GraphFilterCarry(NamedTuple):
+    mean: Array
+    covariance: Array
+    log_evidence: Array
+    failed_bins: Array
+    unconverged_bins: Array
+    max_relative_step: Array
+
+
+def _log_graph_newton_nonconvergence(
+    n_unconverged: Array,
+    n_observed: Array,
+    max_relative_step: Array,
+    *,
+    max_newton_iter: int,
+) -> None:
+    """Report exhausted Newton budgets, including under jit/grad/vmap."""
+    n = int(np.asarray(n_unconverged))
+    if n:
+        logger.warning(
+            "GraphPlaceFieldModel: Newton updates did not converge in %d/%d "
+            "observed time bins with max_newton_iter=%d (largest remaining "
+            "relative log-rate step %.3g; tolerance 1e-6). Increase "
+            "max_newton_iter; the posterior and evidence are unconverged.",
+            n,
+            int(np.asarray(n_observed)),
+            max_newton_iter,
+            float(np.asarray(max_relative_step)),
+        )
+
+
 @partial(typed_jit, static_argnames=("dt", "max_log_count", "max_newton_iter"))
 def _masked_graph_point_process_filter(
     init_mean: Array,
@@ -1162,6 +1201,9 @@ def _masked_graph_point_process_filter(
     conditioned directly on ``(init_mean, init_cov)``.  Subsequent rows receive one
     dynamics transition each.  A row whose position is invalid skips only the
     observation update; its dynamics propagation remains in the state trajectory.
+    Iterated updates report remaining projected Newton steps above a relative
+    tolerance of 1e-6. This checks local conditional modes, not the joint mode
+    of the trajectory or accuracy of the Gaussian posterior approximation.
 
     Parameters
     ----------
@@ -1205,8 +1247,8 @@ def _masked_graph_point_process_filter(
         design_row: Array,
         spike_count: Array,
         is_valid: Array,
-    ) -> tuple[Array, Array, Array, Array]:
-        def _observed(_: None) -> tuple[Array, Array, Array, Array]:
+    ) -> _GraphObservationUpdate:
+        def _observed(_: None) -> _GraphObservationUpdate:
             def _eta(state: Array) -> Array:
                 return jnp.atleast_1d(log_conditional_intensity(design_row, state))
 
@@ -1223,22 +1265,40 @@ def _masked_graph_point_process_filter(
                 max_newton_iter=max_newton_iter,
                 return_line_search_failures=True,
             )
-            return mean, cov, ll, (n_failed_iterations > 0).astype(jnp.int32)
+            relative_step = jnp.zeros((), dtype=prior_mean.dtype)
+            if max_newton_iter > 1:
+                # The rank-one likelihood changes only eta=z.T w. Its prior
+                # variance v=z.T P z reduces the remaining Newton step to
+                # [eta-eta0 + v*(mu-y)] / [1+v*mu], without another matrix solve.
+                eta = design_row @ mean
+                eta0 = design_row @ prior_mean
+                v = design_row @ prior_cov @ design_row
+                mu = family.mean(jnp.atleast_1d(eta))[0]
+                correction = (eta - eta0 + v * (mu - spike_count)) / (1 + v * mu)
+                relative_step = jnp.abs(correction) / (1 + jnp.abs(eta))
+            return _GraphObservationUpdate(
+                mean,
+                cov,
+                ll,
+                (n_failed_iterations > 0).astype(jnp.int32),
+                relative_step,
+            )
 
-        def _missing(_: None) -> tuple[Array, Array, Array, Array]:
-            return (
+        def _missing(_: None) -> _GraphObservationUpdate:
+            return _GraphObservationUpdate(
                 prior_mean,
                 prior_cov,
                 jnp.zeros((), dtype=prior_mean.dtype),
                 jnp.zeros((), dtype=jnp.int32),
+                jnp.zeros((), dtype=prior_mean.dtype),
             )
 
         return cast(
-            tuple[Array, Array, Array, Array],
+            _GraphObservationUpdate,
             jax.lax.cond(is_valid, _observed, _missing, operand=None),
         )
 
-    first_mean, first_cov, first_ll, first_failed = _observation_update(
+    first_mean, first_cov, first_ll, first_failed, first_step = _observation_update(
         init_mean,
         init_cov,
         design_matrix[0],
@@ -1247,31 +1307,60 @@ def _masked_graph_point_process_filter(
     )
 
     def _step(
-        carry: tuple[Array, Array, Array, Array],
+        carry: _GraphFilterCarry,
         args: tuple[Array, Array, Array],
-    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array]]:
-        previous_mean, previous_cov, marginal_ll, n_failed_bins = carry
+    ) -> tuple[_GraphFilterCarry, tuple[Array, Array]]:
+        (
+            previous_mean,
+            previous_cov,
+            marginal_ll,
+            n_failed_bins,
+            n_unconverged,
+            max_step,
+        ) = carry
         design_row, spike_count, is_valid = args
         prior_mean = transition_matrix @ previous_mean
         prior_cov = symmetrize(
             transition_matrix @ previous_cov @ transition_matrix.T + process_cov
         )
-        posterior_mean, posterior_cov, log_likelihood, failed = _observation_update(
-            prior_mean,
-            prior_cov,
-            design_row,
-            spike_count,
-            is_valid,
+        posterior_mean, posterior_cov, log_likelihood, failed, step = (
+            _observation_update(
+                prior_mean,
+                prior_cov,
+                design_row,
+                spike_count,
+                is_valid,
+            )
         )
         marginal_ll = marginal_ll + log_likelihood
-        return (posterior_mean, posterior_cov, marginal_ll, n_failed_bins + failed), (
+        return _GraphFilterCarry(
+            posterior_mean,
+            posterior_cov,
+            marginal_ll,
+            n_failed_bins + failed,
+            n_unconverged + (step > 1e-6).astype(jnp.int32),
+            jnp.maximum(max_step, step),
+        ), (
             posterior_mean,
             posterior_cov,
         )
 
-    (_, _, marginal_ll, n_failed_bins), (remaining_mean, remaining_cov) = jax.lax.scan(
+    (
+        (_, _, marginal_ll, n_failed_bins, n_unconverged, max_step),
+        (
+            remaining_mean,
+            remaining_cov,
+        ),
+    ) = jax.lax.scan(
         _step,
-        (first_mean, first_cov, first_ll, first_failed),
+        _GraphFilterCarry(
+            first_mean,
+            first_cov,
+            first_ll,
+            first_failed,
+            (first_step > 1e-6).astype(jnp.int32),
+            first_step,
+        ),
         (design_matrix[1:], spikes[1:], valid[1:]),
     )
     filtered_mean = jnp.concatenate((first_mean[None, :], remaining_mean), axis=0)
@@ -1289,6 +1378,12 @@ def _masked_graph_point_process_filter(
             ),
             n_failed_bins,
             n_units=jnp.maximum(jnp.sum(valid), 1),
+        )
+        jax.debug.callback(
+            partial(_log_graph_newton_nonconvergence, max_newton_iter=max_newton_iter),
+            n_unconverged,
+            jnp.sum(valid),
+            max_step,
         )
     return filtered_mean, filtered_cov, marginal_ll
 
@@ -1349,7 +1444,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         update_init_mean: bool = True,
         update_kappa2: bool = True,
         max_firing_rate_hz: float = 500.0,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 5,
     ) -> None:
         """Build the graph basis and initialize model hyperparameters.
 
@@ -1409,10 +1504,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             positive.
         max_newton_iter : int, optional
             Maximum Newton iterations per time-step Laplace update in the
-            filter, by default 1.
+            filter, by default 5, with damped updates and a final local
+            convergence check (relative remaining log-rate step <= 1e-6).
             One iteration uses curvature at the predicted state and need not
             reach the posterior mode. Larger values use damped iterative updates;
-            their Gaussian posterior is still an approximation.
+            their Gaussian posterior is still an approximation. Unconverged
+            iterated updates are logged; increase the budget when reported.
         """
         # The compiled filter treats dt as static; normalize concrete scalar
         # array inputs to a finite, hashable Python float before caching it.
@@ -1452,9 +1549,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.interpolation = interpolation
         self.max_firing_rate_hz = max_firing_rate_hz
         self.max_newton_iter = max_newton_iter
-        # The approximate Laplace-EKF marginal likelihood does not reliably
-        # identify q_c from spike observations. Keep it fixed by default; the
-        # closed-form update remains available as an explicit experimental opt-in.
+        # Joint spatial drift-scale learning remains unvalidated. Keep it fixed
+        # by default; the update remains an explicit experimental opt-in.
         self.update_drift_scale = update_drift_scale
         self.update_amplitude = update_amplitude
         self.update_init_mean = update_init_mean

@@ -399,6 +399,89 @@ def test_one_step_and_converged_laplace_have_distinct_mathematical_targets():
 
 
 @pytest.mark.slow
+def test_default_newton_budget_reaches_unexpected_count_mode(math_env, caplog):
+    """The constructor default must fix the documented one-step overshoot."""
+    model = GraphPlaceFieldModel(
+        math_env,
+        dt=0.1,
+        rank=1,
+        init_drift_scale=0.0,
+        max_firing_rate_hz=1e50,
+        update_amplitude=False,
+        update_init_mean=False,
+    )
+    phi = float(model.basis.eigvecs[0, 0])
+    model.tau2 = 1 / phi**2
+    model.init_mean = jnp.zeros((1, 1))
+    model.drift_scale = jnp.zeros(1)
+    times = np.arange(2) * model.dt
+    trajectory = np.repeat(math_env.bin_centers[:1], 2, axis=0)
+    trajectory[1] = 1e6
+    z, counts, mask = model._design_and_spikes(times, trajectory, [8.0, 1e6])
+    with caplog.at_level("WARNING"):
+        ll = model._e_step(z, counts, mask)
+        jax.effects_barrier()
+
+    def objective(eta):
+        return 0.1 * np.exp(eta) - 8 * eta + 0.5 * eta**2
+
+    optimum = minimize_scalar(objective, bounds=(-2, 8), method="bounded").x
+    eta = float(model.smoother_mean[0, 0, 0]) * phi
+    variance = float(model.smoother_cov[0, 0, 0, 0]) * phi**2
+    assert abs(eta - (8 - 0.1) / 1.1) > 2  # the one-step result must fail
+    assert eta == pytest.approx(optimum, abs=1e-6)
+    assert variance == pytest.approx(1 / (1 + 0.1 * np.exp(optimum)), rel=1e-6)
+    assert np.isfinite(ll)
+    assert not any(
+        "Newton updates did not converge" in r.message for r in caplog.records
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("mode", ["eager", "jit", "grad"])
+@pytest.mark.parametrize("observed", [0, 1])
+def test_graph_newton_budget_diagnostic_counts_only_observed_rows(
+    mode, observed, caplog
+):
+    """Accepted steps can still exhaust the budget without line-search failure."""
+
+    def log_evidence(mean):
+        return _masked_graph_point_process_filter(
+            mean,
+            jnp.eye(1),
+            jnp.ones((20, 1)),
+            jnp.full(20, 8.0),
+            jnp.arange(20) < observed,
+            jnp.eye(1),
+            jnp.zeros((1, 1)),
+            dt=0.1,
+            max_log_count=20.0,
+            max_newton_iter=2,
+        )[2]
+
+    function = {
+        "eager": log_evidence,
+        "jit": jax.jit(log_evidence),
+        "grad": jax.grad(log_evidence),
+    }[mode]
+    with caplog.at_level("WARNING", logger="state_space_practice.graph_place_field"):
+        result = function(jnp.zeros(1))
+        jax.block_until_ready(result)
+        jax.effects_barrier()
+    assert np.all(np.isfinite(result))
+    messages = [
+        r.message
+        for r in caplog.records
+        if "Newton updates did not converge" in r.message
+    ]
+    if observed:
+        assert any("1/1 observed time bins" in message for message in messages)
+        assert not any("line search rejected" in r.message for r in caplog.records)
+    else:
+        assert not messages
+
+
+@pytest.mark.slow
 def test_multimode_poisson_update_matches_independent_scalar_projection(math_env):
     """A rank-one likelihood permits an independent multi-dimensional oracle.
 
