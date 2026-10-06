@@ -1,8 +1,8 @@
 # Drifting Graph-GP Place Field Model Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For implementation:** Follow the "Remaining work before merge" section for new work, with its phase gates and checkbox tasks. Historical task snippets document the earlier design; use current package contracts and repository instructions when implementing.
 
-**Goal:** Recover each neuron's time-varying, graph-respecting place-field trajectory `eta_{c,t} = Phi w_{c,t}` from position-aligned Poisson spikes. The drift scale `q_c` controls temporal flexibility and may be supplied or tuned; recovering its generating value is not an acceptance target.
+**Goal:** Recover each neuron's time-varying, graph-respecting place-field trajectory `eta_{c,t} = Phi w_{c,t}` from position-aligned Poisson spikes, with dependable automatic estimation of its drift scale `q_c`. Automatic estimation is now a merge requirement. Acceptance includes optimizer correctness, statistical recovery in informative model-matched simulations, and useful held-out predictions. A single realization need not recover its generating scale, and a fixed-scale option remains available.
 
 **Architecture:** Reuse the existing point-process Laplace-EKF primitives (`point_process_kalman.py`), Kalman EM helpers (`kalman.py`), and the SGD mixin (`sgd_fitting.py`). The novelty is (1) a geometry-aware basis `Φ` (the smoothest Laplacian eigenvectors) already built by the Stage-0 substrate in `graph_place_field.py`, and (2) a shared *diagonal-in-the-eigenbasis* spectral shape `S = (κ²I + diag(λ))^(−α)` that ties the prior `P₀ = τ²S`, the initial covariance, and the per-neuron drift `Q_c = q_c·S` together, so "smoothness" reduces to a handful of tunable scalars (`τ²`, `κ²`, per-neuron `q_c`). `τ²` and `κ²` are learnable; `q_c` is fixed by default and its learning path is experimental (Amendment 1). Neurons are conditionally independent given `Φ`, so the E-step is a `jax.vmap` of the single-neuron Laplace-EKF (dimension `rank`) over neurons using the local masked full-grid filter described in Amendment 2.
 
@@ -12,9 +12,9 @@
 
 ## Implementation status & amendments (post-implementation reconciliation)
 
-**Status:** Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. The committed code in `graph_place_field.py` / `test_graph_place_field.py` is authoritative; several task sections **below describe the original design and were superseded during implementation** — the amendments here take precedence over the task text and code blocks that follow.
+**Status:** Core Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. **The PR remains incomplete: reliable automatic drift-scale estimation is the remaining merge requirement**, as requested on 2026-10-06. The section "Remaining work before merge" below is the current execution plan. The committed code is authoritative for current behavior; historical task sections and earlier acceptance decisions are superseded by the current goal and that section.
 
-1. **Latent field tracking is the primary acceptance target; `q_c` estimation is not.** The implementation must recover the time-varying log-rate field over time and every graph bin and substantially outperform both causal filtering and a single static field. `predict_log_rate_trajectory` exposes this primary posterior output without averaging away the drift. The synthetic tracking contract removes both the common rate baseline and each bin's temporal mean before scoring, so a static spatial pattern cannot pass. It uses the constructor's default `q_c`, deliberately 10x below the generating value, and validates three independent sessions after cold-start burn-in. `q_c` is fixed by default because the original spatial-field experiments did not validate reliable automatic drift-scale learning: their approximate marginal-LL profiles favored larger values, and Gaussian M-steps stayed near initialization (also observed in the sibling `PlaceFieldModel`). These are observed failure cases, not a proof of structural non-identifiability. The original tracking generator also fixes baseline drift while the model allows it. The independent scalar math study below finds informative reference and approximate average evidence profiles when the other parameters are fixed and the generative model matches. Enabling `update_drift_scale=True` (EM) or learning `q_c` via `fit_sgd` remains an explicit, experimental opt-in and is **not** validated to recover drift scales in the full spatial model with other parameters fitted jointly. There is therefore no full-field generating-`q_c` recovery acceptance test; trajectory recovery and independent M-step optimality are the retained contracts. Future automatic timescale selection can use validation data or a redesigned approximation without changing the trajectory-recovery goal.
+1. **Tracking and automatic drift-scale estimation are both acceptance targets.** Existing tests establish temporal field recovery with a supplied scale: they remove common baselines and each bin's temporal mean, use a scale ten times below the generator's, and cover three independent sessions. They do not establish automatic learning. Learning remains disabled by default in the current code because spatial evidence profiles were biased and EM depended on initialization; the newer scalar study shows that the default Adam budget also often misses the directly profiled objective. These are measured failures, not a proof of structural non-identifiability. The original spatial generator additionally fixes baseline drift while the model allows it. The earlier decision to exclude scale estimation from acceptance is superseded: informative, correctly specified simulations must now test scale recovery, and independent analytic-field sessions must test the resulting predictions. A validation-tuned scale is a useful comparator or separately named alternative; it must not silently replace the promised marginal-likelihood learning feature.
 
 2. **Architecture: a masked full-grid filter, not the library smoother.** The E-step, `fit`, `fit_sgd`, and `score` use a new local `_masked_graph_point_process_filter` (`glm_laplace_update` + `poisson_family`) plus `rts_backward_scan`, **not** `stochastic_point_process_filter/_smoother`. It runs each neuron on the **full** time grid: out-of-bounds trajectory rows advance the latent random walk but **skip their observation update** (rather than being dropped, as the original design had it). Row 0 is conditioned **directly on `(init_mean, P₀)`** (no predict-before-first-update; see the `point_process_kalman` docstring note documenting the library filter's differing convention). `_design_and_spikes` returns `(Z, spikes, valid)`.
 
@@ -33,6 +33,8 @@
 9. **Independent evidence audit (2026-10-06).** The independent blocked-holdout experiment below demonstrates retrospective tracking beyond eigenbasis-generated truth. It also exposes limits: a simple time-varying occupancy map outperforms the tested graph configurations on smooth/sparse drift, static controls favor a static estimator, and nominal uncertainty intervals under-cover changing truth. Implementation completion is not evidence of superiority or calibrated biological drift inference. Fitted branching-track comparisons, real recordings, and causal forecasting remain open.
 
 10. **Mathematical contracts and reference inference (2026-10-06).** Independent tests now check graph matrix functions, Poisson modes/curvature/evidence constants, dense Gaussian smoothing, numerical EM optimality, and derivatives in both log and actual SGD coordinates. A converged scalar Bayes-integral reference measures posterior and evidence approximation error, including masking and row-zero conventions. It confirms informative drift-scale profiles in a correctly specified scalar study and exposes a rare-count failure of the original single Newton step. Exact algebra, converged-mode Laplace calculations, and one-step Gaussian updates have different guarantees; the math section below distinguishes them.
+
+11. **Five-step default and actual optimization audit (2026-10-06).** Five damped local Newton steps replace the original one-step default, with remaining-step diagnostics. Paired independent-field sessions improve held-out scores. Drift-only SGD reaches the bounded profile objective in 10/60 fits at 200 steps and 40/60 at 1,000 steps. The study motivates the remaining optimizer/inference/statistical gates below; increasing the step count alone is not an accepted resolution.
 
 
 ---
@@ -466,6 +468,130 @@ formatting and whole-package mypy (47 source files) pass. Historical numerical
 reports retain their original one-step settings; the application script accepts
 `--max-newton-iter 1` to reproduce them and records the actual budget for new runs.
 
+## Remaining work before merge: automatic drift-scale estimation (2026-10-06)
+
+**Status:** Planned; no implementation from this section has started. Keep the PR
+open. The target is a supported fitting path that estimates q from training data
+without requiring the user to choose a favorable initial scale or optimizer budget.
+Retain a fixed-scale option. Keep full-sequence gradients throughout this work.
+
+### 1. Resolve optimization failures on the existing controlled problems
+
+- [ ] Extend the existing scalar study's reference search to include **q=0** and
+  checks of search-range/mesh stability. Evaluate zero and positive scales with the
+  same likelihood approximation and constants. A lower-bound solution is not
+  successful recovery of a positive scale; report endpoints and flat profiles.
+- [ ] Compare full-sequence Adam with bounded optimization using JAX gradients
+  (L-BFGS-B or an equivalent line-search method), plus log-scale profile search and
+  refinement. Use the same data, inference, parameters and initialization range;
+  record objective gaps, stationarity/boundary conditions and runtime. Softplus
+  cannot represent exactly zero; changing it to exp or adding iterations alone
+  does not solve the static boundary.
+- [ ] Use broad profile initialization and an explicit static candidate in the
+  automatic estimator. Compare every initialization with the direct reference;
+  select a deterministic documented procedure. Do not declare convergence from
+  small relative likelihood changes alone. Bound hits or unfinished optimization
+  must remain visible in fit diagnostics.
+- [ ] Reuse the package parameter specifications/transforms, loss and finalization
+  hooks, result contracts and compilation strategy. If the winning optimizer needs
+  another driver, add reusable fitting machinery rather than a notebook-only fit.
+  Do not change the general Adam default solely to make this particular study pass.
+
+**Gate:** On the existing twenty scalar datasets, all three-start runs of the
+selected estimator attain the expanded direct reference objective to **0.001 nat
+or better**, or explicitly identify a flat/non-unique solution with an equivalent
+objective. Include static/boundary cases. Reference-search agreement establishes
+optimization of this approximation, not the accuracy of the approximation itself.
+
+### 2. Separate spatial inference bias from optimization failure
+
+- [ ] Add small full-spatial problems with an independently constructed joint
+  posterior objective/Hessian and a dense or sparse SciPy MAP solve. Compare modes,
+  Hessian-based Laplace covariances, evidence and q profiles with the graph path.
+  Retain exact scalar integrals to measure errors in posterior moments and evidence.
+- [ ] Start with known nuisance parameters, realistic position sampling and a
+  fully model-matched generator: initial state and **all retained modes**, including
+  component baselines, obey the stated Gaussian prior and q*S transitions. Then
+  allow tau2, kappa2 and initial means to be fitted under the intended user settings.
+  Profile nuisance-parameter tradeoffs; constrain/regularize them explicitly if
+  the data cannot separate them. Preserve coefficient/log-rate/per-second units.
+- [ ] Ensure local Newton budgets converge in reference comparisons. If direct
+  optimization succeeds but spatial evidence/recovery remains biased, implement
+  **whole-trajectory Laplace inference**: damped Newton/IRLS at the smoothed path,
+  covariance/lag moments and normalized evidence at its joint mode, with gradients
+  checked independently. More per-observation iterations do not establish this.
+- [ ] Reuse the existing `TemporalRateGP` approach and the shared core design from
+  [the iterated-smoother plan](iterated-parallel-laplace-smoother/PLAN.md). Implement
+  only the common machinery needed for graph inference. Preserve direct row-zero
+  priors, full-grid masked transitions, per-neuron independence and x64. The q=0
+  branch must use the reduced static state, with evidence constants compatible
+  with positive q; do not invert a zero transition covariance.
+
+**Decision:** Whole-trajectory inference is conditional on the measured failure of
+the current approximation after optimization is fixed. If needed, its reference
+tests become prerequisites, and the optimizer gate must be rerun against the new
+objective. Parallel scans, decoder integration and a broad
+refactor of unrelated models are not prerequisites for this PR.
+
+### 3. Establish statistical recovery and useful predictions
+
+- [ ] Define a small pilot matrix spanning static/slow/fast drift, moderate/sparse
+  firing, short/long recordings, missing blocks and uneven occupancy. Include a
+  branching graph and multiple neurons. Recovery tests use matched stochastic
+  generators; analytic moving/remapping fields are for prediction under mismatch,
+  where there is no single "true q" to recover.
+- [ ] Freeze case definitions, scale/rank policies, optimizer settings and thresholds
+  after pilot diagnosis, **before** fresh final sessions. Use at least twenty
+  independent final sessions per declared statistical condition; report session
+  uncertainty rather than treating time bins as independent replicates.
+- [ ] Evaluate known-parameter fits first, then joint fits using the public default
+  automatic route. Compare estimated scales, initial-scale sensitivity, boundary
+  frequency, field recovery and uncertainty coverage. In well-observed matched
+  positive-q conditions, target median estimated/generating ratios between **0.5
+  and 2**, while reporting the entire error distribution and information limits.
+  Do not require every noisy realization to recover its generating parameter.
+- [ ] Repeat the independent blocked-holdout application benchmark, preserving the
+  existing count-poisoning leakage tests. Hyperparameter fitting uses training
+  observations only; validation is used only where a method explicitly requires
+  it; final test observations cannot select the learning procedure or its settings.
+  Keep the intended retrospective reconstruction task explicit.
+- [ ] Compare automatic fitting with static inference, validation-tuned fixed q
+  under the same spatial/nuisance-parameter policy, and the time-varying occupancy
+  map. Record predictive scores, full-field error, false drift, coverage and cost.
+  A predeclared non-inferiority margin is **0.02 bits/spike** against tuned fixed-q
+  fitting and, on stable controls, static inference: the lower paired-session 95%
+  interval must exceed -0.02 bits/spike. Require a positive predictive gain (lower
+  paired-session 95% interval above zero) over static inference
+  in the designated informative drifting conditions. Report the occupancy-map
+  comparison without assuming graph inference must win every condition.
+
+**Gate:** The selected automatic method passes the optimizer reference gate and
+the informative matched recovery/predictive gates, including joint fitting. Cases
+with insufficient information remain reported with explicit boundary/profile
+diagnostics. A change to a gate after viewing final results requires a new final
+sample and a documented change of scope; do not relabel failed acceptance as success.
+
+### 4. Ship the validated fitting route and close the PR
+
+- [ ] Expose the successful automatic estimator as the normal documented fitting
+  route; retain explicit fixed q and identify experimental EM/Adam variants when
+  they do not satisfy the same contract. Do not merely flip `update_drift_scale`
+  to True while leaving the failed optimizer behavior unchanged. Specify public
+  method/flag semantics and repeated-fit behavior once the winning procedure is
+  established, with a runnable constructor-default example.
+- [ ] Add compact regression tests for observed failure cases, leakage, boundary
+  handling, numerical/optimizer convergence, initialization robustness and actual
+  drift-only/joint learning. Store reproducible evaluation artifacts and update
+  model docs, this plan and the changelog around the supported guarantees.
+- [ ] Run graph/math/fitting-contract tests, checks for any touched shared inference
+  or fitting machinery, Ruff and mypy; run normal CI and obtain final review.
+
+**Merge when these gates pass.** Validation-based tuning can remain a useful
+alternative, but it is not a substitute for the learning feature without an explicit
+scope decision. Real recordings, external MRF/spline parity, minibatch/time-buffer
+methods and parallel performance remain separate follow-ups. Minibatching is a
+scaling project and does not resolve the measured estimation failures.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section. Values copied verbatim from the spec and repo `CLAUDE.md`.
@@ -475,7 +601,7 @@ Every task's requirements implicitly include this section. Values copied verbati
 - **Tests importing `neurospatial` must `pytest.importorskip("neurospatial")`** at module top (see `tests/test_graph_place_field.py:13`), so the fast suite still collects when the `spatial` extra is absent.
 - **`α` (smoothness exponent) is a fixed hyperparameter, default `1.0`.** It is never an EM scalar step. `κ²` is fit by SGD or an outer optimizer only, never inside the EM M-step (it reshapes `S` nonlinearly).
 - **Per-neuron `vmap`.** Use the graph model's local masked full-grid filter with independent per-neuron `q_c` values. Preserve its row-zero prior and missing-observation conventions (Amendment 2).
-- **`PlaceFieldModel` is not modified.** All new code lives in `graph_place_field.py` and its test file.
+- **Preserve unrelated model behavior.** Graph-specific code belongs in the graph module/tests. The remaining work may add reusable inference/fitting helpers and their tests to shared modules; preserve existing models' defaults and contracts. Broad `PlaceFieldModel`, decoder and parallel-inference changes remain outside this PR.
 - **Behavioral assertions only** (recovery, ordering, LL improvement), per repo testing guidance — not shape/type checks on deterministic constructors. Every test must be able to fail.
 - **Mark any test that runs EM, SGD, or a full filter/smoother pipeline `@pytest.mark.slow`.** The fast suite (`-m "not slow"`) must finish in under a minute.
 - **Run all tooling through `uv run`** so it uses the locked `.venv` (add `--no-sync` to skip re-resolution): e.g. `uv run --no-sync pytest ...`, `uv run --no-sync ruff format src/`.
