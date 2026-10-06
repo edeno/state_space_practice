@@ -1051,6 +1051,35 @@ def test_missing_positions_keep_timeline_and_validate_observation_count(
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+def test_masked_spike_counts_cannot_leak_into_fitted_fields(small_grid_env, method):
+    """Held-out spikes must not affect warm starts, fitting, or smoothing."""
+    times, trajectory = _toy_trajectory(small_grid_env, 100, seed=63)
+    spikes = np.random.default_rng(64).poisson(0.3, size=100).astype(float)
+    heldout = np.arange(100) % 5 == 0
+    trajectory[heldout] = 1e9
+    poisoned = spikes.copy()
+    poisoned[heldout] = 1000.0
+
+    def fit(counts):
+        model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+        if method == "fit":
+            model.fit(times, trajectory, counts, max_iter=3, verbose=False)
+        else:
+            model.fit_sgd(times, trajectory, counts, num_steps=3, verbose=False)
+        return model.predict_log_rate_trajectory(), float(model.log_likelihood_)
+
+    field, ll = fit(spikes)
+    poisoned_field, poisoned_ll = fit(poisoned)
+    np.testing.assert_allclose(poisoned_field, field, rtol=0, atol=1e-10)
+    assert poisoned_ll == pytest.approx(ll, abs=1e-10)
+    changed_observed = spikes.copy()
+    changed_observed[~heldout] += 1
+    changed_field, _ = fit(changed_observed)
+    assert not np.allclose(changed_field, field)  # guard: observations affect fit
+
+
+@pytest.mark.slow
 def test_cold_start_fit_resets_init_mean_when_neuron_count_changes(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 10, seed=31)
     model = GraphPlaceFieldModel(

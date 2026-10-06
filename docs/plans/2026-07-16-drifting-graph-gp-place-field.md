@@ -30,6 +30,8 @@
 
 8. **Evidence search, diagnostics, and compilation (2026-10-05 review fixes).** Evidence can have multiple local maxima. `select_tau2_by_evidence` now samples 65 logarithmically spaced amplitudes, refines each candidate peak/boundary basin, and compares all evaluated values including the exact interval endpoints. This supersedes Task 2's single bounded-search sketch; the finite grid is a practical search, not a guarantee for arbitrarily narrow peaks. The static Newton solve and masked filter use stable module-level JIT functions with changing parameters passed as inputs. Repeated E-steps reuse compilation, including after parameter changes. The filter reports exhausted line searches through the existing host-side logging policy from eager, jit, and gradient paths. Failure fractions use observed rows; masked rows and fully unobserved grids do not cause spurious warnings. Regression coverage includes multimodal evidence, boundary optima, one-/two-neuron EM/scoring/SGD diagnostics, masking, and compilation reuse.
 
+9. **Independent evidence audit (2026-10-06).** The independent blocked-holdout experiment below demonstrates retrospective tracking beyond eigenbasis-generated truth. It also exposes limits: a simple time-varying occupancy map outperforms the tested graph configurations on smooth/sparse drift, static controls favor a static estimator, and nominal uncertainty intervals under-cover changing truth. Implementation completion is not evidence of superiority or calibrated biological drift inference. Fitted branching-track comparisons, real recordings, and causal forecasting remain open.
+
 
 ---
 
@@ -55,6 +57,137 @@ The field-recovery acceptance thresholds were preserved. External estimator
 comparisons and Stage 3 remain deferred as described above and below.
 
 ---
+
+## Evidence audit and independent validation (2026-10-06)
+
+Implementation completion establishes the retained contracts; it does not establish
+general usefulness on real recordings. The original evidence has distinct scopes:
+
+| Evidence | What it establishes | Limit of the claim |
+| --- | --- | --- |
+| Newton MAP versus independent SciPy optimizer | Correct optimization of the static penalized objective | Both solve the same assumed objective; this is numerical verification, not a generalization benchmark |
+| Static eigenbasis-field recovery | Recovery under dense observations | Truth uses the fitted basis, with uniform 300-second exposure per bin; correlation alone does not validate absolute rates or uncertainty |
+| Independent W-maze simulator, six cells | Static recovery beyond eigenbasis-generated truth | One seed, visited bins only, median correlation threshold of 0.6; this is modest static evidence |
+| Three-seed full-field drift tracking | Temporal spatial structure is recovered after removing baselines, even with a misspecified drift scale | Eight-mode truth uses the model's spectral random walk, random spatial sampling and a 30-Hz baseline; the test fixes several parameters and is not a test of the complete default fitting pipeline |
+| Cross-arm delta reconstruction | The truncated graph basis respects topology on the selected bin pair | No spike fitting and no actual spline/MRF comparison; it does not demonstrate a predictive advantage on branching tracks |
+| Held-out aligned counts beat shifted counts | `score` consumes the supplied observations | No model comparison or hyperparameter-selection evaluation; training likelihood improvement also does not establish generalization |
+
+The next evidence should remove the shared generative parameterization, hide actual
+observations, compare stronger alternatives, include a no-drift control, and measure
+absolute error and uncertainty. The reproducible experiment in
+[`notebooks/graph_place_field_validation.py`](../../notebooks/graph_place_field_validation.py)
+implements this for a **linear track**:
+
+- Analytic Gaussian firing fields (12-cm width), never generated from eigenvectors
+  or spectral increments. Animal movement is continuous reflected laps with variable
+  speed and repeated pauses. Conditions are stable, smoothly moving, abrupt remapping,
+  and sparse firing (3-Hz peak increment, rather than 12 Hz).
+- Each session lasts 400 seconds at 100-ms resolution. Whole one-second blocks are
+  assigned 60/20/20 to training, validation and test. Withheld observations are masked
+  and counts are zeroed during fitting; their time rows still propagate dynamics.
+  The first 40 seconds are excluded from evaluation. Regression tests poison masked
+  counts and confirm both EM and SGD fields remain unchanged while changing observed
+  counts changes the fit.
+- Graph rank/drift, the static graph penalty, and the widths of a simple time-varying
+  occupancy-map baseline are selected with **validation counts only**. The graph grid
+  has ranks 8/16 and drift scales 1e-10/1e-3/1e-2/1e-1, with fixed amplitude 100 and
+  kappa2 1. Static amplitudes are 1/100. Occupancy-map time widths are 10/30 seconds
+  and spatial widths 5/10 cm. A separate model uses constructor defaults, full rank,
+  and the normal 100-iteration EM limit, with convergence recorded, so tuned
+  performance is not confused with default behavior.
+- Final test counts are used after all selections. Pointwise predictive log scores
+  integrate the graph/static Gaussian log-rate uncertainty using 256-node quadrature;
+  the occupancy map uses a plug-in Poisson density. These are **retrospective missing-
+  observation predictions**, with neighboring training data on both sides, not causal
+  forecasts or a joint held-out marginal likelihood. Full-field log-rate RMSE and
+  pointwise 95% log-rate coverage are measured against analytic truth. Continuous-
+  position and bin-center coverage are recorded separately to expose discretization.
+- Pilot seed 0 was used for a smoke run. The final experiment uses ten fresh seeds
+  (10–19) per condition, with fixed grids and no threshold adjustments after viewing
+  their test results. An initial ten-iteration default-setting run hit its budget;
+  a representative-seed diagnostic prompted extending that run to the API's normal
+  100-iteration limit for all sessions, without changing candidate grids. This is
+  an exploratory audit, not a preregistered confirmatory study. Paired bootstrap
+  intervals resample sessions, not correlated time bins, and are descriptive
+  summaries of this synthetic experiment.
+
+Run from the repository root after installing the pinned spatial/test extras:
+
+```bash
+MPLCONFIGDIR=/private/tmp/ssp-matplotlib LOKY_MAX_CPU_COUNT=4 \
+  uv run --no-sync python notebooks/graph_place_field_validation.py \
+  --output-dir docs/validation/graph-place-field
+```
+
+This experiment still leaves the fitted cross-arm graph-versus-spline/MRF comparison,
+longer gaps, broader movement/field families, causal forecasting and real-data
+validation open. The existing real-data notebook uses splines, and its local `data/`
+directory is absent from this checkout; it supplies no evidence for this graph model.
+
+### Results and interpretation
+
+The forty-session run completed with the pinned spatial dependency. Full session
+records and validation grids are in
+[`results.json`](../validation/graph-place-field/results.json). The command also
+generates representative seed-10 field reconstructions at
+`docs/validation/graph-place-field/fields.png`; PNG outputs are ignored by Git.
+Gains below are mean test predictive bits per spike; positive values favor the graph
+model. Each condition has ten independent sessions.
+
+| Condition | Tuned graph vs static | Tuned graph vs windowed map | Default graph vs static | Tuned graph nominal 95% coverage |
+| --- | ---: | ---: | ---: | ---: |
+| Stable | -0.024 | -0.008 | -0.040 | 94.2% |
+| Smooth drift | +0.370 | -0.095 | +0.154 | 72.1% |
+| Abrupt remap | +0.501 | -0.010 | +0.440 | 89.9% |
+| Sparse drift | +0.157 | -0.176 | -0.066 | 71.4% |
+
+- The graph model recovers changing fields outside its exact generative assumptions,
+  with predictive improvements over a single static map in the changing-field cases.
+  Tuned graph models beat static on 9/10 smooth, 10/10 remapping and 9/10 sparse
+  sessions. This establishes useful retrospective tracking for these scenarios.
+- A stronger comparison changes the conclusion: the simple windowed occupancy map
+  scores better than the tuned graph model in 9/10 smooth and 9/10 sparse sessions.
+  Paired descriptive bootstrap intervals for the graph-minus-windowed gain are
+  [-0.208, -0.027] and [-0.257, -0.092] bits/spike, respectively. Remapping has no
+  clear advantage either way ([-0.027, +0.003], five wins each). Full-field RMSE
+  corroborates this: graph/windowed errors are 0.661/0.519 nats for smooth drift,
+  0.833/0.646 for sparse drift and 0.527/0.521 for remapping. This experiment does
+  **not establish superiority over a simple time-varying estimator**.
+- Defaults are weak in the sparse case: mean gain over static is -0.066 bits/spike,
+  and static wins 9/10 sessions. Selected settings consistently favor rank 8 and
+  q=1e-2 for moving fields; defaults use all 41 modes and q=1e-3. This points toward
+  validation-based regularization/timescale selection rather than relying on the
+  approximate training likelihood to learn q. All forty default-setting runs
+  converged within the normal 100-iteration budget (mean accepted E-step counts
+  12.2–19.5 across conditions). The initial budget check is retained separately in
+  [`default_convergence_checks.json`](../validation/graph-place-field/default_convergence_checks.json);
+  convergence did not resolve the baseline or coverage gaps. The tuned/default
+  comparison also differs in amplitude and initialization updates, so it does not
+  isolate which setting causes the performance difference.
+- The no-drift control favors static: it beats tuned graph in 9/10 sessions and
+  defaults in all ten. Tuned estimates have mean temporal spatial fluctuation RMS
+  of 0.235 log-rate nats despite constant truth. A varying posterior mean alone is
+  insufficient evidence for biological drift; model selection against a static
+  null and explicit false-positive checks are needed.
+- Nominal 95% log-rate intervals substantially under-cover changing truth. Defaults
+  are worse (48.1% smooth, 74.4% remapping, 58.2% sparse). Bin-center coverage is
+  nearly identical, so nearest-bin discretization does not explain the gap. These
+  conditional Laplace intervals are not validated for scientific uncertainty claims
+  under model misspecification or parameter selection.
+
+Priority follow-ups are (1) validation-based selection including a static null and
+spatial regularization, (2) calibrated uncertainty and static-control drift detection,
+(3) fitted comparisons on branching tracks where graph topology should matter, and
+(4) blocked real-recording validation and separate causal forecasting experiments.
+Keep this independent benchmark fixed when changing inference. Any further tuning
+should use validation data and a fresh final evaluation, rather than adapting the
+acceptance thresholds to these forty sessions.
+
+Verification: graph/fitting-contract tests now **99 passed**, including the new
+EM/SGD leakage checks. The predictive scorer matches independent adaptive integration
+across 48 count/rate/variance combinations (maximum absolute log-score error 1.3e-8),
+and its zero-variance limit matches the Poisson density. These checks validate the
+evaluation machinery; they do not remove the empirical limitations above.
 
 ## Global Constraints
 

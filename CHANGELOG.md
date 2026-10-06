@@ -7,6 +7,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Independent graph-field validation** with analytic moving fields, continuous
+  trajectories, blocked held-out observations, static and time-varying occupancy-map
+  baselines, validation-based parameter selection, and uncertainty coverage reports.
+  EM/SGD regression tests guard against masked evaluation spikes leaking into fits.
 - **Drifting graph-GP place fields** in `graph_place_field`: distance and
   inverse-distance Laplacian bases, a static penalized Poisson estimator with
   Laplace-evidence amplitude selection, and `GraphPlaceFieldModel` for masked
