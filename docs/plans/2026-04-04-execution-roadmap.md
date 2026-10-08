@@ -44,6 +44,7 @@ Both tracks share the same dependency constraints. The scientific track has a "m
 | Hamiltonian Oscillator SSM | **DONE** (hamiltonian_spikes/lfp/joint/switching.py, 34 tests, nonlinear>linear baseline verified) |
 | Hamiltonian Review Fixes | **DONE** (all 7 phases: runtime crashes, state layout, PRNG split, Phase 4 weighted-Jacobian smoother, smoke tests, API cleanup) |
 | Review Remediation | **PARTIAL/DONE IN CODE** (fast suite green; remaining items are deferred hygiene, not blockers) |
+| [Drifting Graph-GP Place Fields](2026-07-16-drifting-graph-gp-place-field.md) | **DONE, STAGES 0–2** (`GraphPlaceFieldModel`, static estimator, masked inference, EM/SGD, field trajectories and scoring; drift-scale learning experimental; richer dynamics and external comparisons deferred) |
 | Spike-field coupling cross-check | **DONE** (`coupling_*` modules; LFP-conditioned two-stage path validated) |
 | Cross-region oscillator coupling | **BLOCKED AS SPECIFIED** (spike-only latent + loading inference is degenerate; requires LFP-conditioned rewrite) |
 | Switching spike oscillator plan | **CODED, SCIENCE CAVEAT** (numerically tested, but spike-only joint latent/loading interpretation is not identifiable) |

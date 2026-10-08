@@ -32,11 +32,16 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from jax import Array
+from jax.flatten_util import ravel_pytree
 from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import clear_attributes
 from state_space_practice.exceptions import NonFiniteLikelihoodError
 from state_space_practice.fitted_state import FittedAttribute
+from state_space_practice.likelihood_optimization import (
+    LikelihoodOptimum,
+    minimize_likelihood,
+)
 from state_space_practice.parameter_transforms import (
     ParameterTransform,
     transform_to_constrained,
@@ -198,6 +203,7 @@ class _CompiledSGDStep:
 
     def __init__(self, keepalive: list[object]) -> None:
         self.train_step: Callable[..., Any] = _unbuilt_step
+        self.value_and_grad_step: Callable[..., Any] = _unbuilt_step
         self.state_fingerprints: dict[str, Hashable] = {}
         self.cacheable = True
         self.keepalive = keepalive
@@ -344,12 +350,9 @@ def _build_sgd_step(
         p = transform_to_constrained(unc_p, param_spec, static_params=frozen)
         return model._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
-    def _sgd_train_step(
-        unc_p: SGDParams,
-        opt_st: optax.OptState,
-        frozen_leaves: list[Any],
-        data_leaves: list[Any],
-    ) -> tuple[Array, SGDParams, optax.OptState, Array]:
+    def _value_and_grad_step(
+        unc_p: SGDParams, frozen_leaves: list[Any], data_leaves: list[Any]
+    ) -> tuple[Array, SGDParams]:
         if baked_leaves is not None:
             frozen_leaves, data_leaves = baked_leaves
         # Runs only while tracing: record which model attributes the loss
@@ -361,6 +364,15 @@ def _build_sgd_step(
                 unc_p, frozen_leaves, data_leaves
             )
         entry.record_trace(model, reads, recorded)
+        return loss, grads
+
+    def _sgd_train_step(
+        unc_p: SGDParams,
+        opt_st: optax.OptState,
+        frozen_leaves: list[Any],
+        data_leaves: list[Any],
+    ) -> tuple[Array, SGDParams, optax.OptState, Array]:
+        loss, grads = _value_and_grad_step(unc_p, frozen_leaves, data_leaves)
         updates, new_opt_st = optimizer.update(grads, opt_st, unc_p)
         new_unc_p = optax.apply_updates(unc_p, updates)
         step_finite = (
@@ -371,6 +383,7 @@ def _build_sgd_step(
         return loss, new_unc_p, new_opt_st, step_finite
 
     entry.train_step = typed_jit(_sgd_train_step)
+    entry.value_and_grad_step = typed_jit(_value_and_grad_step)
     return entry
 
 
@@ -434,6 +447,7 @@ class SGDFittableMixin:
     #: synchronising E-step can make it ``max_iter + 1``); ``None`` before
     #: fitting and after ``fit_sgd``.
     n_iter_: int | None = None
+    optimizer_result_: FittedAttribute[LikelihoodOptimum] = FittedAttribute()
 
     def _build_param_spec(
         self,
@@ -585,6 +599,7 @@ class SGDFittableMixin:
             value, ``log_likelihood_`` is unset.
         """
         self.log_likelihood_history_ = log_likelihoods
+        del self.optimizer_result_
         self.converged_ = converged
         self.n_iter_ = n_iter
         if log_likelihood is None and log_likelihoods:
@@ -607,6 +622,7 @@ class SGDFittableMixin:
                 "converged_",
                 "log_likelihood_",
                 "log_likelihood_history_",
+                "optimizer_result_",
                 *self._fit_output_attrs,
             ),
         )
@@ -698,6 +714,107 @@ class SGDFittableMixin:
     # Declared as ``(*args, **kwargs)`` so subclasses can replace the data
     # arguments with their own signature without an [override] violation.
     # The optimizer settings are keyword-only, exactly as before.
+    def _fit_lbfgs_prepared(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        max_iter: int,
+        gradient_tolerance: float,
+        bounds: list[tuple[float | None, float | None]] | None = None,
+    ) -> LikelihoodOptimum:
+        """Optimize already prepared data using the shared transforms and cache."""
+        params, param_spec = self._build_param_spec()
+        frozen = {k: params[k] for k, spec in param_spec.items() if not spec.trainable}
+        unc = transform_to_unconstrained(
+            params, param_spec, include_non_trainable=False
+        )
+        if not unc or not _tree_all_finite(unc):
+            raise ValueError("L-BFGS needs finite learnable parameters.")
+        initial, unravel = ravel_pytree(unc)
+        n_time = float(cast(_TimeSeriesModel, self)._n_timesteps)
+        if not math.isfinite(n_time) or n_time <= 0:
+            raise ValueError("_n_timesteps must be positive and finite.")
+        data_leaves, data_structure = _split_leaves((args, kwargs))
+        frozen_leaves, frozen_structure = _split_leaves(frozen)
+        entry, step_cache, cache_key = self._compiled_sgd_step(
+            _DEFAULT_OPTIMIZER, param_spec, n_time, data_structure, frozen_structure
+        )
+
+        def value_and_gradient(x: np.ndarray) -> tuple[float, np.ndarray]:
+            loss, gradient = entry.value_and_grad_step(
+                unravel(jnp.asarray(x)), frozen_leaves, data_leaves
+            )
+            flat_gradient, _ = ravel_pytree(gradient)
+            return float(loss), np.asarray(flat_gradient)
+
+        try:
+            loss0, gradient0 = value_and_gradient(np.asarray(initial))
+        except _DATA_TRACING_ERRORS:
+            if step_cache is not None:
+                step_cache.pop(cache_key, None)
+            step_cache = None
+            entry = _build_sgd_step(
+                lambda: self,
+                _DEFAULT_OPTIMIZER,
+                param_spec,
+                n_time,
+                data_structure,
+                frozen_structure,
+                baked_leaves=(frozen_leaves, data_leaves),
+            )
+            loss0, gradient0 = value_and_gradient(np.asarray(initial))
+        if not np.isfinite(loss0) or not np.isfinite(gradient0).all():
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError(
+                "L-BFGS initial objective/gradient is non-finite."
+            )
+        result = minimize_likelihood(
+            value_and_gradient,
+            np.asarray(initial),
+            bounds=bounds,
+            max_iter=max_iter,
+            gradient_tolerance=gradient_tolerance,
+        )
+        if step_cache is not None and not entry.cacheable:
+            step_cache.pop(cache_key, None)
+        if not np.isfinite(result.loss):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError("L-BFGS final objective is non-finite.")
+        final = transform_to_constrained(
+            unravel(jnp.asarray(result.parameters)), param_spec, static_params=frozen
+        )
+        self._store_sgd_params(final)
+        final_ll = float(self._finalize_sgd(*args, **kwargs))
+        if not math.isfinite(final_ll):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError("L-BFGS final inference is non-finite.")
+        history = [-loss * n_time for loss in result.loss_history]
+        self._record_fit_result(
+            history, result.converged, n_iter=None, log_likelihood=final_ll
+        )
+        self.optimizer_result_ = result
+        return result
+
+    def fit_lbfgs(self, *args: Any, **kwargs: Any) -> list[float]:
+        """Fit the same full-sequence objective as SGD using L-BFGS-B.
+
+        ``max_iter`` defaults to 500 and ``gradient_tolerance`` to 1e-7 in
+        per-time-row transformed coordinates. Other arguments go through the
+        same data, parameter and final-inference hooks as ``fit_sgd``. Stores
+        projected-gradient/budget diagnostics in ``optimizer_result_``; a small
+        relative objective change alone is not reported as convergence.
+        """
+        max_iter = validate_int(kwargs.pop("max_iter", 500), "max_iter", positive=True)
+        tolerance = validate_scalar(
+            kwargs.pop("gradient_tolerance", 1e-7), "gradient_tolerance", positive=True
+        )
+        args, kwargs = self._prepare_sgd_data(*args, **kwargs)
+        self._fit_lbfgs_prepared(
+            args, kwargs, max_iter=max_iter, gradient_tolerance=tolerance
+        )
+        return self.log_likelihood_history_
+
     def fit_sgd(self, *args: Any, **kwargs: Any) -> list[float]:
         """Fit by gradient descent on the model's SGD loss.
 

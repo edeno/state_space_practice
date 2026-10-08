@@ -2,6 +2,19 @@
 
 [← back to PLAN.md](PLAN.md)
 
+**Graph prerequisite update (2026-10-08):** The drift-scale execution added
+`laplace_smoothing.py`, a reusable single-observation Poisson/log-linear joint
+Laplace core with information sites, Armijo damping, final Hessian/lag moments,
+normalized evidence, implicit derivatives and a reduced q=0 branch. It reuses
+shared RTS and agrees with `TemporalRateGP` and an independent dense oracle.
+This implements the machinery needed by the graph branch, not all phases here:
+the planned general GLM interfaces, integration into unrelated point-process
+models/decoder, parallel scans and TemporalRateGP consolidation remain open.
+The graph task requires adaptive convergence and masks, and therefore uses
+adaptive stopped primal iteration with an exact implicit derivative. Reconcile
+these interfaces and current master before implementing this plan's remaining
+phases; its older fixed-pass/derivative assumptions are not completed contracts.
+
 ## Current codebase integration points
 
 Paths are relative to `src/state_space_practice/`. Line numbers were verified against

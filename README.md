@@ -77,7 +77,7 @@ uvx pre-commit install            # ruff, ruff-format and nbstripout on commit
 
 Tests that run EM, SGD or full fits are marked `slow`, either explicitly or
 automatically by `tests/conftest.py` (any test whose body, or a fixture it
-uses, calls `.fit(`, `.fit_sgd(` or `run_em(` outside `pytest.raises`). CI runs lint, mypy and the
+uses, calls a fitting method or `run_em(` outside `pytest.raises`). CI runs lint, mypy and the
 fast suite on Python 3.10-3.12 for every push and pull request, and the full
 suite nightly. Set `HYPOTHESIS_PROFILE=ci` for the thorough Hypothesis profile.
 
@@ -95,6 +95,13 @@ missing modules in:
   multi-map place fields, a successor-representation basis, a volatile Kalman
   choice model, theta-sweep amplitude tracking, streaming filters)
 - [Spatial bandit latent roadmap](docs/plans/2026-04-05-bandit-latent-roadmap.md)
+- [Drifting graph-GP place fields](docs/plans/2026-07-16-drifting-graph-gp-place-field.md)
+  — Stages 0–2 implemented: geometry-aware static and drifting place-field
+  inference and posterior field trajectories. Automatic drift-scale fitting
+  now uses joint Laplace evidence and profile-initialized L-BFGS; fixed scales
+  and experimental EM/Adam remain available. See the [usage guide](docs/graph-place-fields.md)
+  for units and diagnostics. Richer dynamics and external estimator comparisons
+  remain deferred.
 
 Spike-only latent oscillator coupling plans are treated as exploratory or
 blocked as scientific estimators unless an observed field signal anchors the

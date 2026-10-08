@@ -521,6 +521,33 @@ def _place_field_case() -> FitCase:
     )
 
 
+def _graph_place_field_case() -> FitCase:
+    neurospatial = pytest.importorskip("neurospatial")
+    from state_space_practice.graph_place_field import GraphPlaceFieldModel
+
+    rng = np.random.default_rng(42)
+    env = neurospatial.Environment.from_samples(
+        rng.uniform(0, 20, (400, 2)), bin_size=5.0
+    )
+    times = np.arange(40, dtype=float) * 0.02
+    trajectory = env.bin_centers[rng.integers(env.n_bins, size=40)]
+    spikes = rng.poisson(0.2, size=40).astype(float)
+    return FitCase(
+        GraphPlaceFieldModel(
+            env,
+            dt=0.02,
+            rank=4,
+            inference_method="sequential",
+            update_drift_scale=False,
+        ),
+        (times, trajectory, spikes),
+        lambda model, data, _: model.score(*data),
+        sgd_kwargs={"optimizer": optax.adam(1e-3)},
+        em_kwargs={"verbose": False, "method": "em"},
+        repeat_kwargs={"warm_start": False},
+    )
+
+
 def _smith_case() -> FitCase:
     outcomes, _ = simulate_learning_data(
         n_trials=100, prob_success_init=0.3, prob_success_final=0.9, seed=42
@@ -684,6 +711,7 @@ _EM_AND_SGD_CASES: dict[str, Callable[[], FitCase]] = {
     "SwitchingSpikeOscillatorModel": _switching_spike_oscillator_case,
     "PointProcessModel": _point_process_kalman_case,
     "PlaceFieldModel": _place_field_case,
+    "GraphPlaceFieldModel": _graph_place_field_case,
     "SmithLearningModel": _smith_case,
     "MultinomialChoiceModel": _multinomial_case,
     "CovariateChoiceModel": _covariate_case,

@@ -136,6 +136,22 @@ class _PenalizedToyModel(_ToyModel):
         return super()._sgd_loss_fn(params, target) + 50.0 * params["scale"] ** 2
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("model_class", [_ToyModel, _PenalizedToyModel])
+def test_lbfgs_uses_shared_transforms_and_result_contract(model_class):
+    model = model_class(scale=0.1)
+    history = model.fit_lbfgs(jnp.array(3.0))
+    expected = 3.0 if model_class is _ToyModel else 2.0
+    assert model.scale == pytest.approx(expected, abs=1e-6)
+    assert history[-1] > history[0]
+    assert model.converged_
+    assert model.optimizer_result_.gradient_norm < 1e-7
+    assert model.log_likelihood_ == pytest.approx(-100 * (expected - 3) ** 2, abs=1e-8)
+    model.fit_sgd(jnp.array(3.0), num_steps=1)
+    with pytest.raises(RuntimeError):
+        _ = model.optimizer_result_
+
+
 class _UnconstrainedToyModel(_ToyModel):
     @property
     def _n_timesteps(self):
@@ -870,3 +886,19 @@ class TestCompiledStepCache:
         # a second call with new data is honoured (the fallback is uncached)
         model.fit_sgd(jnp.array([-1.0]), optimizer=optax.sgd(2.5), num_steps=40)
         np.testing.assert_allclose(model.scale, -1.0, atol=1e-6)
+
+
+@pytest.mark.slow
+def test_lbfgs_honors_changed_fixed_attributes_and_concrete_data():
+    class HostValidating(_CountingToyModel):
+        def _sgd_loss_fn(self, params, target):
+            assert np.asarray(target).min() > -100
+            return super()._sgd_loss_fn(params, target)
+
+    model = HostValidating(scale=0.0)
+    model.fit_lbfgs(jnp.array([2.0]))
+    assert model.scale == pytest.approx(2.0, abs=1e-6)
+    model.offset = 1.0
+    model.fit_lbfgs(jnp.array([3.0]))
+    assert model.scale == pytest.approx(4.0, abs=1e-6)
+    assert model.converged_
