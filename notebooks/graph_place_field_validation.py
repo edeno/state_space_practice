@@ -244,13 +244,21 @@ def infer_graph(
     )
     if max_newton_iter is not None:
         settings["max_newton_iter"] = max_newton_iter
-    model = GraphPlaceFieldModel(env, dt=DT, rank=rank, init_drift_scale=q, **settings)
+    model = GraphPlaceFieldModel(
+        env,
+        dt=DT,
+        rank=rank,
+        init_drift_scale=q,
+        inference_method="sequential",
+        update_drift_scale=False,
+        **settings,
+    )
     masked_trajectory = session.trajectory.copy()
     masked_trajectory[~session.train] = 1e6
     # Zero held-out counts as well as masking positions: even an accidental helper
     # that ignores the position mask cannot consume the evaluation spikes.
     fitting_spikes = np.where(session.train, session.spikes, 0.0)
-    model.fit(
+    model.fit_em(
         session.times,
         masked_trajectory,
         fitting_spikes,

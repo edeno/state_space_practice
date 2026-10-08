@@ -676,8 +676,18 @@ def test_static_field_recovers_wmaze_place_cells(w_maze_env):
 from state_space_practice.graph_place_field import GraphPlaceFieldModel  # noqa: E402
 
 
+def _legacy_graph_model(*args, **kwargs):
+    """Keep the original sequential/EM regression targets explicit.
+
+    Automatic constructor defaults are tested in test_graph_place_field_learning.
+    """
+    kwargs.setdefault("inference_method", "sequential")
+    kwargs.setdefault("update_drift_scale", False)
+    return GraphPlaceFieldModel(*args, **kwargs)
+
+
 def test_model_builds_diagonal_psd_prior_and_drift(small_grid_env):
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env, dt=0.02, rank=10, kappa2=0.5, alpha=1.0, tau2=2.0
     )
     assert model.rank == 10
@@ -696,13 +706,13 @@ def test_model_builds_diagonal_psd_prior_and_drift(small_grid_env):
 
 def test_model_rejects_bad_hyperparameters(small_grid_env):
     with pytest.raises(ValueError, match="dt"):
-        GraphPlaceFieldModel(small_grid_env, dt=0.0)
+        _legacy_graph_model(small_grid_env, dt=0.0)
     with pytest.raises(ValueError, match="kappa2"):
-        GraphPlaceFieldModel(small_grid_env, dt=0.02, kappa2=0.0)
+        _legacy_graph_model(small_grid_env, dt=0.02, kappa2=0.0)
     with pytest.raises(ValueError, match="tau2"):
-        GraphPlaceFieldModel(small_grid_env, dt=0.02, tau2=-1.0)
+        _legacy_graph_model(small_grid_env, dt=0.02, tau2=-1.0)
     with pytest.raises(ValueError, match="alpha"):
-        GraphPlaceFieldModel(small_grid_env, dt=0.02, alpha=0.0)
+        _legacy_graph_model(small_grid_env, dt=0.02, alpha=0.0)
 
 
 # -------------------------------------------------------- E-step (masked filter)
@@ -717,7 +727,7 @@ def _toy_trajectory(env, n_time, seed=0):
 
 @pytest.mark.slow
 def test_estep_returns_finite_total_ll_and_stores_posteriors(small_grid_env):
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=8)
     n_time = 150
     times, traj = _toy_trajectory(small_grid_env, n_time, seed=1)
     rng = np.random.default_rng(2)
@@ -733,7 +743,7 @@ def test_estep_returns_finite_total_ll_and_stores_posteriors(small_grid_env):
 
 @pytest.mark.slow
 def test_estep_neurons_are_independent(small_grid_env):
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=8)
     n_time = 120
     times, traj = _toy_trajectory(small_grid_env, n_time, seed=3)
     rng = np.random.default_rng(4)
@@ -780,7 +790,7 @@ def test_graph_filter_uses_p0_at_row_zero_and_propagates_masked_rows():
 
 @pytest.fixture
 def graph_line_search_problem(isolated_bins_env):
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         isolated_bins_env,
         dt=0.02,
         rank=2,
@@ -798,9 +808,9 @@ def graph_line_search_problem(isolated_bins_env):
 @pytest.mark.slow
 @pytest.mark.parametrize("dt", [np.array(0.02), jnp.array(0.02)])
 def test_compiled_graph_fit_accepts_scalar_array_dt(small_grid_env, dt):
-    model = GraphPlaceFieldModel(small_grid_env, dt=dt, rank=3)
+    model = _legacy_graph_model(small_grid_env, dt=dt, rank=3)
     times, trajectory = _toy_trajectory(small_grid_env, 20, seed=7)
-    likelihoods = model.fit(
+    likelihoods = model.fit_em(
         times, trajectory, np.zeros(20), max_iter=1, warm_start=False, verbose=False
     )
     assert np.all(np.isfinite(likelihoods))
@@ -816,14 +826,14 @@ def test_graph_fitters_report_exhausted_line_searches(
     model, times, trajectory, spikes = graph_line_search_problem
     spikes = np.broadcast_to(spikes[:, None], (spikes.size, n_neurons)).copy()
     if method == "score":
-        model.fit(
+        model.fit_em(
             times, trajectory, spikes, max_iter=3, warm_start=False, verbose=False
         )
         jax.effects_barrier()
         caplog.clear()
     with caplog.at_level("WARNING", logger="state_space_practice.point_process_kalman"):
         if method == "fit":
-            model.fit(
+            model.fit_em(
                 times, trajectory, spikes, max_iter=3, warm_start=False, verbose=False
             )
         elif method == "score":
@@ -877,7 +887,7 @@ def test_graph_line_search_diagnostics_exclude_masked_rows(observed, caplog):
 
 @pytest.mark.slow
 def test_repeated_estep_reuses_compilation_with_new_parameters(small_grid_env):
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=5)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=5)
     times, trajectory = _toy_trajectory(small_grid_env, 37, seed=5)
     spikes = np.random.default_rng(6).poisson(0.2, size=37).astype(float)
     model.init_mean = jnp.zeros((1, model.rank))
@@ -911,7 +921,7 @@ def test_repeated_estep_reuses_compilation_with_new_parameters(small_grid_env):
 
 
 def test_tau_mstep_includes_fixed_prior_mean_residual(small_grid_env):
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=1,
@@ -971,8 +981,8 @@ def test_fit_em_is_monotone_under_rollback(small_grid_env):
         kappa2=1e-2,
         seed=0,
     )
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8, kappa2=1e-2)
-    lls = model.fit(times, traj, spikes, max_iter=30, verbose=False)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=8, kappa2=1e-2)
+    lls = model.fit_em(times, traj, spikes, max_iter=30, verbose=False)
     diffs = np.diff(lls)
     # GEM rollback guarantees the accepted LL sequence never decreases.
     assert np.all(diffs >= -1e-6)
@@ -983,9 +993,9 @@ def test_fit_em_is_monotone_under_rollback(small_grid_env):
 def test_terminal_mstep_returns_matching_ll_and_posteriors(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 60, seed=11)
     spikes = np.random.default_rng(12).poisson(0.05, size=60).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
 
-    lls = model.fit(times, traj, spikes, max_iter=1, verbose=False)
+    lls = model.fit_em(times, traj, spikes, max_iter=1, verbose=False)
     stored_mean = np.asarray(model.smoother_mean).copy()
     Z, spk, valid = model._design_and_spikes(times, traj, spikes)
     fresh_ll = model._e_step(Z, spk, valid)
@@ -1004,14 +1014,14 @@ def test_missing_positions_keep_timeline_and_validate_observation_count(
     one_valid_trajectory = np.stack((center, outside, outside))
     spikes = np.zeros(3)
 
-    frozen = GraphPlaceFieldModel(
+    frozen = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=3,
         update_amplitude=False,
         update_init_mean=False,
     )
-    frozen.fit(
+    frozen.fit_em(
         times,
         one_valid_trajectory,
         spikes,
@@ -1022,17 +1032,17 @@ def test_missing_positions_keep_timeline_and_validate_observation_count(
     assert frozen.smoother_mean.shape[1] == 3
     assert np.all(np.isfinite(np.asarray(frozen.drift_scale)))
 
-    updating = GraphPlaceFieldModel(
+    updating = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=3,
         update_drift_scale=True,
     )
-    updating.fit(times, one_valid_trajectory, spikes, max_iter=1, verbose=False)
+    updating.fit_em(times, one_valid_trajectory, spikes, max_iter=1, verbose=False)
     assert np.all(np.isfinite(np.asarray(updating.drift_scale)))
 
     with pytest.raises(ValueError, match="at least two time rows"):
-        updating.fit(
+        updating.fit_em(
             times[:1],
             one_valid_trajectory[:1],
             spikes[:1],
@@ -1041,7 +1051,7 @@ def test_missing_positions_keep_timeline_and_validate_observation_count(
         )
 
     with pytest.raises(ValueError, match="no in-bounds"):
-        frozen.fit(
+        frozen.fit_em(
             times,
             np.stack((outside, outside, outside)),
             spikes,
@@ -1062,9 +1072,9 @@ def test_masked_spike_counts_cannot_leak_into_fitted_fields(small_grid_env, meth
     poisoned[heldout] = 1000.0
 
     def fit(counts):
-        model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+        model = _legacy_graph_model(small_grid_env, dt=0.02, rank=6)
         if method == "fit":
-            model.fit(times, trajectory, counts, max_iter=3, verbose=False)
+            model.fit_em(times, trajectory, counts, max_iter=3, verbose=False)
         else:
             model.fit_sgd(times, trajectory, counts, num_steps=3, verbose=False)
         return model.predict_log_rate_trajectory(), float(model.log_likelihood_)
@@ -1082,14 +1092,14 @@ def test_masked_spike_counts_cannot_leak_into_fitted_fields(small_grid_env, meth
 @pytest.mark.slow
 def test_cold_start_fit_resets_init_mean_when_neuron_count_changes(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 10, seed=31)
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=3,
         update_amplitude=False,
         update_init_mean=False,
     )
-    model.fit(
+    model.fit_em(
         times,
         traj,
         np.zeros(10),
@@ -1097,7 +1107,7 @@ def test_cold_start_fit_resets_init_mean_when_neuron_count_changes(small_grid_en
         warm_start=False,
         verbose=False,
     )
-    model.fit(
+    model.fit_em(
         times,
         traj,
         np.zeros((10, 2)),
@@ -1111,10 +1121,10 @@ def test_cold_start_fit_resets_init_mean_when_neuron_count_changes(small_grid_en
 
 
 @pytest.mark.slow
-def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
+def test_fit_sgd_runs_with_explicit_fixed_drift(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 30, seed=21)
     spikes = np.random.default_rng(22).poisson(0.05, size=30).astype(float)
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=3,
@@ -1144,7 +1154,7 @@ def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
 # Drift learning therefore remains experimental and fixed by default. Its M-step
 # algebra is checked both below and against independent complete-density numerical
 # optimization in test_graph_place_field_math.py; trajectory recovery is checked
-# by test_default_model_tracks_drifting_field_over_time.
+# by test_fixed_scale_model_tracks_drifting_field_over_time.
 
 
 @pytest.mark.slow
@@ -1168,7 +1178,7 @@ def test_static_limit_approximates_static_estimator(small_grid_env):
     times, traj, spikes, _eta, _w = _simulate_field_drift_spikes(
         small_grid_env, basis, dt=0.02, n_time=2000, q_c=0.0, seed=2
     )
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=8,
@@ -1181,7 +1191,7 @@ def test_static_limit_approximates_static_estimator(small_grid_env):
     )
     # warm_start=False leaves init_mean at its zero default: the reference (static MAP)
     # is NOT reused as the prior mean, so the agreement is a genuine parity check.
-    model.fit(times, traj, spikes, warm_start=False, max_iter=1, verbose=False)
+    model.fit_em(times, traj, spikes, warm_start=False, max_iter=1, verbose=False)
 
     counts = bin_spike_counts(small_grid_env, spikes, times, traj, basis)
     occ = bin_occupancy(small_grid_env, times, traj, dt=0.02)
@@ -1243,7 +1253,7 @@ def _simulate_field_drift_spikes(env, basis, dt, n_time, q_c, seed, rate_hz=30.0
 
 
 def test_predict_rate_map_requires_fit_and_valid_neuron(small_grid_env):
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=6)
     with pytest.raises(NotFittedError, match="not fitted"):
         model.predict_rate_map()
     with pytest.raises(NotFittedError, match="not fitted"):
@@ -1259,7 +1269,7 @@ def test_predict_rate_map_recovers_static_field(small_grid_env):
     times, traj, spikes, _eta, w_traj = _simulate_field_drift_spikes(
         small_grid_env, basis, dt=0.02, n_time=2000, q_c=0.0, seed=3
     )
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=8,
@@ -1268,7 +1278,7 @@ def test_predict_rate_map_recovers_static_field(small_grid_env):
         update_drift_scale=False,
         update_amplitude=False,
     )
-    model.fit(times, traj, spikes, max_iter=8, verbose=False)
+    model.fit_em(times, traj, spikes, max_iter=8, verbose=False)
     rate_hat = model.predict_rate_map(neuron_idx=0)
     rate_true = np.exp(np.asarray(basis.eigvecs @ w_traj[0]))  # static (Hz)
     occ = bin_occupancy(small_grid_env, times, traj, dt=0.02)
@@ -1288,8 +1298,8 @@ def test_predict_rate_map_recovers_static_field(small_grid_env):
 def test_score_matches_fit_marginal_ll(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 120, seed=41)
     spikes = np.random.default_rng(42).poisson(0.05, size=120).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
-    lls = model.fit(times, traj, spikes, max_iter=3, verbose=False)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=6)
+    lls = model.fit_em(times, traj, spikes, max_iter=3, verbose=False)
     held = model.score(times, traj, spikes)
     # score() reruns the same masked forward filter with the fitted parameters, so on
     # the training data it reproduces the fit's final marginal log-likelihood.
@@ -1301,8 +1311,8 @@ def test_score_matches_fit_marginal_ll(small_grid_env):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_default_model_tracks_drifting_field_over_time(small_grid_env, seed):
-    """The default model recovers evolving spatial structure over the full graph."""
+def test_fixed_scale_model_tracks_drifting_field_over_time(small_grid_env, seed):
+    """The legacy fixed-scale model recovers evolving full-graph structure."""
     from state_space_practice.graph_place_field import build_graph_basis
 
     basis = build_graph_basis(small_grid_env, rank=8)
@@ -1313,7 +1323,7 @@ def test_default_model_tracks_drifting_field_over_time(small_grid_env, seed):
     # Fit with the constructor's default q_c=1e-3, deliberately 10x below q_true. A
     # cold start and fixed initial mean keep filtered_mean genuinely causal; burn-in
     # below gives the filter time to learn the initially unknown firing-rate baseline.
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=dt,
         rank=8,
@@ -1323,7 +1333,7 @@ def test_default_model_tracks_drifting_field_over_time(small_grid_env, seed):
         update_amplitude=False,
         update_init_mean=False,
     )
-    model.fit(times, traj, spikes, warm_start=False, max_iter=1, verbose=False)
+    model.fit_em(times, traj, spikes, warm_start=False, max_iter=1, verbose=False)
 
     burn_in = 500
     phi = np.asarray(basis.eigvecs)
@@ -1436,7 +1446,7 @@ def test_multineuron_fit_recovers_distinct_per_neuron_fields(small_grid_env):
         axis=1,
     ).astype(float)
 
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=8,
@@ -1445,7 +1455,7 @@ def test_multineuron_fit_recovers_distinct_per_neuron_fields(small_grid_env):
         update_drift_scale=False,
         update_amplitude=False,
     )
-    model.fit(times, traj, spikes, max_iter=8, verbose=False)
+    model.fit_em(times, traj, spikes, max_iter=8, verbose=False)
     assert model.smoother_mean.shape[0] == 2
 
     occ = bin_occupancy(small_grid_env, times, traj, 0.02)
@@ -1468,7 +1478,7 @@ def test_score_uses_heldout_spikes_and_positions(small_grid_env):
         small_grid_env, basis, dt=0.02, n_time=2400, q_c=0.0, seed=5
     )
     half = 1200
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=8,
@@ -1477,7 +1487,7 @@ def test_score_uses_heldout_spikes_and_positions(small_grid_env):
         update_drift_scale=False,
         update_amplitude=False,
     )
-    model.fit(times[:half], traj[:half], spikes[:half], max_iter=8, verbose=False)
+    model.fit_em(times[:half], traj[:half], spikes[:half], max_iter=8, verbose=False)
     ll_aligned = model.score(times[half:], traj[half:], spikes[half:])
     # Rolling the held-out spikes by a large shift breaks the position<->rate
     # alignment; the fitted field must assign it a lower likelihood.
@@ -1490,7 +1500,7 @@ def test_drift_scale_mstep_matches_closed_form(small_grid_env):
     """The closed-form drift_scale M-step q* = mean_j(diag(E[dw dw^T])_j / S_j),
     pinned to a hand-computed value on a 1-mode, 2-step problem (mirrors the tau2 test).
     """
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=1,
@@ -1517,7 +1527,7 @@ def test_fit_sgd_improves_marginal_ll(small_grid_env):
     Catches a sign error in the loss or a broken parameter-transform wiring."""
     times, traj = _toy_trajectory(small_grid_env, 250, seed=9)
     spikes = np.random.default_rng(10).poisson(0.1, size=250).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=6)
     initial_tau2 = model.tau2
     initial_kappa2 = model.kappa2
     lls = model.fit_sgd(
@@ -1536,13 +1546,13 @@ def test_fit_sgd_improves_marginal_ll(small_grid_env):
 # ------------------------------------------------- regression guards for review fixes
 def test_constructor_rejects_nan_max_firing_rate(small_grid_env):
     with pytest.raises(ValueError, match="max_firing_rate_hz"):
-        GraphPlaceFieldModel(small_grid_env, dt=0.02, max_firing_rate_hz=float("nan"))
+        _legacy_graph_model(small_grid_env, dt=0.02, max_firing_rate_hz=float("nan"))
 
 
 def test_fit_sgd_all_frozen_raises(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 20, seed=1)
     spikes = np.zeros(20)
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env,
         dt=0.02,
         rank=3,
@@ -1559,7 +1569,7 @@ def test_fit_sgd_all_frozen_raises(small_grid_env):
 def test_update_kappa2_false_freezes_kappa2_under_sgd(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 40, seed=2)
     spikes = np.random.default_rng(3).poisson(0.1, size=40).astype(float)
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env, dt=0.02, rank=4, kappa2=1.5, update_kappa2=False
     )
     model.fit_sgd(times, traj, spikes, num_steps=5, warm_start=True, verbose=False)
@@ -1570,14 +1580,14 @@ def test_update_kappa2_false_freezes_kappa2_under_sgd(small_grid_env):
 def test_fit_preserves_learned_drift_scale_on_repeat(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 60, seed=4)
     spikes = np.random.default_rng(5).poisson(0.1, size=60).astype(float)
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         small_grid_env, dt=0.02, rank=4, update_drift_scale=True, init_drift_scale=2e-3
     )
-    model.fit(times, traj, spikes, max_iter=3, verbose=False)
+    model.fit_em(times, traj, spikes, max_iter=3, verbose=False)
     learned = np.asarray(model.drift_scale).copy()
     assert not np.allclose(learned, 2e-3)  # guard: EM actually moved it
     # A second fit(warm_start=False) must NOT reset drift_scale to init_drift_scale.
-    model.fit(times, traj, spikes, max_iter=1, warm_start=False, verbose=False)
+    model.fit_em(times, traj, spikes, max_iter=1, warm_start=False, verbose=False)
     assert not np.allclose(np.asarray(model.drift_scale), 2e-3)
 
 
@@ -1585,11 +1595,11 @@ def test_fit_preserves_learned_drift_scale_on_repeat(small_grid_env):
 @pytest.mark.parametrize("bad", [0, -1, 2.0, True, 1.5])
 def test_constructor_rejects_bad_max_newton_iter(small_grid_env, bad):
     with pytest.raises(ValueError, match="max_newton_iter"):
-        GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=3, max_newton_iter=bad)
+        _legacy_graph_model(small_grid_env, dt=0.02, rank=3, max_newton_iter=bad)
 
 
 def test_predict_and_score_require_fit(small_grid_env):
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
     assert model._is_fitted is False
     with pytest.raises(NotFittedError, match="not fitted"):
         model.predict_rate_map()
@@ -1602,8 +1612,8 @@ def test_predict_and_score_require_fit(small_grid_env):
 def test_score_rejects_all_out_of_bounds_trajectory(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 40, seed=1)
     spikes = np.random.default_rng(2).poisson(0.1, size=40).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
-    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
+    model.fit_em(times, traj, spikes, max_iter=2, verbose=False)
     assert model._is_fitted is True
     outside = np.full((40, 2), 1e9)
     with pytest.raises(ValueError, match="no in-bounds"):
@@ -1616,11 +1626,11 @@ def test_failed_first_estep_clears_posteriors_and_stays_unfitted(small_grid_env)
     model not-fitted (so predict/score refuse rather than return NaN)."""
     times, traj = _toy_trajectory(small_grid_env, 30, seed=3)
     spikes = np.random.default_rng(4).poisson(0.1, size=30).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
     # Inject a non-finite initial mean so the first E-step's LL is non-finite.
     model.init_mean = jnp.full((1, model.rank), jnp.inf)
     with pytest.raises(NonFiniteLikelihoodError, match="Non-finite log-likelihood"):
-        model.fit(times, traj, spikes, warm_start=False, verbose=False)
+        model.fit_em(times, traj, spikes, warm_start=False, verbose=False)
     assert model._is_fitted is False
     assert not is_set(model, "smoother_mean")  # NaN posteriors cleared
     with pytest.raises(NotFittedError, match="not fitted"):
@@ -1633,8 +1643,8 @@ def test_rejected_refit_leaves_model_cleanly_unfitted(small_grid_env):
     model reading as fitted with stale posteriors for the previous neuron count."""
     times, traj = _toy_trajectory(small_grid_env, 40, seed=1)
     spikes = np.random.default_rng(2).poisson(0.1, size=40).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
-    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
+    model.fit_em(times, traj, spikes, max_iter=2, verbose=False)
     assert model._is_fitted is True and model.predict_rate_map(0).shape[0] > 0
 
     # Re-fit with a 2-neuron, all-out-of-bounds trajectory: fails the n_valid==0 check
@@ -1642,7 +1652,7 @@ def test_rejected_refit_leaves_model_cleanly_unfitted(small_grid_env):
     outside = np.full((40, 2), 1e9)
     two_neuron = np.random.default_rng(3).poisson(0.1, size=(40, 2)).astype(float)
     with pytest.raises(ValueError, match="no in-bounds"):
-        model.fit(times, outside, two_neuron, max_iter=1, verbose=False)
+        model.fit_em(times, outside, two_neuron, max_iter=1, verbose=False)
     assert model._is_fitted is False
     assert not is_set(model, "smoother_mean")
     with pytest.raises(NotFittedError, match="not fitted"):
@@ -1653,8 +1663,8 @@ def test_rejected_refit_leaves_model_cleanly_unfitted(small_grid_env):
 def test_score_rejects_wrong_ndim_spikes(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 40, seed=4)
     spikes = np.random.default_rng(5).poisson(0.1, size=40).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
-    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
+    model.fit_em(times, traj, spikes, max_iter=2, verbose=False)
     with pytest.raises(ValueError, match="spikes must be 1D"):
         model.score(times, traj, np.float64(3.0))  # 0-d scalar
     with pytest.raises(ValueError, match="spikes must be 1D"):
@@ -1666,7 +1676,7 @@ def test_score_rejects_wrong_ndim_spikes(small_grid_env):
 def test_rejected_sgd_data_preserves_previous_fit(small_grid_env, invalid_data):
     times, traj = _toy_trajectory(small_grid_env, 30, seed=3)
     spikes = np.random.default_rng(4).poisson(0.1, size=30).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
     model.fit_sgd(times, traj, spikes, num_steps=2, verbose=False)
     assert is_set(model, "log_likelihood_")
     before = snapshot_model_state(model)
@@ -1687,8 +1697,8 @@ def test_rejected_sgd_data_preserves_previous_fit(small_grid_env, invalid_data):
 def test_nonfinite_sgd_final_inference_clears_previous_fit(small_grid_env, monkeypatch):
     times, traj = _toy_trajectory(small_grid_env, 30, seed=3)
     spikes = np.random.default_rng(4).poisson(0.1, size=30).astype(float)
-    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
-    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    model = _legacy_graph_model(small_grid_env, dt=0.02, rank=4)
+    model.fit_em(times, traj, spikes, max_iter=2, verbose=False)
     assert is_set(model, "log_likelihood_")
     e_step = model._e_step
 

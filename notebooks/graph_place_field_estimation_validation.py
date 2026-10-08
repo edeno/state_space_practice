@@ -113,7 +113,7 @@ def newton_experiment(seeds: list[int]) -> dict:
     )
 
 
-def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
+def sgd_experiment(reference_path: Path, seeds: list[int], inference: str) -> dict:
     reference = json.loads(reference_path.read_text())["q_profile"]
     source = {row["seed"]: row for row in reference["datasets"]}
     if not set(seeds) <= source.keys():
@@ -130,6 +130,7 @@ def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
         update_kappa2=False,
         update_init_mean=False,
         max_firing_rate_hz=1e50,
+        inference_method=inference,
     )
     phi = float(model.basis.eigvecs[0, 0])
     model.tau2 = reference["prior_variance"] / phi**2
@@ -137,7 +138,7 @@ def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
     times = np.arange(reference["n_time"]) * model.dt
     trajectory = np.repeat(env.bin_centers[:1], len(times), axis=0)
     starts, budgets = (0.001, 0.03, 0.3), (200, 1000)
-    log_grid = np.linspace(np.log(1e-4), np.log(1.0), 81)
+    log_grid = np.linspace(np.log(1e-10), np.log(30.0), 241)
 
     # Data are arguments, so all sessions share the compiled direct objective.
     @jax.jit
@@ -173,6 +174,7 @@ def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
                     options={"xatol": 1e-8},
                 )
                 candidates.append((float(result.x), float(result.fun)))
+        candidates.append((-np.inf, objective(-np.inf)))
         best_log_q, best_loss = min(candidates, key=lambda p: p[1])
         exact = row["profile"]
         exact_q = max(exact, key=lambda p: p["reference_log_evidence"])["q"]
@@ -184,7 +186,9 @@ def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
                 profile_log_evidence=(-losses).tolist(),
                 refined_q=float(np.exp(best_log_q)),
                 refined_log_evidence=-best_loss,
-                boundary=best_log_q in (float(log_grid[0]), float(log_grid[-1])),
+                boundary=best_log_q
+                in (-np.inf, float(log_grid[0]), float(log_grid[-1])),
+                static_log_evidence=-objective(-np.inf),
                 exact_grid_q=exact_q,
                 approximate_on_exact_grid_log_evidence=(
                     -np.asarray(approximate_on_exact_grid)
@@ -218,7 +222,7 @@ def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
                         log_evidence_gap_to_profile=float(loss) - best_loss,
                         log_q_gradient=float(gradient),
                         fit_seconds=elapsed,
-                        outside_profile_bounds=not (1e-4 <= learned_q <= 1.0),
+                        outside_profile_bounds=not (1e-10 <= learned_q <= 30.0),
                     )
                 )
         print(f"SGD drift comparison seed {seed} complete", flush=True)
@@ -249,8 +253,9 @@ def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
             newton_steps=model.max_newton_iter,
             parameter_units="q is scalar log-rate variance per transition, phi^2 times coefficient-space drift_scale",
             fixed_parameters="Known initial mean/variance and kappa2; only per-neuron q is optimized",
-            objective="Approximate masked forward-filter evidence, full-sequence Adam(0.01), shared SGD mixin",
-            direct_search="81 log-spaced scales on [0.0001,1], all sampled local maxima refined; includes endpoints",
+            inference=inference,
+            objective="Selected Laplace evidence, full-sequence Adam(0.01), shared SGD mixin",
+            direct_search="241 log-spaced scales on [1e-10,30], sampled local maxima refined; includes exact zero and endpoints",
             optimization_check="Objective gap <=0.001 nat against direct search; outside-bound fits reported",
             timing="Descriptive wall-clock including first-call compilation; not a performance comparison",
             limitation="Short scalar, model-matched datasets with known nuisance parameters; no full spatial joint-learning claim",
@@ -261,11 +266,146 @@ def sgd_experiment(reference_path: Path, seeds: list[int]) -> dict:
     )
 
 
+def optimizer_experiment(
+    reference_path: Path, seeds: list[int], inference: str
+) -> dict:
+    """Independent expanded search versus actual public gradient/profile fits."""
+    reference = json.loads(reference_path.read_text())["q_profile"]
+    datasets = {row["seed"]: row for row in reference["datasets"]}
+    env = Environment.from_samples(np.linspace(0, 10, 201)[:, None], bin_size=2.0)
+    model = GraphPlaceFieldModel(
+        env,
+        reference["dt"],
+        rank=1,
+        update_drift_scale=True,
+        update_amplitude=False,
+        update_init_mean=False,
+        update_kappa2=False,
+        max_firing_rate_hz=1e50,
+        inference_method=inference,
+    )
+    phi = float(model.basis.eigvecs[0, 0])
+    model.tau2 = reference["prior_variance"] / phi**2
+    model.init_mean = jnp.array([[reference["prior_mean"] / phi]])
+    times = np.arange(reference["n_time"]) * model.dt
+    base_positions = np.repeat(env.bin_centers[:1], len(times), axis=0)
+
+    @jax.jit
+    def loss(q, z, spikes, mask):
+        return model._sgd_loss_fn(
+            {"drift_scale": jnp.atleast_1d(q / phi**2)}, z, spikes, mask
+        )
+
+    # Independent implementation: separate grid/range, not profile_scale().
+    def direct_search(objective, lower, upper, size):
+        grid = np.geomspace(lower, upper, size)
+        values = np.array([objective(q) for q in grid])
+        candidates = [(0.0, objective(0.0)), *zip(grid, values, strict=True)]
+        for i in range(1, size - 1):
+            if values[i] < min(values[i - 1], values[i + 1]):
+                opt = minimize_scalar(
+                    lambda x: objective(np.exp(x)),
+                    bounds=(np.log(grid[i - 1]), np.log(grid[i + 1])),
+                    method="bounded",
+                    options={"xatol": 1e-10},
+                )
+                candidates.append((float(np.exp(opt.x)), float(opt.fun)))
+        return min(candidates, key=lambda p: p[1]), grid, values
+
+    profiles, records = [], []
+    for seed in seeds:
+        row = datasets[seed]
+        positions = base_positions.copy()
+        positions[~np.asarray(row["valid"])] = 1e6
+        counts = np.asarray(row["counts"])
+        z, spikes, mask = model._design_and_spikes(times, positions, counts)
+        model._mle_static_mask = None
+
+        def objective(q, z=z, spikes=spikes, mask=mask):
+            return float(loss(jnp.asarray(q), z, spikes, mask))
+
+        coarse, _, _ = direct_search(objective, 1e-8, 3.0, 121)
+        best, grid, values = direct_search(objective, 1e-10, 30.0, 241)
+        if abs(best[1] - coarse[1]) > 1e-4:
+            raise RuntimeError("Expanded reference search did not stabilize.")
+        profiles.append(
+            dict(
+                seed=seed,
+                q=best[0],
+                log_evidence=-best[1],
+                refinement_difference=abs(best[1] - coarse[1]),
+                grid_q=grid.tolist(),
+                grid_log_evidence=(-values).tolist(),
+                static_log_evidence=-objective(0.0),
+            )
+        )
+        for start_q in (0.001, 0.03, 0.3):
+            for method in ("lbfgs", "profile_lbfgs"):
+                model.drift_scale = jnp.array([start_q / phi**2])
+                started = perf_counter()
+                if method == "lbfgs":
+                    model.fit_lbfgs(times, positions, counts, warm_start=False)
+                else:
+                    model.fit_mle(
+                        times,
+                        positions,
+                        counts,
+                        warm_start=False,
+                        profile_rounds=1,
+                        drift_bounds=(1e-10 / phi**2, 30.0 / phi**2),
+                    )
+                records.append(
+                    dict(
+                        seed=seed,
+                        method=method,
+                        initial_q=start_q,
+                        learned_q=float(model.drift_scale[0]) * phi**2,
+                        log_evidence=model.log_likelihood_,
+                        objective_gap=-model.log_likelihood_ - best[1],
+                        converged=model.converged_,
+                        gradient_norm=model.optimizer_result_.gradient_norm,
+                        seconds=perf_counter() - started,
+                    )
+                )
+        print(f"Expanded optimizer audit seed {seed} complete", flush=True)
+    summary = {}
+    for method in ("lbfgs", "profile_lbfgs"):
+        rows = [r for r in records if r["method"] == method]
+        summary[method] = dict(
+            n_fits=len(rows),
+            n_objective_gap_at_most_0_001=sum(
+                r["objective_gap"] <= 0.001 for r in rows
+            ),
+            maximum_objective_gap=max(r["objective_gap"] for r in rows),
+            n_gradient_converged=sum(r["converged"] for r in rows),
+        )
+    return dict(
+        software=software_versions(),
+        protocol=dict(
+            seeds=seeds,
+            reference=str(reference_path),
+            parameters="Known priors, only q learned; log-rate variance units",
+            reference_search="Independent zero+121/241-point profiles with basin refinement and expanded bounds [1e-10,30]",
+            optimizer="Shared package L-BFGS-B and transforms; profile initialization includes exact zero",
+            newton_iterations=model.max_newton_iter,
+            inference=inference,
+            objective_tolerance=0.001,
+            reference_stability_tolerance=1e-4,
+        ),
+        profiles=profiles,
+        records=records,
+        summary=summary,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--section", choices=("newton", "sgd"), required=True)
+    parser.add_argument(
+        "--section", choices=("newton", "sgd", "optimizer"), required=True
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seeds", nargs="+", type=int)
+    parser.add_argument("--inference", choices=("sequential", "joint"), default="joint")
     parser.add_argument(
         "--reference",
         type=Path,
@@ -279,13 +419,15 @@ def main() -> None:
     )
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         parser.error("Use distinct nonnegative seeds.")
-    result = (
-        newton_experiment(seeds)
-        if args.section == "newton"
-        else sgd_experiment(args.reference, seeds)
-    )
+    if args.section == "newton":
+        result = newton_experiment(seeds)
+    elif args.section == "sgd":
+        result = sgd_experiment(args.reference, seeds, args.inference)
+    else:
+        result = optimizer_experiment(args.reference, seeds, args.inference)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    path = args.output_dir / f"{args.section}.json"
+    suffix = f"_{args.inference}" if args.section in ("optimizer", "sgd") else ""
+    path = args.output_dir / f"{args.section}{suffix}.json"
     path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(json.dumps(result["summary"], indent=2), flush=True)
     print(f"Saved {path}", flush=True)

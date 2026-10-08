@@ -59,6 +59,11 @@ from state_space_practice.em_driver import (
 from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.kalman import rts_backward_scan, sum_of_outer_products
+from state_space_practice.laplace_smoothing import (
+    LaplaceTrajectoryResult,
+    poisson_laplace_smoother,
+)
+from state_space_practice.likelihood_optimization import ScaleProfile, profile_scale
 from state_space_practice.point_process_kalman import (
     _log_line_search_failures,
     _validate_filter_numerics,
@@ -1388,6 +1393,80 @@ def _masked_graph_point_process_filter(
     return filtered_mean, filtered_cov, marginal_ll
 
 
+@partial(
+    typed_jit,
+    static_argnames=(
+        "dt",
+        "alpha",
+        "max_log_count",
+        "max_newton_iter",
+        "inference_method",
+        "max_smoother_iter",
+    ),
+)
+def _graph_forward_loss(
+    params: SGDParams,
+    Z: Array,
+    spikes: Array,
+    valid: Array,
+    eigvals: Array,
+    transition: Array,
+    *,
+    dt: float,
+    alpha: float,
+    max_log_count: float,
+    max_newton_iter: int,
+    inference_method: str = "sequential",
+    max_smoother_iter: int = 50,
+) -> Array:
+    """Pure shared objective for gradient optimization and scale profiles."""
+    S = (params["kappa2"] + eigvals) ** (-alpha)
+    P0 = jnp.diag(params["tau2"] * S)
+
+    def one(m0: Array, spk: Array, q: Array) -> Array:
+        if inference_method == "joint":
+            result = poisson_laplace_smoother(
+                m0,
+                P0,
+                transition,
+                jnp.diag(q * S),
+                Z,
+                spk,
+                valid,
+                dt=dt,
+                max_iter=max_smoother_iter,
+            )
+            usable = (result.relative_newton_step <= 1e-8) & (
+                result.n_rejected_steps == 0
+            )
+            return jnp.where(usable, result.log_evidence, -jnp.inf)
+        return _masked_graph_point_process_filter(
+            m0,
+            P0,
+            Z,
+            spk,
+            valid,
+            transition,
+            jnp.diag(q * S),
+            dt=dt,
+            max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
+        )[2]
+
+    ll = jax.vmap(one)(params["init_mean"], spikes, params["drift_scale"])
+    return -jnp.sum(ll)
+
+
+class _GraphNeuronInference(NamedTuple):
+    mean: Array
+    covariance: Array
+    cross_covariance: Array
+    log_evidence: Array
+    filtered_mean: Array
+    filtered_covariance: Array
+    diagnostics: LaplaceTrajectoryResult | None
+
+
 class GraphPlaceFieldModel(SGDFittableMixin):
     """Track a drifting place-field over a graph-Laplacian eigenbasis.
 
@@ -1402,13 +1481,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     The primary output is the posterior trajectory of the spatial log-rate field,
     available from :meth:`predict_log_rate_trajectory`. ``q_c`` controls how quickly
     that field may drift; recovering its generating value is not required for tracking.
-    Drift-scale learning is disabled by default because reliable automatic scale
-    selection has not been validated for the full spatial model. Original spatial
-    experiments showed biased approximate evidence profiles and EM updates that
-    depended strongly on initialization. This does not establish structural
-    non-identifiability.
-    Setting ``update_drift_scale=True`` enables the closed-form update as an explicit
-    experimental opt-in.
+    The normal fitting path learns drift, initial amplitude, spatial shape and
+    component baseline prior means from training-data joint Laplace evidence.
+    An explicit zero-drift candidate competes with positive-scale profiles;
+    bounded L-BFGS uses full-sequence gradients. Set ``update_drift_scale=False``
+    for a supplied scale. ``fit_em`` and ``fit_sgd`` retain experimental alternatives.
+    With fitted shape, q and kappa2 can trade off; ``field_drift_scale_`` gives
+    the resulting mean active-bin log-rate increment variance per transition.
 
     x64 is required (see the module and repo CLAUDE.md notes).
     """
@@ -1418,12 +1497,18 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     smoother_cross_cov: FittedAttribute[Array] = FittedAttribute()
     filtered_mean: FittedAttribute[Array] = FittedAttribute()
     filtered_cov: FittedAttribute[Array] = FittedAttribute()
+    drift_profiles_: FittedAttribute[tuple[ScaleProfile, ...]] = FittedAttribute()
+    smoother_diagnostics_: FittedAttribute[LaplaceTrajectoryResult] = FittedAttribute()
+    parameter_bound_hits_: FittedAttribute[tuple[str, ...]] = FittedAttribute()
     _fit_output_attrs = (
         "smoother_mean",
         "smoother_cov",
         "smoother_cross_cov",
         "filtered_mean",
         "filtered_cov",
+        "drift_profiles_",
+        "smoother_diagnostics_",
+        "parameter_bound_hits_",
     )
 
     def __init__(
@@ -1439,12 +1524,14 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         init_drift_scale: float = 1e-3,
         interpolation: str = "nearest",
         laplacian_convention: LaplacianConvention = "distance",
-        update_drift_scale: bool = False,
+        update_drift_scale: bool = True,
         update_amplitude: bool = True,
         update_init_mean: bool = True,
         update_kappa2: bool = True,
         max_firing_rate_hz: float = 500.0,
         max_newton_iter: int = 5,
+        inference_method: Literal["sequential", "joint"] = "joint",
+        max_smoother_iter: int = 50,
     ) -> None:
         """Build the graph basis and initialize model hyperparameters.
 
@@ -1484,24 +1571,21 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Edge-weight convention forwarded to :func:`build_graph_basis`, by
             default ``"distance"``.
         update_drift_scale : bool, optional
-            Whether ``fit``'s M-step updates the per-neuron drift scale ``q_c``,
-            by default **False**. Automatic drift-scale learning with the other
-            spatial parameters fitted jointly has not been validated, so it is an
-            experimental opt-in. Informative profiles with fixed known priors do
-            not establish reliable learning in the full spatial model.
+            Learn per-neuron q (default True). False retains the supplied scale,
+            including exact zero. The normal fit profiles and refines evidence;
+            experimental EM uses a posterior-moment update instead.
         update_amplitude : bool, optional
-            Whether ``fit``'s M-step updates ``tau2``, by default True.
+            Learn initial-state amplitude tau2, by default True.
         update_init_mean : bool, optional
-            Whether ``fit``'s M-step updates the per-neuron initial state mean,
-            by default True.
+            Learn component baseline prior means, by default True. The normal
+            fit keeps other spatial means zero; EM/SGD fit every coefficient.
         update_kappa2 : bool, optional
-            Whether ``fit_sgd`` optimizes ``kappa2``, by default True.
-            ``kappa2`` reshapes the spectral shape nonlinearly, so it has no
-            closed-form EM M-step and is learnable by ``fit_sgd`` only.
+            Learn spatial shape kappa2 by evidence optimization, by default True.
+            There is no closed-form EM update, so fit_em leaves it fixed.
         max_firing_rate_hz : float, optional
-            Maximum firing rate (Hz) used to clamp the log conditional
-            intensity for numerical stability, by default 500.0; must be
-            positive.
+            Numerical rate clamp for the causal sequential filter outputs,
+            by default 500.0. Joint inference uses the ordinary Poisson
+            likelihood without this clamp (an exponential overflow guard remains).
         max_newton_iter : int, optional
             Maximum Newton iterations per time-step Laplace update in the
             filter, by default 5, with damped updates and a final local
@@ -1510,10 +1594,23 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             reach the posterior mode. Larger values use damped iterative updates;
             their Gaussian posterior is still an approximation. Unconverged
             iterated updates are logged; increase the budget when reported.
+        inference_method : {"sequential", "joint"}, optional
+            Joint trajectory Laplace inference (default), or experimental
+            sequential local Laplace filtering/RTS. Joint inference uses adaptive damped
+            Newton iteration and implicit mode derivatives; unconverged evidence
+            is rejected by gradient optimization.
+        max_smoother_iter : int, optional
+            Joint Newton iteration cap, by default 50. Convergence uses a
+            relative remaining state update tolerance of 1e-8.
         """
         # The compiled filter treats dt as static; normalize concrete scalar
         # array inputs to a finite, hashable Python float before caching it.
         dt = validate_scalar(dt, "dt", positive=True)
+        if inference_method not in ("sequential", "joint"):
+            raise ValueError("inference_method must be sequential or joint.")
+        max_smoother_iter = validate_int(
+            max_smoother_iter, "max_smoother_iter", positive=True
+        )
         if not kappa2 > 0:
             raise ValueError(f"kappa2 must be positive, got {kappa2}.")
         if not tau2 > 0:
@@ -1549,13 +1646,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.interpolation = interpolation
         self.max_firing_rate_hz = max_firing_rate_hz
         self.max_newton_iter = max_newton_iter
-        # Joint spatial drift-scale learning remains unvalidated. Keep it fixed
-        # by default; the update remains an explicit experimental opt-in.
+        self.inference_method = inference_method
+        self.max_smoother_iter = max_smoother_iter
         self.update_drift_scale = update_drift_scale
         self.update_amplitude = update_amplitude
         self.update_init_mean = update_init_mean
-        # kappa2 is learnable by fit_sgd only (it reshapes S nonlinearly, so it has no
-        # closed-form EM M-step); default on to preserve prior behavior.
+        # kappa2 reshapes S nonlinearly and has no closed-form EM M-step.
         self.update_kappa2 = update_kappa2
         self._log_intensity_func = log_conditional_intensity
 
@@ -1571,6 +1667,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self._is_fitted: bool = False
         self.log_likelihoods: list[float] = []
         self._n_time: int = 0
+        self._mle_static_mask: Array | None = None
+        self._mle_field_coordinates = False
+        self._mle_baseline_mean = False
+        self._mle_reference_factor = float(
+            jnp.sum(self._spectral_shape_current()) / self.env.n_bins
+        )
 
     @property
     def _max_log_count(self) -> float:
@@ -1638,9 +1740,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         P0 = jnp.diag(self.tau2 * S)
         A = self.transition_matrix
 
-        def _one(
-            m0: Array, spk: Array, q_c: Array
-        ) -> tuple[Array, Array, Array, Array, Array, Array]:
+        def _one(m0: Array, spk: Array, q_c: Array) -> _GraphNeuronInference:
             Q = jnp.diag(q_c * S)
             filtered_mean, filtered_cov, marginal_ll = (
                 _masked_graph_point_process_filter(
@@ -1656,19 +1756,45 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     max_newton_iter=self.max_newton_iter,
                 )
             )
-            smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
-                filtered_mean,
-                filtered_cov,
-                A,
-                Q,
-            )
-            return (
+            result: LaplaceTrajectoryResult | None = None
+            if self.inference_method == "joint":
+                result = poisson_laplace_smoother(
+                    m0,
+                    P0,
+                    A,
+                    Q,
+                    Z,
+                    spk,
+                    valid,
+                    dt=self.dt,
+                    max_iter=self.max_smoother_iter,
+                )
+                smoother_mean, smoother_cov, smoother_cross_cov = (
+                    result.mean,
+                    result.covariance,
+                    result.cross_covariance,
+                )
+                marginal_ll = jnp.where(
+                    (result.relative_newton_step <= 1e-8)
+                    & (result.n_rejected_steps == 0),
+                    result.log_evidence,
+                    -jnp.inf,
+                )
+            else:
+                smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
+                    filtered_mean,
+                    filtered_cov,
+                    A,
+                    Q,
+                )
+            return _GraphNeuronInference(
                 smoother_mean,
                 smoother_cov,
                 smoother_cross_cov,
                 marginal_ll,
                 filtered_mean,
                 filtered_cov,
+                result,
             )
 
         (
@@ -1678,7 +1804,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             marginal_ll,
             self.filtered_mean,
             self.filtered_cov,
+            diagnostics,
         ) = jax.vmap(_one, in_axes=(0, 0, 0))(self.init_mean, spikes, self.drift_scale)
+        if diagnostics is not None:
+            self.smoother_diagnostics_ = diagnostics
         return float(jnp.sum(marginal_ll))
 
     def _warm_start(
@@ -1752,6 +1881,70 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.init_mean = self.smoother_mean[:, 0, :]
 
     def fit(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+        *,
+        method: Literal["mle", "em"] = "mle",
+        max_iter: int | None = None,
+        tolerance: float | None = None,
+        warm_start: bool = True,
+        verbose: bool = True,
+        drift_bounds: tuple[float, float] = (1e-8, 10.0),
+        profile_points: int = 49,
+        profile_rounds: int = 3,
+        initial_mean_mode: Literal["baseline", "full"] = "baseline",
+    ) -> list[float]:
+        """Fit by training-data evidence optimization (the normal fitting route).
+
+        Profiles include exact zero drift; bounded L-BFGS fits the enabled
+        parameters using full-sequence gradients. ``tolerance`` is the maximum
+        projected gradient in optimizer coordinates, per time row (default
+        1e-7); ``max_iter`` defaults to 500 per nuisance optimization. The
+        returned history includes profile-round/static-candidate restarts and
+        line-search evaluations, so it need not be monotone. Its last entry is
+        the evidence at the selected parameters; ``n_iter_`` is None.
+
+        Set ``update_drift_scale=False`` to retain a supplied scale, including
+        zero. Spatial prior means stay zero while component baselines are free.
+        ``warm_start=False`` resumes compatible stored parameters; a warm start
+        recomputes initial means and resets q before profiling. Profiles use
+        field-variance units with bounds mapped from the constructor shape.
+
+        ``method="em"`` selects experimental GEM rollback, equivalently
+        :meth:`fit_em`, with defaults 100 iterations and relative likelihood
+        tolerance 1e-4. EM/Adam and sequential inference do not carry the
+        automatic estimator's validation guarantees. See :meth:`fit_mle` for
+        profile and numerical diagnostics.
+        """
+        if method == "em":
+            return self.fit_em(
+                times,
+                trajectory,
+                spikes,
+                max_iter=100 if max_iter is None else max_iter,
+                tolerance=1e-4 if tolerance is None else tolerance,
+                warm_start=warm_start,
+                verbose=verbose,
+            )
+        if method != "mle":
+            self._clear_fit_state()
+            raise ValueError("method must be mle or em.")
+        return self.fit_mle(
+            times,
+            trajectory,
+            spikes,
+            max_iter=500 if max_iter is None else max_iter,
+            gradient_tolerance=1e-7 if tolerance is None else tolerance,
+            warm_start=warm_start,
+            drift_bounds=drift_bounds,
+            profile_points=profile_points,
+            profile_rounds=profile_rounds,
+            initial_mean_mode=initial_mean_mode,
+        )
+
+    def fit_em(
         self,
         times: NDArray[np.float64],
         trajectory: NDArray[np.float64],
@@ -1882,12 +2075,20 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             spec["kappa2"] = POSITIVE
         if self.update_drift_scale:
             params["drift_scale"] = self.drift_scale
+            if self._mle_field_coordinates:
+                params["drift_scale"] = (
+                    params["drift_scale"] * self._field_shape_factor()
+                )
             spec["drift_scale"] = POSITIVE
         if self.update_amplitude:
             params["tau2"] = jnp.asarray(self.tau2)
+            if self._mle_field_coordinates:
+                params["tau2"] = params["tau2"] * self._field_shape_factor()
             spec["tau2"] = POSITIVE
         if self.update_init_mean:
             params["init_mean"] = self.init_mean
+            if self._mle_baseline_mean:
+                params["init_mean"] = params["init_mean"][:, : self.basis.n_components]
             spec["init_mean"] = UNCONSTRAINED
         if not params:
             raise ValueError(
@@ -1904,37 +2105,78 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         tau2 = self._sgd_param(params, "tau2")
         drift_scale = self._sgd_param(params, "drift_scale")
         init_mean = self._sgd_param(params, "init_mean")
-        eigvals = jnp.asarray(self.basis.eigvals)
-        S = (kappa2 + eigvals) ** (-self.alpha)
-        P0 = jnp.diag(tau2 * S)
-
-        def _one(m0: Array, spk: Array, q_c: Array) -> Array:
-            _, _, marginal_ll = _masked_graph_point_process_filter(
-                m0,
-                P0,
-                Z,
-                spk,
-                valid,
-                self.transition_matrix,
-                jnp.diag(q_c * S),
-                dt=self.dt,
-                max_log_count=self._max_log_count,
-                max_newton_iter=self.max_newton_iter,
+        if self._mle_field_coordinates:
+            factor = self._field_shape_factor(kappa2)
+            if "drift_scale" in params:
+                drift_scale = drift_scale / factor
+            if "tau2" in params:
+                tau2 = tau2 / factor
+        if self._mle_baseline_mean and "init_mean" in params:
+            init_mean = jnp.pad(
+                init_mean, ((0, 0), (0, self.rank - self.basis.n_components))
             )
-            return marginal_ll
-
-        marginal_ll = jax.vmap(_one, in_axes=(0, 0, 0))(init_mean, spikes, drift_scale)
-        return -jnp.sum(marginal_ll)
+        if self._mle_static_mask is not None:
+            drift_scale = jnp.where(self._mle_static_mask, 0.0, drift_scale)
+        return _graph_forward_loss(
+            dict(
+                kappa2=kappa2, tau2=tau2, init_mean=init_mean, drift_scale=drift_scale
+            ),
+            Z,
+            spikes,
+            valid,
+            jnp.asarray(self.basis.eigvals),
+            self.transition_matrix,
+            dt=self.dt,
+            alpha=self.alpha,
+            max_log_count=self._max_log_count,
+            max_newton_iter=self.max_newton_iter,
+            inference_method=self.inference_method,
+            max_smoother_iter=self.max_smoother_iter,
+        )
 
     def _store_sgd_params(self, params: SGDParams) -> None:
+        if self._mle_field_coordinates:
+            factor = self._field_shape_factor(
+                params.get("kappa2", jnp.asarray(self.kappa2))
+            )
+            params = dict(params)
+            for key in ("drift_scale", "tau2"):
+                if key in params:
+                    params[key] = params[key] / factor
         if "drift_scale" in params:
             self.drift_scale = params["drift_scale"]
+            if self._mle_static_mask is not None:
+                self.drift_scale = jnp.where(
+                    self._mle_static_mask, 0.0, self.drift_scale
+                )
         if "tau2" in params:
             self.tau2 = float(params["tau2"])
         if "kappa2" in params:
             self.kappa2 = float(params["kappa2"])
         if "init_mean" in params:
             self.init_mean = params["init_mean"]
+            if self._mle_baseline_mean:
+                self.init_mean = jnp.pad(
+                    self.init_mean, ((0, 0), (0, self.rank - self.basis.n_components))
+                )
+
+    def _field_shape_factor(self, kappa2: Array | None = None) -> Array:
+        """Mean field variance per coefficient-scale unit, using orthonormal Phi."""
+        shape = (jnp.asarray(self.kappa2) if kappa2 is None else kappa2) + jnp.asarray(
+            self.basis.eigvals
+        )
+        return jnp.sum(shape ** (-self.alpha)) / self.env.n_bins
+
+    @property
+    def field_drift_scale_(self) -> NDArray[np.float64]:
+        """Mean across graph bins of log-rate increment variance per transition.
+
+        Equals ``q_c * sum(S) / n_bins``. Divide by dt for diffusion variance
+        per second. ``drift_scale`` retains its coefficient-scale convention.
+        """
+        self._check_fitted("field_drift_scale_")
+        assert self.drift_scale is not None
+        return np.asarray(self.drift_scale * self._field_shape_factor())
 
     def _finalize_sgd(self, Z: Array, spikes: Array, valid: Array) -> float:
         final_ll = self._e_step(Z, spikes, valid)
@@ -1947,6 +2189,324 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.log_likelihoods = [final_ll]
         self._is_fitted = True
         return final_ll
+
+    def fit_mle(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+        *,
+        max_iter: int = 500,
+        gradient_tolerance: float = 1e-7,
+        drift_bounds: tuple[float, float] = (1e-8, 10.0),
+        profile_points: int = 49,
+        profile_rounds: int = 3,
+        warm_start: bool = True,
+        initial_mean_mode: Literal["baseline", "full"] = "baseline",
+    ) -> list[float]:
+        """Fit training-data Laplace evidence with profiles and bounded L-BFGS.
+
+        Fixed ``update_*`` parameters remain fixed. Profiles include exact zero;
+        ``drift_profiles_`` contains conditional profiles at the final nuisance
+        parameters, in mean field-increment variance units. These are diagnostics,
+        not confidence intervals. ``parameter_bound_hits_`` and
+        ``optimizer_result_`` expose numerical bounds and projected gradients.
+        Only component baseline prior means are fitted by default. The ``full``
+        mean option is experimental because freely fitting every prior mean can
+        collapse the fitted initial-state variance.
+        """
+        self._clear_fit_state()
+        try:
+            return self._fit_mle(
+                times,
+                trajectory,
+                spikes,
+                max_iter=max_iter,
+                gradient_tolerance=gradient_tolerance,
+                drift_bounds=drift_bounds,
+                profile_points=profile_points,
+                profile_rounds=profile_rounds,
+                warm_start=warm_start,
+                initial_mean_mode=initial_mean_mode,
+            )
+        except Exception:
+            self._clear_fit_state()
+            raise
+        finally:
+            self._mle_field_coordinates = False
+            self._mle_baseline_mean = False
+
+    def _profile_drift(
+        self,
+        Z: Array,
+        spk: Array,
+        valid: Array,
+        drift_bounds: tuple[float, float],
+        profile_points: int,
+    ) -> tuple[ScaleProfile, ...]:
+        assert self.init_mean is not None and self.drift_scale is not None
+        base = dict(
+            kappa2=jnp.asarray(self.kappa2),
+            tau2=jnp.asarray(self.tau2),
+            init_mean=self.init_mean,
+            drift_scale=self.drift_scale,
+        )
+        factor = float(self._field_shape_factor())
+        results = []
+        for cell in range(self.n_neurons):
+
+            def objective(q: float, cell: int = cell) -> float:
+                params = dict(
+                    base,
+                    init_mean=base["init_mean"][cell : cell + 1],
+                    drift_scale=jnp.atleast_1d(q / factor),
+                )
+                return float(
+                    _graph_forward_loss(
+                        params,
+                        Z,
+                        spk[cell : cell + 1],
+                        valid,
+                        jnp.asarray(self.basis.eigvals),
+                        self.transition_matrix,
+                        dt=self.dt,
+                        alpha=self.alpha,
+                        max_log_count=self._max_log_count,
+                        max_newton_iter=self.max_newton_iter,
+                        inference_method=self.inference_method,
+                        max_smoother_iter=self.max_smoother_iter,
+                    )
+                )
+
+            results.append(
+                profile_scale(
+                    objective,
+                    bounds=(
+                        drift_bounds[0] * self._mle_reference_factor,
+                        drift_bounds[1] * self._mle_reference_factor,
+                    ),
+                    n_grid=profile_points,
+                )
+            )
+        return tuple(results)
+
+    def _fit_mle(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+        *,
+        max_iter: int = 500,
+        gradient_tolerance: float = 1e-7,
+        drift_bounds: tuple[float, float] = (1e-8, 10.0),
+        profile_points: int = 49,
+        profile_rounds: int = 3,
+        warm_start: bool = True,
+        initial_mean_mode: Literal["baseline", "full"] = "baseline",
+    ) -> list[float]:
+        """Profile q including zero, then optimize learnable parameters by L-BFGS.
+
+        Uses the selected inference approximation. ``update_*`` flags
+        determine trainable parameters; fixed drift stays fixed. Positive-scale
+        profiles use coefficient-variance ``drift_bounds`` and refine sampled
+        minima. Exact zero is a separate candidate. ``drift_profiles_`` and
+        ``optimizer_result_`` expose boundary/gradient diagnostics. This path
+        uses the selected inference approximation.
+        Optimization uses field-variance coordinates internally; stored q/tau2
+        retain coefficient units. Only component baseline prior means are free
+        by default; spatial prior means stay zero. ``initial_mean_mode="full"``
+        retains the experimental fit of every mean together with its variance.
+        Profiles use mean field-variance units and bounds mapped using the
+        constructor's spectral shape, which stays fixed throughout the search.
+        """
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
+        if initial_mean_mode not in ("baseline", "full"):
+            raise ValueError("initial_mean_mode must be baseline or full.")
+        tolerance = validate_scalar(
+            gradient_tolerance, "gradient_tolerance", positive=True
+        )
+        profile_rounds = validate_int(profile_rounds, "profile_rounds", positive=True)
+        profile_points = validate_int(profile_points, "profile_points", positive=True)
+        if profile_points < 3 or not 0 < drift_bounds[0] < drift_bounds[1] < np.inf:
+            raise ValueError(
+                "Need at least three profile points and finite increasing positive drift bounds."
+            )
+        args, _ = self._prepare_sgd_data(
+            times, trajectory, spikes, warm_start=warm_start
+        )
+        Z, spk, valid = args
+        self._mle_field_coordinates = True
+        self._mle_baseline_mean = (
+            self.update_init_mean and initial_mean_mode == "baseline"
+        )
+        if self._mle_baseline_mean:
+            assert self.init_mean is not None
+            if self.update_amplitude and self.rank > self.basis.n_components:
+                contrasts = self.init_mean[:, self.basis.n_components :]
+                shape = self._spectral_shape_current()[self.basis.n_components :]
+                self.tau2 = max(self.tau2, float(jnp.mean(contrasts**2 / shape)))
+            self.init_mean = self.init_mean.at[:, self.basis.n_components :].set(0.0)
+        histories: list[float] = []
+        profiles: tuple[ScaleProfile, ...] = ()
+        for _round in range(profile_rounds if self.update_drift_scale else 1):
+            assert self.init_mean is not None and self.drift_scale is not None
+            if self.update_drift_scale:
+                profiles = self._profile_drift(
+                    Z, spk, valid, drift_bounds, profile_points
+                )
+                factor = float(self._field_shape_factor())
+                chosen = jnp.asarray([p.scale for p in profiles]) / factor
+                self._mle_static_mask = chosen == 0
+                # The optimizer sees positive coordinates, with static entries
+                # masked from its likelihood and restored to exact zero on store.
+                self.drift_scale = jnp.maximum(
+                    chosen, drift_bounds[0] * self._mle_reference_factor / factor
+                )
+            if not any(
+                (
+                    self.update_drift_scale,
+                    self.update_amplitude,
+                    self.update_kappa2,
+                    self.update_init_mean,
+                )
+            ):
+                ll = self._e_step(Z, spk, valid)
+                if not np.isfinite(ll):
+                    raise NonFiniteLikelihoodError(
+                        "Final joint inference is unconverged or non-finite."
+                    )
+                self._is_fitted = True
+                self.log_likelihoods = [ll]
+                self._record_fit_result([ll], True, n_iter=None)
+                self.drift_profiles_ = ()
+                self.parameter_bound_hits_ = ()
+                self._mle_field_coordinates = False
+                self._mle_baseline_mean = False
+                return [ll]
+            result = self._fit_lbfgs_prepared(
+                args,
+                {},
+                max_iter=max_iter,
+                gradient_tolerance=tolerance,
+                bounds=self._mle_parameter_bounds(drift_bounds),
+            )
+            histories.extend([-loss * self._n_time for loss in result.loss_history])
+            if not any(
+                (self.update_amplitude, self.update_kappa2, self.update_init_mean)
+            ):
+                break
+        if self.update_drift_scale and not bool(jnp.all(self.drift_scale == 0)):
+            keys = self._fit_output_attrs + (
+                "kappa2",
+                "tau2",
+                "init_mean",
+                "drift_scale",
+                "_mle_static_mask",
+                "_is_fitted",
+                "log_likelihoods",
+                "log_likelihood_",
+                "log_likelihood_history_",
+                "converged_",
+                "optimizer_result_",
+                "n_iter_",
+            )
+            positive_state = snapshot_attributes(self, keys)
+            positive_ll = self.log_likelihood_
+            positive_result = result
+            self._mle_static_mask = jnp.ones(self.n_neurons, dtype=bool)
+            self.drift_scale = jnp.full(self.n_neurons, drift_bounds[0])
+            if self.update_amplitude:
+                self.tau2 = max(self.tau2, 0.1 / float(self._field_shape_factor()))
+            static_result = self._fit_lbfgs_prepared(
+                args,
+                {},
+                max_iter=max_iter,
+                gradient_tolerance=tolerance,
+                bounds=self._mle_parameter_bounds(drift_bounds),
+            )
+            histories.extend(
+                [-loss * self._n_time for loss in static_result.loss_history]
+            )
+            if self.log_likelihood_ >= positive_ll - 1e-6:
+                result = static_result
+            else:
+                restore_attributes(self, positive_state)
+                result = positive_result
+        if self.update_drift_scale:
+            profiles = self._profile_drift(Z, spk, valid, drift_bounds, profile_points)
+        self.drift_profiles_ = profiles
+        params, _spec = self._build_param_spec()
+        bounds = self._mle_parameter_bounds(drift_bounds)
+        hits = []
+        offset = 0
+        for name in sorted(params):
+            size = int(np.size(params[name]))
+            for index, (value, (lo, hi)) in enumerate(
+                zip(
+                    result.parameters[offset : offset + size],
+                    bounds[offset : offset + size],
+                    strict=True,
+                )
+            ):
+                if (
+                    name == "drift_scale"
+                    and self._mle_static_mask is not None
+                    and bool(self._mle_static_mask[index])
+                ):
+                    continue
+                if (lo is not None and np.isclose(value, lo, atol=1e-8, rtol=0)) or (
+                    hi is not None and np.isclose(value, hi, atol=1e-8, rtol=0)
+                ):
+                    hits.append(name)
+            offset += size
+        self.parameter_bound_hits_ = tuple(sorted(set(hits)))
+        final_ll = self.log_likelihood_
+        if histories:
+            histories[-1] = final_ll
+        self._record_fit_result(
+            histories, result.converged, n_iter=None, log_likelihood=final_ll
+        )
+        self.optimizer_result_ = result
+        self._mle_field_coordinates = False
+        self._mle_baseline_mean = False
+        self.log_likelihoods = histories
+        if histories:
+            histories[-1] = final_ll
+        if any(p.at_upper_bound for p in profiles):
+            logger.warning(
+                "Drift scale profile reached its upper bound; expand drift_bounds."
+            )
+        return histories
+
+    def _mle_parameter_bounds(
+        self, drift_bounds: tuple[float, float]
+    ) -> list[tuple[float | None, float | None]]:
+        """Map coefficient-scale bounds into the actual optimizer coordinates."""
+        params, spec = self._build_param_spec()
+        bounds: list[tuple[float | None, float | None]] = []
+        for name in sorted(params):
+            if name == "drift_scale":
+                values = spec[name].to_unconstrained(
+                    jnp.asarray(drift_bounds) * self._mle_reference_factor
+                )
+                pair: tuple[float | None, float | None] = (
+                    float(values[0]),
+                    float(values[1]),
+                )
+            elif name == "kappa2":
+                values = spec[name].to_unconstrained(
+                    jnp.array([1e-6, 1e4 * (1 + float(np.max(self.basis.eigvals)))])
+                )
+                pair = (float(values[0]), float(values[1]))
+            elif name == "tau2":
+                values = spec[name].to_unconstrained(jnp.array([1e-8, 1e4]))
+                pair = (float(values[0]), float(values[1]))
+            elif name == "init_mean":
+                pair = (-200.0, 200.0)
+            else:
+                pair = (None, None)
+            bounds.extend([pair] * int(np.size(params[name])))
+        return bounds
 
     def fit_sgd(
         self,
@@ -2027,6 +2587,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         _validate_filter_numerics(self.prior_cov(), n_time=Z.shape[0])
 
         self._clear_fit_state()
+        self._mle_static_mask = None
         self.n_neurons = int(spikes_arr.shape[1])
         self._n_time = int(Z.shape[0])
         state_shape_matches = self.init_mean is not None and self.init_mean.shape == (
@@ -2046,6 +2607,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             if self.update_drift_scale:
                 initial_drift = max(initial_drift, 1e-12)
             self.drift_scale = jnp.full(self.n_neurons, initial_drift)
+        elif self.update_drift_scale:
+            assert self.drift_scale is not None
+            self.drift_scale = jnp.maximum(self.drift_scale, 1e-12)
 
         return (Z, spk, valid), {}
 
@@ -2056,6 +2620,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         super()._clear_fit_state()
         self.log_likelihoods = []
         self._is_fitted = False
+        self._mle_static_mask = None
+        self._mle_field_coordinates = False
+        self._mle_baseline_mean = False
 
     def _check_fitted(self, method: str) -> None:
         if not self._is_fitted:
@@ -2149,11 +2716,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         trajectory: NDArray[np.float64],
         spikes: ArrayLike,
     ) -> float:
-        """Held-out total marginal log-likelihood (forward filter, fitted parameters).
+        """Approximate marginal evidence of a sequence at the fitted parameters.
 
-        Runs the same masked forward filter as the E-step (no smoothing, no parameter
-        updates) with the current parameters, summed over neurons. On the training data
-        this matches the fit's final marginal log-likelihood.
+        Uses the selected inference method and restarts from the fitted initial
+        prior; it neither continues the training posterior nor computes a future
+        forecast. On training data this matches the fit's final evidence. Joint
+        inference uses all supplied observations to construct the trajectory mode.
+        No fitted state or parameters are changed.
 
         Parameters
         ----------
@@ -2193,23 +2762,24 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 "trajectory contains no in-bounds observations for this environment; "
                 "the marginal log-likelihood would depend on no data."
             )
-        S = self._spectral_shape_current()
-        P0 = jnp.diag(self.tau2 * S)
-
-        def _one(m0: Array, spike_row: Array, q_c: Array) -> Array:
-            _, _, marginal_ll = _masked_graph_point_process_filter(
-                m0,
-                P0,
+        return -float(
+            _graph_forward_loss(
+                dict(
+                    kappa2=jnp.asarray(self.kappa2),
+                    tau2=jnp.asarray(self.tau2),
+                    init_mean=self.init_mean,
+                    drift_scale=self.drift_scale,
+                ),
                 Z,
-                spike_row,
+                spk,
                 valid,
+                jnp.asarray(self.basis.eigvals),
                 self.transition_matrix,
-                jnp.diag(q_c * S),
                 dt=self.dt,
+                alpha=self.alpha,
                 max_log_count=self._max_log_count,
                 max_newton_iter=self.max_newton_iter,
+                inference_method=self.inference_method,
+                max_smoother_iter=self.max_smoother_iter,
             )
-            return marginal_ll
-
-        lls = jax.vmap(_one, in_axes=(0, 0, 0))(self.init_mean, spk, self.drift_scale)
-        return float(jnp.sum(lls))
+        )

@@ -14,7 +14,9 @@ from typing import NamedTuple
 import numpy as np
 from numpy.typing import NDArray
 from scipy.integrate import cumulative_trapezoid
+from scipy.linalg import block_diag, cho_factor, cho_solve
 from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import minimize
 from scipy.special import gammaln, logsumexp
 from scipy.stats import norm
 
@@ -290,3 +292,95 @@ def expected_gaussian_prior_nll(
             np.linalg.solve(process_covariance, second)
         )
     return 0.5 * float(value)
+
+
+class JointPoissonLaplace(NamedTuple):
+    """Independent joint MAP/curvature reference in whitened innovations."""
+
+    mean: np.ndarray
+    covariance: np.ndarray
+    cross_covariance: np.ndarray
+    log_evidence: float
+    gradient_norm: float
+
+
+def joint_poisson_laplace(
+    initial_mean: np.ndarray,
+    initial_covariance: np.ndarray,
+    process_covariance: np.ndarray,
+    design: np.ndarray,
+    counts: np.ndarray,
+    valid: np.ndarray,
+    dt: float,
+    transition: np.ndarray | None = None,
+) -> JointPoissonLaplace:
+    """Dense Newton oracle, with no package filtering/smoothing formulas.
+
+    States are a linear function of independent standard Gaussian innovations.
+    The static branch uses only the initial state; it does not invert zero Q.
+    Posterior means here are modes, not exact Poisson posterior expectations.
+    """
+    n_time, rank = design.shape
+    transition = np.eye(rank) if transition is None else transition
+    propagation = [np.linalg.matrix_power(transition, t) for t in range(n_time)]
+    prior_mean = np.stack([a @ initial_mean for a in propagation])
+    static = not np.any(process_covariance)
+    n_white = rank if static else n_time * rank
+    loading = np.zeros((n_time * rank, n_white))
+    loading[:, :rank] = np.vstack(
+        [a @ np.linalg.cholesky(initial_covariance) for a in propagation]
+    )
+    if not static:
+        noise_chol = np.linalg.cholesky(process_covariance)
+        for t in range(1, n_time):
+            for s in range(1, t + 1):
+                loading[t * rank : (t + 1) * rank, s * rank : (s + 1) * rank] = (
+                    propagation[t - s] @ noise_chol
+                )
+    observation = block_diag(*[z[None, :] for z in design]) @ loading
+    offset = np.sum(design * prior_mean, axis=1) + np.log(dt)
+    observed_design, observed_offset, y = (
+        observation[valid],
+        offset[valid],
+        counts[valid],
+    )
+
+    def objective(u):
+        eta = observed_design @ u + observed_offset
+        return float(np.sum(np.exp(eta) - y * eta) + 0.5 * u @ u)
+
+    def gradient(u):
+        mu = np.exp(observed_design @ u + observed_offset)
+        return observed_design.T @ (mu - y) + u
+
+    def hessian(u):
+        mu = np.exp(observed_design @ u + observed_offset)
+        return np.eye(n_white) + observed_design.T @ (mu[:, None] * observed_design)
+
+    result = minimize(
+        objective,
+        np.zeros(n_white),
+        jac=gradient,
+        hess=hessian,
+        method="trust-exact",
+        options={"gtol": 1e-9, "maxiter": 200},
+    )
+    norm = float(np.max(np.abs(gradient(result.x))))
+    if norm > 1e-6:
+        raise RuntimeError(f"Joint reference mode did not converge: gradient={norm}.")
+    factor = cho_factor(hessian(result.x))
+    covariance = loading @ cho_solve(factor, loading.T)
+    mean = (loading @ result.x).reshape(n_time, rank) + prior_mean
+    blocks = covariance.reshape(n_time, rank, n_time, rank)
+    diagonal = np.stack([blocks[t, :, t, :] for t in range(n_time)])
+    cross = (
+        np.stack([blocks[t, :, t + 1, :] for t in range(n_time - 1)])
+        if n_time > 1
+        else np.empty((0, rank, rank))
+    )
+    log_evidence = (
+        -objective(result.x)
+        - float(gammaln(y + 1).sum())
+        - float(np.log(np.diag(factor[0])).sum())
+    )
+    return JointPoissonLaplace(mean, diagonal, cross, log_evidence, norm)

@@ -127,6 +127,7 @@ def graph_approximation(env: Environment, p: Problem, iterations: int) -> Approx
         rank=1,
         max_newton_iter=iterations,
         max_firing_rate_hz=1e50,
+        inference_method="sequential",
         update_amplitude=False,
         update_init_mean=False,
     )

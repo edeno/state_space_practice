@@ -4,7 +4,15 @@
 
 **Goal:** Recover each neuron's time-varying, graph-respecting place-field trajectory `eta_{c,t} = Phi w_{c,t}` from position-aligned Poisson spikes, with dependable automatic estimation of its drift scale `q_c`. Automatic estimation is now a merge requirement. Acceptance includes optimizer correctness, statistical recovery in informative model-matched simulations, and useful held-out predictions. A single realization need not recover its generating scale, and a fixed-scale option remains available.
 
-**Architecture:** Reuse the existing point-process Laplace-EKF primitives (`point_process_kalman.py`), Kalman EM helpers (`kalman.py`), and the SGD mixin (`sgd_fitting.py`). The novelty is (1) a geometry-aware basis `Φ` (the smoothest Laplacian eigenvectors) already built by the Stage-0 substrate in `graph_place_field.py`, and (2) a shared *diagonal-in-the-eigenbasis* spectral shape `S = (κ²I + diag(λ))^(−α)` that ties the prior `P₀ = τ²S`, the initial covariance, and the per-neuron drift `Q_c = q_c·S` together, so "smoothness" reduces to a handful of tunable scalars (`τ²`, `κ²`, per-neuron `q_c`). `τ²` and `κ²` are learnable; `q_c` is fixed by default and its learning path is experimental (Amendment 1). Neurons are conditionally independent given `Φ`, so the E-step is a `jax.vmap` of the single-neuron Laplace-EKF (dimension `rank`) over neurons using the local masked full-grid filter described in Amendment 2.
+**Architecture:** A geometry-aware Laplacian basis Phi and spectral shape
+`S=(kappa2+lambda)^(-alpha)` tie `P0=tau2*diag(S)` and per-neuron
+`Q_c=q_c*diag(S)` together. The normal graph fit uses the new shared Poisson
+joint-Laplace core (`laplace_smoothing.py`), shared RTS, and the package's parameter
+transforms, gradient compilation and result hooks through reusable bounded
+L-BFGS machinery. Exact q=0 uses a reduced deterministic state. The local masked
+Laplace filter remains for causal filtered outputs and experimental sequential
+inference. All paths preserve direct row-zero priors and full-grid transitions.
+
 
 **Tech Stack:** Python 3.10–3.12, JAX (x64), `neurospatial` (spatial substrate), `optax` (SGD), `scipy` (eigensolve, independent-optimizer parity check), `pytest` + `hypothesis`. Managed by `uv`.
 
@@ -12,9 +20,12 @@
 
 ## Implementation status & amendments (post-implementation reconciliation)
 
-**Status:** Core Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. **The PR remains incomplete: reliable automatic drift-scale estimation is the remaining merge requirement**, as requested on 2026-10-06. The section "Remaining work before merge" below is the current execution plan. The committed code is authoritative for current behavior; historical task sections and earlier acceptance decisions are superseded by the current goal and that section.
+**Status:** Core Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. **The PR remains incomplete: reliable automatic drift-scale estimation is the remaining merge requirement**, as requested on 2026-10-06. The section "Remaining work before merge" below is the current execution plan. The new automatic fitting route and joint inference are implemented on 2026-10-08; fresh statistical acceptance remains in progress. The committed code is authoritative for current behavior; historical task sections and earlier acceptance decisions are superseded by the current goal and that section.
 
-1. **Tracking and automatic drift-scale estimation are both acceptance targets.** Existing tests establish temporal field recovery with a supplied scale: they remove common baselines and each bin's temporal mean, use a scale ten times below the generator's, and cover three independent sessions. They do not establish automatic learning. Learning remains disabled by default in the current code because spatial evidence profiles were biased and EM depended on initialization; the newer scalar study shows that the default Adam budget also often misses the directly profiled objective. These are measured failures, not a proof of structural non-identifiability. The original spatial generator additionally fixes baseline drift while the model allows it. The earlier decision to exclude scale estimation from acceptance is superseded: informative, correctly specified simulations must now test scale recovery, and independent analytic-field sessions must test the resulting predictions. A validation-tuned scale is a useful comparator or separately named alternative; it must not silently replace the promised marginal-likelihood learning feature.
+The numbered amendments below record the earlier sequential implementation;
+the 2026-10-08 execution decisions supersede its default and fitting policy.
+
+1. **Tracking and automatic drift-scale estimation are both acceptance targets.** Existing tests establish temporal field recovery with a supplied scale: they remove common baselines and each bin's temporal mean, use a scale ten times below the generator's, and cover three independent sessions. They do not establish automatic learning. Before the 2026-10-08 changes, learning was disabled by default because spatial evidence profiles were biased and EM depended on initialization; the newer scalar study shows that the default Adam budget also often misses the directly profiled objective. These are measured failures, not a proof of structural non-identifiability. The original spatial generator additionally fixes baseline drift while the model allows it. The earlier decision to exclude scale estimation from acceptance is superseded: informative, correctly specified simulations must now test scale recovery, and independent analytic-field sessions must test the resulting predictions. A validation-tuned scale is a useful comparator or separately named alternative; it must not silently replace the promised marginal-likelihood learning feature.
 
 2. **Architecture: a masked full-grid filter, not the library smoother.** The E-step, `fit`, `fit_sgd`, and `score` use a new local `_masked_graph_point_process_filter` (`glm_laplace_update` + `poisson_family`) plus `rts_backward_scan`, **not** `stochastic_point_process_filter/_smoother`. It runs each neuron on the **full** time grid: out-of-bounds trajectory rows advance the latent random walk but **skip their observation update** (rather than being dropped, as the original design had it). Row 0 is conditioned **directly on `(init_mean, P₀)`** (no predict-before-first-update; see the `point_process_kalman` docstring note documenting the library filter's differing convention). `_design_and_spikes` returns `(Z, spikes, valid)`.
 
@@ -470,29 +481,89 @@ reports retain their original one-step settings; the application script accepts
 
 ## Remaining work before merge: automatic drift-scale estimation (2026-10-06)
 
-**Status:** Planned; no implementation from this section has started. Keep the PR
-open. The target is a supported fitting path that estimates q from training data
+**Status (2026-10-08):** Implementation and pilot validation complete; fresh
+statistical evaluation is running. Keep the PR open until the gates and final
+checks below pass. The target is a supported fitting path that estimates q from training data
 without requiring the user to choose a favorable initial scale or optimizer budget.
 Retain a fixed-scale option. Keep full-sequence gradients throughout this work.
 
+### Execution decisions and frozen protocol (2026-10-08)
+
+The existing sequential objective is optimized to the 0.001-nat gate in all
+60 scalar profile-initialized runs, including zero. Plain L-BFGS and Adam remain
+comparators. The joint-objective repeat also passes all 60 profile-initialized runs (maximum
+gap 5.7e-14 nat), as does plain L-BFGS (maximum gap 2.3e-6). On this same
+objective, Adam passes 10/60 at 200 steps and 36/60 at 1000 steps, against the
+expanded zero/positive search.
+A static scalar example with counts [8, 0] versus [0, 8] changes sequential
+Laplace evidence by 2.36 nats despite converged local updates. Static evidence
+must be order invariant. This establishes the need for the common joint
+Poisson Laplace smoother, which now matches independent dense modes, Hessians,
+lag moments, evidence and finite-difference derivatives.
+
+Pilots (seeds 0 and 1) fit component baseline prior means; other spatial prior
+means stay zero. Fitting every mean jointly with its initial variance can collapse
+that variance. Automatic fitting uses full-sequence profile-initialized bounded
+L-BFGS with an exact static candidate and joint inference, 49 profile points,
+three nuisance/profile rounds, 500 optimizer iterations, projected-gradient
+threshold 1e-7 per time row, and 50 joint Newton steps (residual tolerance 1e-8).
+Final conditional profiles, zero selections, convergence and numerical bound
+hits are retained. Bounds are numerical safeguards, not evidence of identification:
+field q bounds are constructor-reference S times [1e-8, 10], initial field
+variance [1e-8, 1e4], kappa2 [1e-6, 1e4*(1+max retained eigenvalue)], and baseline
+coefficients [-200, 200]. Fixed parameters remain fixed.
+
+**Pilot refinement, before final data:** With unknown kappa2, raw coefficient
+q and spectral shape trade off even when predictive field covariance is stable.
+The joint recovery target is therefore mean active-bin log-rate increment variance
+`q * sum(S) / n_bins`; known-shape recovery also reports coefficient q. Both raw
+q and kappa2 remain reported, and successful field-variance recovery must not be
+presented as separate identification of these parameters. Stored q/tau2 and
+`Q=q*diag(S)` retain their original coefficient units; per-second field diffusion
+is field variance divided by dt. The acceptance ratio remains 0.5--2.
+
+The frozen script is `notebooks/graph_place_field_learning_validation.py`.
+Fresh seeds **100--119** are independent sessions, not optimizer replicates.
+Matched conditions are linear static/slow/fast (2000 rows, three neurons,
+rank 4), branching fast (3000 rows, three neurons, rank 8), and sparse short
+(600 rows, three neurons, rank 4), at dt=0.1. Slow/fast coefficient q are
+0.0005/0.002 times neuron factors [0.7, 1, 1.5]; moderate/sparse baseline rates
+are 5/1 Hz times [0.7, 1, 1.3]. Every mode follows the Gaussian prior and
+random walk. Ten percent of one-second blocks are missing on the full grid;
+occupancy is uneven. Informative positive conditions require median session
+mean field-variance ratio 0.5--2, for both known and joint nuisance fits.
+Sparse/short cases and static false drift are reported without a recovery gate.
+Coverage, full distributions, zero fractions, profile support and cost are reported.
+
+The independent analytic application benchmark retains its 400-second,
+60/20/20 blocked train/validation/test split and 40-second burn-in. Rank is 8;
+automatic and fixed q fits use identical fitted nuisance parameters and baseline
+mean constraints. Fixed q [0, .001, .01, .1] and occupancy-map widths are chosen
+on validation only. For every declared condition, the lower paired-session 95%
+bootstrap bound versus tuned fixed q must exceed -0.02 bits/spike. On stable
+controls the same margin applies versus static; on smooth/remapping/sparse
+moving fields the lower bound versus static must exceed zero. Windowed maps
+are reported without a superiority requirement. Settings and gates are frozen
+before generating these final sessions; failures will remain failures.
+
 ### 1. Resolve optimization failures on the existing controlled problems
 
-- [ ] Extend the existing scalar study's reference search to include **q=0** and
+- [x] Extend the existing scalar study's reference search to include **q=0** and
   checks of search-range/mesh stability. Evaluate zero and positive scales with the
   same likelihood approximation and constants. A lower-bound solution is not
   successful recovery of a positive scale; report endpoints and flat profiles.
-- [ ] Compare full-sequence Adam with bounded optimization using JAX gradients
+- [x] Compare full-sequence Adam with bounded optimization using JAX gradients
   (L-BFGS-B or an equivalent line-search method), plus log-scale profile search and
   refinement. Use the same data, inference, parameters and initialization range;
   record objective gaps, stationarity/boundary conditions and runtime. Softplus
   cannot represent exactly zero; changing it to exp or adding iterations alone
   does not solve the static boundary.
-- [ ] Use broad profile initialization and an explicit static candidate in the
+- [x] Use broad profile initialization and an explicit static candidate in the
   automatic estimator. Compare every initialization with the direct reference;
   select a deterministic documented procedure. Do not declare convergence from
   small relative likelihood changes alone. Bound hits or unfinished optimization
   must remain visible in fit diagnostics.
-- [ ] Reuse the package parameter specifications/transforms, loss and finalization
+- [x] Reuse the package parameter specifications/transforms, loss and finalization
   hooks, result contracts and compilation strategy. If the winning optimizer needs
   another driver, add reusable fitting machinery rather than a notebook-only fit.
   Do not change the general Adam default solely to make this particular study pass.
@@ -505,22 +576,22 @@ optimization of this approximation, not the accuracy of the approximation itself
 
 ### 2. Separate spatial inference bias from optimization failure
 
-- [ ] Add small full-spatial problems with an independently constructed joint
+- [x] Add small full-spatial problems with an independently constructed joint
   posterior objective/Hessian and a dense or sparse SciPy MAP solve. Compare modes,
   Hessian-based Laplace covariances, evidence and q profiles with the graph path.
   Retain exact scalar integrals to measure errors in posterior moments and evidence.
-- [ ] Start with known nuisance parameters, realistic position sampling and a
+- [x] Start with known nuisance parameters, realistic position sampling and a
   fully model-matched generator: initial state and **all retained modes**, including
   component baselines, obey the stated Gaussian prior and q*S transitions. Then
   allow tau2, kappa2 and initial means to be fitted under the intended user settings.
   Profile nuisance-parameter tradeoffs; constrain/regularize them explicitly if
   the data cannot separate them. Preserve coefficient/log-rate/per-second units.
-- [ ] Ensure local Newton budgets converge in reference comparisons. If direct
+- [x] Ensure local Newton budgets converge in reference comparisons. If direct
   optimization succeeds but spatial evidence/recovery remains biased, implement
   **whole-trajectory Laplace inference**: damped Newton/IRLS at the smoothed path,
   covariance/lag moments and normalized evidence at its joint mode, with gradients
   checked independently. More per-observation iterations do not establish this.
-- [ ] Reuse the existing `TemporalRateGP` approach and the shared core design from
+- [x] Reuse the existing `TemporalRateGP` approach and the shared core design from
   [the iterated-smoother plan](iterated-parallel-laplace-smoother/PLAN.md). Implement
   only the common machinery needed for graph inference. Preserve direct row-zero
   priors, full-grid masked transitions, per-neuron independence and x64. The q=0
@@ -535,12 +606,12 @@ refactor of unrelated models are not prerequisites for this PR.
 
 ### 3. Establish statistical recovery and useful predictions
 
-- [ ] Define a small pilot matrix spanning static/slow/fast drift, moderate/sparse
+- [x] Define a small pilot matrix spanning static/slow/fast drift, moderate/sparse
   firing, short/long recordings, missing blocks and uneven occupancy. Include a
   branching graph and multiple neurons. Recovery tests use matched stochastic
   generators; analytic moving/remapping fields are for prediction under mismatch,
   where there is no single "true q" to recover.
-- [ ] Freeze case definitions, scale/rank policies, optimizer settings and thresholds
+- [x] Freeze case definitions, scale/rank policies, optimizer settings and thresholds
   after pilot diagnosis, **before** fresh final sessions. Use at least twenty
   independent final sessions per declared statistical condition; report session
   uncertainty rather than treating time bins as independent replicates.
@@ -573,12 +644,13 @@ sample and a documented change of scope; do not relabel failed acceptance as suc
 
 ### 4. Ship the validated fitting route and close the PR
 
-- [ ] Expose the successful automatic estimator as the normal documented fitting
+- [x] Expose the automatic estimator as the normal documented fitting
   route; retain explicit fixed q and identify experimental EM/Adam variants when
   they do not satisfy the same contract. Do not merely flip `update_drift_scale`
   to True while leaving the failed optimizer behavior unchanged. Specify public
   method/flag semantics and repeated-fit behavior once the winning procedure is
-  established, with a runnable constructor-default example.
+  established, with a runnable constructor-default example. Implemented; its
+  statistical support is conditional on the pending final gates.
 - [ ] Add compact regression tests for observed failure cases, leakage, boundary
   handling, numerical/optimizer convergence, initialization robustness and actual
   drift-only/joint learning. Store reproducible evaluation artifacts and update

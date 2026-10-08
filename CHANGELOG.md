@@ -18,9 +18,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Drifting graph-GP place fields** in `graph_place_field`: distance and
   inverse-distance Laplacian bases, a static penalized Poisson estimator with
   Laplace-evidence amplitude selection, and `GraphPlaceFieldModel` for masked
-  per-neuron filtering/smoothing, EM/SGD fitting, posterior field trajectories,
-  rate maps, and held-out scoring. Drift-scale learning is experimental and
-  disabled by default; field tracking is the validated target. The model uses
+  per-neuron filtering/smoothing, automatic drift-scale fitting, posterior field
+  trajectories, rate maps, and sequence evidence scoring. The normal `fit()`
+  profiles exact-zero and positive scales, then optimizes joint Laplace evidence
+  with full-sequence bounded L-BFGS. Fixed q, experimental `fit_em()`/`fit_sgd()`,
+  final conditional profiles, bound hits and convergence diagnostics remain
+  available. Component baseline prior means are free; spatial prior means stay
+  zero. Mean field-increment variance is reported separately from coefficient q
+  because q and fitted spatial shape can trade off. The model uses
   the shared fitting/result contracts and requires the `spatial` extra and x64.
 - **Public API and version at package level**: `state_space_practice.__version__`
   and lazily loaded (PEP 562) entry points — `kalman_filter`, `kalman_smoother`,

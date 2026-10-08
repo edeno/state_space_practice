@@ -533,11 +533,17 @@ def _graph_place_field_case() -> FitCase:
     trajectory = env.bin_centers[rng.integers(env.n_bins, size=40)]
     spikes = rng.poisson(0.2, size=40).astype(float)
     return FitCase(
-        GraphPlaceFieldModel(env, dt=0.02, rank=4),
+        GraphPlaceFieldModel(
+            env,
+            dt=0.02,
+            rank=4,
+            inference_method="sequential",
+            update_drift_scale=False,
+        ),
         (times, trajectory, spikes),
         lambda model, data, _: model.score(*data),
         sgd_kwargs={"optimizer": optax.adam(1e-3)},
-        em_kwargs={"verbose": False},
+        em_kwargs={"verbose": False, "method": "em"},
         repeat_kwargs={"warm_start": False},
     )
 

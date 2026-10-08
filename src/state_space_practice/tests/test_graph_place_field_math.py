@@ -41,6 +41,16 @@ neurospatial = pytest.importorskip("neurospatial")
 from neurospatial import Environment  # noqa: E402
 
 
+def _legacy_graph_model(*args, **kwargs):
+    """Keep the original sequential/EM regression targets explicit.
+
+    Automatic constructor defaults are tested in test_graph_place_field_learning.
+    """
+    kwargs.setdefault("inference_method", "sequential")
+    kwargs.setdefault("update_drift_scale", False)
+    return GraphPlaceFieldModel(*args, **kwargs)
+
+
 @pytest.fixture(scope="module")
 def math_env():
     return Environment.from_samples(np.linspace(0, 10, 201)[:, None], bin_size=2.0)
@@ -59,7 +69,7 @@ def topology_env(request, math_env):
 def test_field_prior_equals_dense_graph_resolvent(topology_env, convention, alpha):
     """The prior in field coordinates equals a matrix function of the raw graph."""
     env = topology_env
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         env, dt=0.1, kappa2=0.7, tau2=2.3, alpha=alpha, laplacian_convention=convention
     )
     laplacian = np.zeros((env.n_bins, env.n_bins))
@@ -111,7 +121,7 @@ def test_field_prior_equals_dense_graph_resolvent(topology_env, convention, alph
 def test_static_mode_curvature_and_evidence_match_independent_objective(
     math_env, n_neurons
 ):
-    model = GraphPlaceFieldModel(math_env, dt=0.1, rank=3, tau2=1.7, kappa2=0.6)
+    model = _legacy_graph_model(math_env, dt=0.1, rank=3, tau2=1.7, kappa2=0.6)
     phi = np.asarray(model.basis.eigvecs)
     occupancy = np.geomspace(0.1, 15.0, math_env.n_bins)
     occupancy[1] = 0.0
@@ -174,7 +184,7 @@ def test_static_mode_curvature_and_evidence_match_independent_objective(
 
 @pytest.fixture(scope="module")
 def gaussian_problem(math_env):
-    model = GraphPlaceFieldModel(math_env, dt=0.1, rank=3, tau2=1.3, kappa2=0.7)
+    model = _legacy_graph_model(math_env, dt=0.1, rank=3, tau2=1.3, kappa2=0.7)
     indices = [0, math_env.n_bins - 1, 1, math_env.n_bins // 2, 0]
     return dict(
         initial_mean=np.array([0.3, -0.2, 0.1]),
@@ -285,7 +295,7 @@ def test_graph_chain_matches_grid_posterior_in_declared_benign_regime(
     math_env, benign_poisson_chain, newton_steps
 ):
     p = benign_poisson_chain
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         math_env,
         dt=p["dt"],
         rank=1,
@@ -401,7 +411,7 @@ def test_one_step_and_converged_laplace_have_distinct_mathematical_targets():
 @pytest.mark.slow
 def test_default_newton_budget_reaches_unexpected_count_mode(math_env, caplog):
     """The constructor default must fix the documented one-step overshoot."""
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         math_env,
         dt=0.1,
         rank=1,
@@ -489,7 +499,7 @@ def test_multimode_poisson_update_matches_independent_scalar_projection(math_env
     Integrating only eta gives the exact full-state mean/covariance, while
     optimizing eta gives an independent full-state MAP and Laplace normalizer.
     """
-    z = np.asarray(GraphPlaceFieldModel(math_env, dt=0.2, rank=3).basis.eigvecs[0])
+    z = np.asarray(_legacy_graph_model(math_env, dt=0.2, rank=3).basis.eigvecs[0])
     mean = np.array([0.3, -0.1, 0.2])
     chol = np.array([[0.8, 0, 0], [0.2, 0.7, 0], [-0.1, 0.15, 0.6]])
     prior = chol @ chol.T
@@ -567,7 +577,7 @@ def test_multimode_poisson_update_matches_independent_scalar_projection(math_env
 def test_em_updates_maximize_independent_expected_complete_density(
     math_env, gaussian_problem, update_mean
 ):
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         math_env,
         dt=0.1,
         rank=3,
@@ -639,7 +649,7 @@ def test_em_updates_maximize_independent_expected_complete_density(
 def test_graph_hyperparameter_gradients_match_directional_finite_differences(
     math_env, newton_steps, coordinates
 ):
-    model = GraphPlaceFieldModel(
+    model = _legacy_graph_model(
         math_env, dt=0.1, rank=3, max_newton_iter=newton_steps, update_drift_scale=True
     )
     model.n_neurons = 2
@@ -698,7 +708,7 @@ def test_graph_hyperparameter_gradients_match_directional_finite_differences(
 @pytest.mark.slow
 def test_basis_coordinate_changes_preserve_field_posterior_and_evidence(topology_env):
     env = topology_env
-    model = GraphPlaceFieldModel(env, dt=0.1, rank=3)
+    model = _legacy_graph_model(env, dt=0.1, rank=3)
     model.init_mean = jnp.array([[0.4, -0.1, 0.2]])
     model.drift_scale = jnp.array([0.03])
     times = np.arange(8) * 0.1
@@ -739,9 +749,7 @@ def test_basis_coordinate_changes_preserve_field_posterior_and_evidence(topology
 def test_process_variance_scales_per_step_to_preserve_physical_time(math_env):
     results = []
     for dt, n_time in ((0.05, 9), (0.1, 5)):
-        model = GraphPlaceFieldModel(
-            math_env, dt=dt, rank=3, init_drift_scale=0.04 * dt
-        )
+        model = _legacy_graph_model(math_env, dt=dt, rank=3, init_drift_scale=0.04 * dt)
         covariance = _masked_graph_point_process_filter(
             jnp.zeros(3),
             model.prior_cov(),
