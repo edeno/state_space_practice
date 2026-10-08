@@ -2165,7 +2165,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         shape = (jnp.asarray(self.kappa2) if kappa2 is None else kappa2) + jnp.asarray(
             self.basis.eigvals
         )
-        return jnp.sum(shape ** (-self.alpha)) / self.env.n_bins
+        return jnp.sum(shape ** (-self.alpha)) / int(self.env.n_bins)
 
     @property
     def field_drift_scale_(self) -> NDArray[np.float64]:
