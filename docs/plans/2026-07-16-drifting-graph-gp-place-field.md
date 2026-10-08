@@ -482,8 +482,8 @@ reports retain their original one-step settings; the application script accepts
 ## Remaining work before merge: automatic drift-scale estimation (2026-10-06)
 
 **Status (2026-10-08):** Implementation, local checks, and fresh statistical
-acceptance complete. No PR currently exists for this local branch; hosted CI and
-final review remain before merge. The target is a supported fitting path that estimates q from training data
+acceptance complete. [PR #4](https://github.com/edeno/state_space_practice/pull/4)
+is open for review; hosted CI and final review remain before merge. The target is a supported fitting path that estimates q from training data
 without requiring the user to choose a favorable initial scale or optimizer budget.
 Retain a fixed-scale option. Keep full-sequence gradients throughout this work.
 
@@ -657,8 +657,9 @@ sample and a documented change of scope; do not relabel failed acceptance as suc
   model docs, this plan and the changelog around the supported guarantees.
 - [x] Run local graph/math/fitting-contract and affected shared-model checks,
   Ruff and mypy.
-- [ ] Open/review the PR and run hosted CI before merge. Local commits are
-  complete; no branch publication or merge has been performed.
+- [x] Publish the branch and open [PR #4](https://github.com/edeno/state_space_practice/pull/4).
+- [ ] Complete PR review and pass hosted CI before merge. CI has started;
+  the branch has not been merged.
 
 **Merge when these gates pass.** Validation-based tuning can remain a useful
 alternative, but it is not a substitute for the learning feature without an explicit
@@ -700,8 +701,9 @@ and gates are unchanged.
 Validation: **211 targeted checks**, **178 additional affected slow checks**,
 and **2454 package fast checks** (one skip) pass. The extended joint-start/masking
 regression also passes. Whole-source/notebook/script Ruff and formatting checks
-(162 files) and package mypy (49 source files) pass. Hosted CI and external review
-have not run for these local commits; no open PR was found for this branch.
+(162 files) and package mypy (49 source files) pass. Hosted CI has started on
+[PR #4](https://github.com/edeno/state_space_practice/pull/4); its results and
+external review remain pending.
 
 ## Global Constraints
 
