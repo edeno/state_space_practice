@@ -865,7 +865,8 @@ def fit_static_graph_glm(
         The basis ``Phi`` (``GraphBasis.eigvecs``).
     penalty_diag : ArrayLike, shape (rank,)
         Diagonal penalty ``P0^{-1}`` (from :func:`spectral_precision` or
-        :func:`parity_penalty`).
+        :func:`parity_penalty`). Any unpenalized modes must be identified by
+        bins with positive occupancy.
     max_iter : int, optional
         Maximum Newton iterations, by default 25.
     tol : float, optional
@@ -877,6 +878,13 @@ def fit_static_graph_glm(
         MAP coefficients.
     cov : Array, shape (rank, rank) or (n_neurons, rank, rank)
         Laplace posterior covariance (inverse Fisher + penalty) at the MAP.
+
+    Raises
+    ------
+    ValueError
+        If occupied design rows do not identify every unpenalized mode. In
+        particular, a parity fit requires visiting every graph component whose
+        constant mode is retained.
     """
     counts_np = np.asarray(counts)
     validate_count_array(counts_np, "counts", allow_empty=False)
@@ -930,6 +938,27 @@ def fit_static_graph_glm(
     counts_2d_np = counts_np[:, None] if counts_np.ndim == 1 else counts_np
     if np.any((occ_np == 0) & np.any(counts_2d_np > 0, axis=1)):
         raise ValueError("counts must be zero in bins with zero occupancy.")
+
+    # Positive penalties identify their coordinates regardless of data coverage.
+    # The observed design must identify the remaining flat-prior directions;
+    # otherwise psd_solve would hide a structurally singular Hessian with jitter.
+    unpenalized = penalty_np == 0.0
+    if np.any(unpenalized):
+        observed_free_design = Phi_np[occ_np > 0][:, unpenalized]
+        n_free = int(np.sum(unpenalized))
+        identifiable = False
+        if observed_free_design.shape[0] >= n_free:
+            column_scale = np.max(np.abs(observed_free_design), axis=0)
+            if np.all(column_scale > 0):
+                identifiable = bool(
+                    np.linalg.matrix_rank(observed_free_design / column_scale) == n_free
+                )
+        if not identifiable:
+            raise ValueError(
+                "Unpenalized modes are not identifiable from bins with positive "
+                "occupancy; visit the missing graph components, reduce the basis, "
+                "or use a positive penalty."
+            )
 
     dtype = jnp.result_type(Phi_np, occ_np, penalty_np, jnp.float32)
     Phi = jnp.asarray(Phi_np, dtype=dtype)

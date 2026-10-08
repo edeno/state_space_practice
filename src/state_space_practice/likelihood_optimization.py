@@ -65,7 +65,8 @@ def profile_scale(
     points = [0.0, *np.exp(log_grid).tolist()]
     points[1], points[-1] = lo, hi
     values = [float(objective(q)) for q in points]
-    grid_values = np.asarray(values[1:])
+    raw_grid_values = np.asarray(values[1:])
+    grid_values = np.where(np.isfinite(raw_grid_values), raw_grid_values, np.inf)
     for i in range(n_grid):
         left = grid_values[i - 1] if i else np.inf
         right = grid_values[i + 1] if i + 1 < n_grid else np.inf
@@ -75,14 +76,25 @@ def profile_scale(
             and (grid_values[i] < left or grid_values[i] < right)
         ):
             a, b = log_grid[max(i - 1, 0)], log_grid[min(i + 1, n_grid - 1)]
+
+            def refinement_objective(
+                x: float, sampled_loss: float = float(grid_values[i])
+            ) -> float:
+                loss = float(objective(float(np.exp(x))))
+                if not np.isfinite(loss):
+                    return float(np.pi / 2)
+                # A monotone, finite objective keeps unusable trials worse than
+                # the sampled minimum without inf arithmetic inside SciPy.
+                return float(np.arctan(loss - sampled_loss))
+
             result = minimize_scalar(
-                lambda x: objective(float(np.exp(x))),
+                refinement_objective,
                 bounds=(float(a), float(b)),
                 method="bounded",
                 options={"xatol": 1e-9},
             )
             points.append(float(np.exp(result.x)))
-            values.append(float(result.fun))
+            values.append(float(objective(points[-1])))
     scales, losses = np.asarray(points), np.asarray(values)
     finite = np.isfinite(losses)
     if not finite.any():

@@ -485,6 +485,77 @@ def test_static_glm_ignores_unvisited_bins(small_grid_env):
     assert np.all(np.isfinite(np.asarray(w_hat)))
 
 
+@pytest.mark.parametrize("multineuron", [False, True])
+def test_static_parity_rejects_unvisited_component(isolated_bins_env, multineuron):
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    assert basis.n_components == 2
+    counts = np.array([2.0, 0.0])
+    if multineuron:
+        counts = np.column_stack((counts, counts))
+
+    with pytest.raises(ValueError, match="Unpenalized modes are not identifiable"):
+        fit_static_graph_glm(
+            counts,
+            np.array([2.0, 0.0]),
+            basis.eigvecs,
+            parity_penalty(basis.eigvals, basis.n_components),
+        )
+
+
+def test_static_parity_recovers_rates_when_each_component_is_visited(isolated_bins_env):
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    occupancy = np.array([2.0, 3.0])
+    counts = np.array([4.0, 3.0])
+    weights, covariance = fit_static_graph_glm(
+        counts,
+        occupancy,
+        basis.eigvecs,
+        parity_penalty(basis.eigvals, basis.n_components),
+    )
+
+    rates = np.exp(basis.eigvecs @ np.asarray(weights))
+    np.testing.assert_allclose(rates, counts / occupancy, atol=1e-8)
+    hessian = basis.eigvecs.T @ (counts[:, None] * basis.eigvecs)
+    np.testing.assert_allclose(covariance, np.linalg.inv(hessian), atol=1e-8)
+
+
+def test_static_glm_positive_penalty_identifies_unvisited_mode(isolated_bins_env):
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    weights, covariance = fit_static_graph_glm(
+        np.array([2.0, 0.0]),
+        np.array([2.0, 0.0]),
+        basis.eigvecs,
+        np.array([0.0, 1e-6]),
+    )
+
+    np.testing.assert_allclose(weights, np.zeros(2), atol=1e-12)
+    np.testing.assert_allclose(covariance, np.diag([0.5, 1e6]), rtol=1e-10)
+
+
+def test_static_glm_retains_weak_proper_prior_without_observations(isolated_bins_env):
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    penalty = np.full(2, 1e-30)
+    weights, covariance = fit_static_graph_glm(
+        np.zeros(2), np.zeros(2), basis.eigvecs, penalty
+    )
+
+    np.testing.assert_allclose(weights, np.zeros(2), atol=1e-12)
+    np.testing.assert_allclose(covariance, np.diag(1 / penalty), rtol=1e-10)
+
+
+def test_static_glm_rejects_dependent_observed_unpenalized_columns():
+    phi = np.array([[0.5, 0.5], [0.5, 0.5], [1 / np.sqrt(2), -1 / np.sqrt(2)]])
+    np.testing.assert_allclose(phi.T @ phi, np.eye(2), atol=1e-12)
+
+    with pytest.raises(ValueError, match="Unpenalized modes are not identifiable"):
+        fit_static_graph_glm(
+            np.array([1.0, 1.0, 0.0]),
+            np.array([1.0, 1.0, 0.0]),
+            phi,
+            np.zeros(2),
+        )
+
+
 def test_static_glm_multineuron_matches_per_neuron(small_grid_env):
     from state_space_practice.graph_place_field import build_graph_basis
 

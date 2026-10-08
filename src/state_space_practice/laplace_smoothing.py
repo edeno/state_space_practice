@@ -179,11 +179,20 @@ def poisson_laplace_smoother(
     model with noise fixed to zero; they are not right derivatives in Q.
     Compare zero with positive-noise evidence explicitly when learning Q.
     """
+    # Use one promoted floating dtype for loop carries and both cond branches.
+    dtype = jnp.result_type(
+        mean0, covariance0, transition, noise, design, counts, jnp.float32
+    )
+    mean0, covariance0, transition, noise, design, counts = (
+        jnp.asarray(value, dtype=dtype)
+        for value in (mean0, covariance0, transition, noise, design, counts)
+    )
     n_time, rank = design.shape
+    identity = jnp.eye(rank, dtype=dtype)
     is_static = jnp.all(noise == 0)
     # vmap evaluates both cond branches. Keep the unused dynamic branch finite
     # for static neurons, including its reverse-mode derivatives.
-    safe_noise = jnp.where(is_static, jnp.eye(rank, dtype=noise.dtype), noise)
+    safe_noise = jnp.where(is_static, identity, noise)
     y = jnp.where(valid, counts, 0.0)
 
     def sites(path: Array) -> tuple[Array, Array, Array]:
@@ -288,9 +297,9 @@ def poisson_laplace_smoother(
             return matrix, matrix
 
         _last_loading, remaining = jax.lax.scan(
-            loading_step, jnp.eye(rank), None, length=n_time - 1
+            loading_step, identity, None, length=n_time - 1
         )
-        loading = jnp.concatenate((jnp.eye(rank)[None], remaining))
+        loading = jnp.concatenate((identity[None], remaining))
         prior_path = jnp.einsum("tij,j->ti", loading, mean0)
         white_loading = loading @ chol
         white_design = jnp.einsum("ti,tij->tj", design, white_loading)
@@ -302,7 +311,7 @@ def poisson_laplace_smoother(
             )
 
         def hessian(u: Array) -> Array:
-            return jnp.eye(rank) + white_design.T @ (weights(u)[:, None] * white_design)
+            return identity + white_design.T @ (weights(u)[:, None] * white_design)
 
         def target(u: Array) -> Array:
             w = weights(u)
@@ -322,7 +331,7 @@ def poisson_laplace_smoother(
             w = jnp.where(
                 valid, jnp.exp(jnp.minimum(poffset + pdesign @ u, 600.0)), 0.0
             )
-            h = jnp.eye(rank) + pdesign.T @ (w[:, None] * pdesign)
+            h = identity + pdesign.T @ (w[:, None] * pdesign)
             return cast(Array, u + jnp.linalg.solve(h, pdesign.T @ (py - w) - u))
 
         def stopped_merit(u: Array) -> Array:
@@ -339,13 +348,17 @@ def poisson_laplace_smoother(
             )
 
         u, residual, n, rejected = _iterate_mode(
-            jnp.zeros(rank), stopped_target, stopped_merit, max_iter, tolerance
+            jnp.zeros(rank, dtype=dtype),
+            stopped_target,
+            stopped_merit,
+            max_iter,
+            tolerance,
         )
         u = jax.lax.stop_gradient(u)
         exact_target = target(u)
         mode_u = u + (exact_target - jax.lax.stop_gradient(exact_target))
         h = hessian(mode_u)
-        inverse = cho_solve((jnp.linalg.cholesky(h), True), jnp.eye(rank))
+        inverse = cho_solve((jnp.linalg.cholesky(h), True), identity)
         mean = prior_path + jnp.einsum("tij,j->ti", white_loading, mode_u)
         covariance = jnp.einsum(
             "tij,jk,tlk->til", white_loading, inverse, white_loading

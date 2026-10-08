@@ -51,6 +51,43 @@ def test_joint_mode_curvature_lag_and_evidence_match_dense_reference(joint_probl
 
 @pytest.mark.slow
 @pytest.mark.parametrize("q", [0.0, 0.03])
+@pytest.mark.parametrize("mixed_precision", [False, True])
+def test_explicit_float32_inputs_with_x64_enabled(joint_problem, q, mixed_precision):
+    args = {
+        name: value.astype(jnp.float32)
+        if isinstance(value, jax.Array) and name != "valid"
+        else value
+        for name, value in joint_problem.items()
+    }
+    args["noise"] = q * jnp.eye(2, dtype=jnp.float32)
+    if mixed_precision:
+        args["covariance0"] = args["covariance0"].astype(jnp.float64)
+    expected_dtype = jnp.float64 if mixed_precision else jnp.float32
+    tolerance = 1e-8 if mixed_precision else 1e-4
+    result = poisson_laplace_smoother(**args, tolerance=tolerance)
+    reference = joint_poisson_laplace(
+        np.asarray(args["mean0"]),
+        np.asarray(args["covariance0"]),
+        np.asarray(args["noise"]),
+        np.asarray(args["design"]),
+        np.asarray(args["counts"]),
+        np.asarray(args["valid"]),
+        args["dt"],
+        np.asarray(args["transition"]),
+    )
+    assert result.relative_newton_step <= tolerance
+    assert result.n_rejected_steps == 0
+    for name in ("mean", "covariance", "cross_covariance", "log_evidence"):
+        actual = getattr(result, name)
+        assert actual.dtype == expected_dtype
+        np.testing.assert_allclose(
+            actual, getattr(reference, name), atol=5e-5, rtol=5e-5
+        )
+    assert result.relative_newton_step.dtype == expected_dtype
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("q", [0.0, 0.03])
 def test_implicit_evidence_gradients_match_finite_differences(joint_problem, q):
     def loss(theta):
         args = dict(

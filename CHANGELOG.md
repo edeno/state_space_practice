@@ -690,6 +690,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Static graph fits reject unidentifiable unpenalized modes, including parity
+  fits with an unvisited graph component, instead of returning a finite
+  covariance for a singular Hessian.
+- Joint Poisson smoothing preserves explicit float32 inputs and promotes mixed
+  input precisions consistently when x64 is enabled.
+- Drift-scale profiles refine valid basins next to non-finite samples and reject
+  unusable bounded-search trials while retaining raw evidence diagnostics.
 - Graph-field evidence selection compares separate amplitude peaks and interval
   endpoints instead of assuming a unimodal objective.
 - Graph-field EM, scoring, and SGD report exhausted Fisher line searches using
