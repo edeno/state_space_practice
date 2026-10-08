@@ -66,3 +66,71 @@ Runtime includes compilation and descriptive fitting wall time. Concurrent
 validation processes share a machine, so their times do not establish a hardware
 speedup or an isolated fit-only cost comparison. Biological recordings, arbitrary
 geometries/ranks, exact Bayesian calibration, and causal prediction remain open.
+
+## Fresh held-out prediction results (2026-10-08)
+
+All four declared conditions pass both predictive gates, with **80/80 automatic
+fits gradient-converged**. Values are mean bits/test-spike gains with paired
+session 95% bootstrap intervals. Stable fits incur a small loss versus static
+inference, well within the predeclared -0.02 margin.
+
+| Condition | Automatic versus static | Versus validation-tuned fixed q | Versus windowed map |
+| --- | --- | --- | --- |
+| stable | -0.0014 [-0.0028, -0.0003] | -0.0012 [-0.0026, -0.0002] | +0.0242 [+0.0120, +0.0397] |
+| smooth | +0.4719 [+0.4490, +0.4943] | +0.0055 [+0.0013, +0.0099] | +0.0097 [+0.0015, +0.0177] |
+| remap | +0.5277 [+0.4957, +0.5607] | +0.0031 [+0.0006, +0.0068] | +0.0270 [+0.0182, +0.0370] |
+| sparse | +0.2918 [+0.2520, +0.3290] | +0.0121 [+0.0051, +0.0200] | -0.0115 [-0.0429, +0.0204] |
+
+Automatic pointwise 95% log-rate coverage averages 92.6% (stable), 97.4%
+(smooth), 92.5% (remapping), and 92.5% (sparse). These intervals condition on
+fitted hyperparameters and do not establish exact Bayesian calibration.
+The sparse windowed-map comparison is inconclusive; its interval spans zero.
+Other conditions favor the automatic graph fit over that baseline.
+
+![Paired prediction gains](prediction_gains.svg)
+
+![Joint inference versus dense evidence](reference_evidence.svg)
+
+Generate these standalone figures and `summary.json` with:
+
+```bash
+uv run --no-sync python notebooks/graph_place_field_learning_report.py
+```
+
+## Fresh matched recovery results (2026-10-08)
+
+All six informative known/joint conditions pass the median-ratio gate, and
+**200/200 matched fits converge**. Ratios below are medians of session means
+across three neurons. The interval is a session-bootstrap interval for the mean
+field-variance ratio, not an interval for the median or an individual neuron.
+
+| Condition | Known-shape median | Joint field-variance median | Joint coefficient-q median | Joint mean-ratio 95% interval | Joint 90% coverage |
+| --- | --- | --- | --- | --- | --- |
+| linear_slow | 1.056 | 1.037 | 1.803 | [0.876, 1.186] | 87.4% |
+| linear_fast | 1.012 | 0.992 | 1.204 | [0.917, 1.110] | 88.9% |
+| branching_fast | 0.991 | 0.982 | 1.268 | [0.942, 1.070] | 89.5% |
+
+Joint coefficient medians also meet the original 0.5--2 ratio target in
+all informative conditions. That does not establish separate identification of
+q and kappa2: the full records retain their tradeoffs and error distributions.
+Joint field RMSE is 0.154 (slow), 0.219 (fast), and 0.310 (branching), close to
+the corresponding known-nuisance errors.
+
+On static controls, 63.3% of joint neuron fits choose exact zero. Positive
+estimates in the other 36.7% give a population mean field-increment variance
+of 5.0e-6 per transition; a positive point estimate alone is not a drift test.
+Spatial shape reaches a numerical bound in 14/20 static sessions.
+
+The sparse/short condition was predeclared as uninformative, without a recovery
+gate. Its joint field-variance median ratio is 0.869, but its raw-q median ratio
+is 5612, shape/amplitude bounds occur in 15/20 sessions, and nominal 90% field
+coverage is only **76.1%** (84.5% with known nuisance parameters). This is a
+material limit: field amplitude, raw scale and spatial shape should not be treated
+as jointly identified, and conditional uncertainty intervals are unreliable there.
+
+The running study loaded an early bound diagnostic that counted masked q=0
+optimizer placeholders as positive-bound hits. The stored diagnostic labels were
+corrected from the fitted physical scales, matching the current source behavior;
+fit parameters, likelihoods, convergence and gates were not altered.
+
+![Independent session recovery](recovery.svg)

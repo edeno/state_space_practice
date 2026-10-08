@@ -2094,7 +2094,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             raise ValueError(
                 "fit_sgd has nothing to optimize: all of update_kappa2, "
                 "update_drift_scale, update_amplitude, and update_init_mean are "
-                "False. Enable at least one, or use fit() for EM."
+                "False. Enable at least one, or use fit() for fixed-parameter inference."
             )
         return params, spec
 

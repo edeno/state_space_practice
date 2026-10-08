@@ -111,9 +111,14 @@ def test_joint_learning_masks_counts_and_constrains_prior_means(learning_env):
     positions[missing] = 1e6
     counts = rng.poisson(np.exp(np.linspace(-1, 2, 200)))
     results = []
-    for poison in (0, 10000):
+    for poison, initial_q in ((0, 0.0), (0, 1e-3), (10000, 1e-3)):
         model = GraphPlaceFieldModel(
-            learning_env, 0.1, rank=3, update_drift_scale=True, inference_method="joint"
+            learning_env,
+            0.1,
+            rank=3,
+            update_drift_scale=True,
+            inference_method="joint",
+            init_drift_scale=initial_q,
         )
         model.fit_mle(times, positions, np.where(missing, poison, counts))
         results.append(model)
@@ -127,12 +132,13 @@ def test_joint_learning_masks_counts_and_constrains_prior_means(learning_env):
         np.testing.assert_allclose(
             model.field_drift_scale_, np.asarray(model.drift_scale) * factor
         )
-    assert results[0].log_likelihood_ == pytest.approx(
-        results[1].log_likelihood_, abs=1e-8
-    )
-    np.testing.assert_allclose(
-        results[0].smoother_mean, results[1].smoother_mean, atol=1e-8
-    )
+    for result in results[1:]:
+        assert results[0].log_likelihood_ == pytest.approx(
+            result.log_likelihood_, abs=1e-8
+        )
+        np.testing.assert_allclose(
+            results[0].smoother_mean, result.smoother_mean, atol=1e-8
+        )
 
 
 @pytest.mark.slow
@@ -148,6 +154,9 @@ def test_fixed_scales_and_failed_refit_clear_diagnostics(learning_env, scalar_da
     model.fit_mle(*scalar_data)
     assert float(model.drift_scale[0]) == 0.02
     assert model.drift_profiles_ == ()
+    assert -model.optimizer_result_.loss * len(scalar_data[0]) == pytest.approx(
+        model.log_likelihood_, abs=1e-8
+    )
     with pytest.raises(ValueError, match="profile"):
         model.fit_mle(*scalar_data, profile_points=1)
     assert not is_set(model, "optimizer_result_")

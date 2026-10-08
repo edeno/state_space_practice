@@ -1,0 +1,338 @@
+{
+  "optimizer": {
+    "n_fits": 60,
+    "n_objective_gap_at_most_0_001": 60,
+    "maximum_objective_gap": 5.684341886080802e-14,
+    "n_gradient_converged": 60
+  },
+  "matched": {
+    "gate": true,
+    "conditions": [
+      {
+        "case": "linear_slow",
+        "method": "known",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "mean_rmse": 0.15207851322649046,
+        "mean_coverage_90": 0.8802604166666669,
+        "zero_fraction": 0.016666666666666666,
+        "median_seconds": 16.568439707974903,
+        "n_parameter_bound_hits": 0,
+        "median_field_ratio": 1.055736520946244,
+        "mean_field_ratio_interval": [
+          0.8976725187805146,
+          1.2046675121870978
+        ],
+        "median_coefficient_ratio": 1.055736520946244,
+        "informative_recovery_gate": true,
+        "field_ratio_quantiles": [
+          0.6770929421020856,
+          1.055736520946244,
+          1.4221387736341924
+        ]
+      },
+      {
+        "case": "linear_slow",
+        "method": "joint",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "mean_rmse": 0.15408139103463708,
+        "mean_coverage_90": 0.8739895833333333,
+        "zero_fraction": 0.06666666666666667,
+        "median_seconds": 39.50652260403149,
+        "n_parameter_bound_hits": 2,
+        "median_field_ratio": 1.0369055066030626,
+        "mean_field_ratio_interval": [
+          0.8759944870095676,
+          1.1859751954803006
+        ],
+        "median_coefficient_ratio": 1.8031710370742395,
+        "informative_recovery_gate": true,
+        "field_ratio_quantiles": [
+          0.5964365984062037,
+          1.0369055066030626,
+          1.4183807660840455
+        ]
+      },
+      {
+        "case": "linear_fast",
+        "method": "known",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "mean_rmse": 0.2176878294837866,
+        "mean_coverage_90": 0.8892552083333335,
+        "zero_fraction": 0.0,
+        "median_seconds": 16.533040957991034,
+        "n_parameter_bound_hits": 0,
+        "median_field_ratio": 1.0116443261094015,
+        "mean_field_ratio_interval": [
+          0.9259099218159401,
+          1.1145837077725411
+        ],
+        "median_coefficient_ratio": 1.0116443261094015,
+        "informative_recovery_gate": true,
+        "field_ratio_quantiles": [
+          0.8113024448656831,
+          1.0116443261094015,
+          1.2864711673463014
+        ]
+      },
+      {
+        "case": "linear_fast",
+        "method": "joint",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "mean_rmse": 0.21868304088982066,
+        "mean_coverage_90": 0.8885902777777777,
+        "zero_fraction": 0.0,
+        "median_seconds": 40.37083279201761,
+        "n_parameter_bound_hits": 1,
+        "median_field_ratio": 0.9924986944521641,
+        "mean_field_ratio_interval": [
+          0.9168209490295464,
+          1.110354468930625
+        ],
+        "median_coefficient_ratio": 1.20433673661561,
+        "informative_recovery_gate": true,
+        "field_ratio_quantiles": [
+          0.7640846638802898,
+          0.9924986944521641,
+          1.3128174952281622
+        ]
+      },
+      {
+        "case": "branching_fast",
+        "method": "known",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "mean_rmse": 0.3083522905233935,
+        "mean_coverage_90": 0.8969306891025642,
+        "zero_fraction": 0.0,
+        "median_seconds": 32.03754310403019,
+        "n_parameter_bound_hits": 0,
+        "median_field_ratio": 0.9910873255263064,
+        "mean_field_ratio_interval": [
+          0.9618230539157603,
+          1.0969248281543114
+        ],
+        "median_coefficient_ratio": 0.9910873255263066,
+        "informative_recovery_gate": true,
+        "field_ratio_quantiles": [
+          0.8734979138473791,
+          0.9910873255263064,
+          1.1861115882301878
+        ]
+      },
+      {
+        "case": "branching_fast",
+        "method": "joint",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "mean_rmse": 0.30952176746217874,
+        "mean_coverage_90": 0.895038862179487,
+        "zero_fraction": 0.0,
+        "median_seconds": 86.11417310452089,
+        "n_parameter_bound_hits": 0,
+        "median_field_ratio": 0.9822461736242016,
+        "mean_field_ratio_interval": [
+          0.9419084107632538,
+          1.0702435328272633
+        ],
+        "median_coefficient_ratio": 1.2680482977350906,
+        "informative_recovery_gate": true,
+        "field_ratio_quantiles": [
+          0.8532377202507866,
+          0.9822461736242016,
+          1.1514345570471463
+        ]
+      }
+    ],
+    "controls": {
+      "linear_static": {
+        "known": {
+          "n_sessions": 20,
+          "n_converged": 20,
+          "mean_rmse": 0.06995965784410077,
+          "mean_coverage_90": 0.9216979166666667,
+          "zero_fraction": 0.6166666666666667,
+          "median_seconds": 18.818030833499506,
+          "n_parameter_bound_hits": 0
+        },
+        "joint": {
+          "n_sessions": 20,
+          "n_converged": 20,
+          "mean_rmse": 0.06899964875599521,
+          "mean_coverage_90": 0.9192795138888888,
+          "zero_fraction": 0.6333333333333333,
+          "median_seconds": 42.89790574996732,
+          "n_parameter_bound_hits": 14
+        }
+      },
+      "sparse_short": {
+        "known": {
+          "n_sessions": 20,
+          "n_converged": 20,
+          "mean_rmse": 0.3671946879713735,
+          "mean_coverage_90": 0.8450308641975308,
+          "zero_fraction": 0.3333333333333333,
+          "median_seconds": 5.929988646064885,
+          "n_parameter_bound_hits": 0,
+          "median_field_ratio": 1.0126571146714536,
+          "mean_field_ratio_interval": [
+            0.7902002968279926,
+            1.6383780323063184
+          ],
+          "median_coefficient_ratio": 1.0126571146714538,
+          "informative_recovery_gate": null
+        },
+        "joint": {
+          "n_sessions": 20,
+          "n_converged": 20,
+          "mean_rmse": 0.38118081119201147,
+          "mean_coverage_90": 0.761358024691358,
+          "zero_fraction": 0.31666666666666665,
+          "median_seconds": 13.82938318757806,
+          "n_parameter_bound_hits": 15,
+          "median_field_ratio": 0.8687185905273203,
+          "mean_field_ratio_interval": [
+            0.7631419667632967,
+            1.5890288005471738
+          ],
+          "median_coefficient_ratio": 5612.391953849017,
+          "informative_recovery_gate": null
+        }
+      }
+    }
+  },
+  "application": {
+    "gate": true,
+    "conditions": [
+      {
+        "case": "stable",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "static": {
+          "mean_bits_gain": -0.0014108514161090021,
+          "interval": [
+            -0.002750460247825917,
+            -0.00030364383167156634
+          ]
+        },
+        "tuned": {
+          "mean_bits_gain": -0.0012406280874622706,
+          "interval": [
+            -0.002612776000629113,
+            -0.00015759116550392648
+          ]
+        },
+        "windowed": {
+          "mean_bits_gain": 0.024181089640792675,
+          "interval": [
+            0.012033048040382043,
+            0.039687507159404264
+          ]
+        },
+        "tuned_gate": true,
+        "static_gate": true,
+        "mean_field_rmse": 0.17511081103409415,
+        "mean_coverage_95": 0.9258333333333335,
+        "median_seconds": 47.74547360395081
+      },
+      {
+        "case": "smooth",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "static": {
+          "mean_bits_gain": 0.47194621232258954,
+          "interval": [
+            0.4490114676040902,
+            0.4943240845890617
+          ]
+        },
+        "tuned": {
+          "mean_bits_gain": 0.005499679048542433,
+          "interval": [
+            0.0012587649917264296,
+            0.009896152144644513
+          ]
+        },
+        "windowed": {
+          "mean_bits_gain": 0.009663084247258664,
+          "interval": [
+            0.0014937099508071888,
+            0.017675363246512428
+          ]
+        },
+        "tuned_gate": true,
+        "static_gate": true,
+        "mean_field_rmse": 0.46235835094996647,
+        "mean_coverage_95": 0.973888888888889,
+        "median_seconds": 41.89498887502123
+      },
+      {
+        "case": "remap",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "static": {
+          "mean_bits_gain": 0.5276768651791596,
+          "interval": [
+            0.4957305099421431,
+            0.5607008202591024
+          ]
+        },
+        "tuned": {
+          "mean_bits_gain": 0.0031368463983645206,
+          "interval": [
+            0.0005948932434518454,
+            0.006765321976717974
+          ]
+        },
+        "windowed": {
+          "mean_bits_gain": 0.02703825776809941,
+          "interval": [
+            0.018152036457555594,
+            0.037006405126779024
+          ]
+        },
+        "tuned_gate": true,
+        "static_gate": true,
+        "mean_field_rmse": 0.4308564547791417,
+        "mean_coverage_95": 0.9247916666666667,
+        "median_seconds": 38.256383708445355
+      },
+      {
+        "case": "sparse",
+        "n_sessions": 20,
+        "n_converged": 20,
+        "static": {
+          "mean_bits_gain": 0.29181907168520266,
+          "interval": [
+            0.2519956180659989,
+            0.32902781284129123
+          ]
+        },
+        "tuned": {
+          "mean_bits_gain": 0.012050356353040192,
+          "interval": [
+            0.005076407209316092,
+            0.019982408245963895
+          ]
+        },
+        "windowed": {
+          "mean_bits_gain": -0.011510378703710212,
+          "interval": [
+            -0.0429272205157881,
+            0.020404004517176905
+          ]
+        },
+        "tuned_gate": true,
+        "static_gate": true,
+        "mean_field_rmse": 0.6266673414734308,
+        "mean_coverage_95": 0.925,
+        "median_seconds": 37.400821812450886
+      }
+    ]
+  },
+  "accepted": true,
+  "limitation": "Synthetic retrospective reconstruction; neither biological identification nor exact Bayesian calibration."
+}

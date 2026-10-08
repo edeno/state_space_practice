@@ -35,7 +35,8 @@ adequate performance for every rank or geometry.
 For a supplied scale, use
 `GraphPlaceFieldModel(env, dt, update_drift_scale=False, init_drift_scale=q)`.
 `q=0` gives a reduced static-state solve with compatible evidence constants.
-Other enabled parameters still learn. Setting every `update_*` flag to False
+Other enabled parameters still learn. Also set `update_kappa2=False` to hold
+the entire positive Q covariance fixed. Setting every `update_*` flag to False
 performs inference at the supplied parameters. `fit_mle()` is the explicit alias
 for the normal estimator. `fit_em()` (or `fit(method="em")`) and `fit_sgd()`
 retain experimental alternatives; `inference_method="sequential"` retains the
@@ -57,8 +58,9 @@ variance can collapse that variance; `initial_mean_mode="full"` is experimental.
 profiling. `warm_start=False` resumes compatible stored parameters and still
 profiles drift. Failed refits clear fitted outputs and diagnostics.
 
-Check `converged_`, `optimizer_result_.gradient_norm`, `parameter_bound_hits_`,
-and `smoother_diagnostics_`. The optimizer threshold is 1e-7 per time row in
+For optimized fits, check `converged_`, `optimizer_result_.gradient_norm`, `parameter_bound_hits_`,
+and `smoother_diagnostics_`. Inference with every parameter fixed has no optimizer
+result. The optimizer threshold is 1e-7 per time row in
 transformed field-variance coordinates, with a budget of 500 per nuisance solve;
 a small relative evidence change alone does not establish convergence. Joint
 Newton inference has a 50-step cap and 1e-8 remaining-update tolerance;

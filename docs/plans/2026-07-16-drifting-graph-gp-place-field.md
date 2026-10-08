@@ -20,7 +20,7 @@ inference. All paths preserve direct row-zero priors and full-grid transitions.
 
 ## Implementation status & amendments (post-implementation reconciliation)
 
-**Status:** Core Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. **The PR remains incomplete: reliable automatic drift-scale estimation is the remaining merge requirement**, as requested on 2026-10-06. The section "Remaining work before merge" below is the current execution plan. The new automatic fitting route and joint inference are implemented on 2026-10-08; fresh statistical acceptance remains in progress. The committed code is authoritative for current behavior; historical task sections and earlier acceptance decisions are superseded by the current goal and that section.
+**Status:** Core Stages 0–2 (Tasks 1–8) are **implemented** on `feat/graph-place-field`; integrated with `master` at `3feccfc` on 2026-10-05. **Automatic drift-scale implementation and its local mathematical/statistical gates are complete (2026-10-08).** Hosted CI and final PR review remain before merge. The section "Remaining work before merge" below is the current execution plan. The automatic fitting route and joint inference passed the fresh statistical acceptance runs on 2026-10-08. The committed code is authoritative for current behavior; historical task sections and earlier acceptance decisions are superseded by the current goal and that section.
 
 The numbered amendments below record the earlier sequential implementation;
 the 2026-10-08 execution decisions supersede its default and fitting policy.
@@ -481,9 +481,9 @@ reports retain their original one-step settings; the application script accepts
 
 ## Remaining work before merge: automatic drift-scale estimation (2026-10-06)
 
-**Status (2026-10-08):** Implementation and pilot validation complete; fresh
-statistical evaluation is running. Keep the PR open until the gates and final
-checks below pass. The target is a supported fitting path that estimates q from training data
+**Status (2026-10-08):** Implementation, local checks, and fresh statistical
+acceptance complete. No PR currently exists for this local branch; hosted CI and
+final review remain before merge. The target is a supported fitting path that estimates q from training data
 without requiring the user to choose a favorable initial scale or optimizer budget.
 Retain a fixed-scale option. Keep full-sequence gradients throughout this work.
 
@@ -615,18 +615,18 @@ refactor of unrelated models are not prerequisites for this PR.
   after pilot diagnosis, **before** fresh final sessions. Use at least twenty
   independent final sessions per declared statistical condition; report session
   uncertainty rather than treating time bins as independent replicates.
-- [ ] Evaluate known-parameter fits first, then joint fits using the public default
+- [x] Evaluate known-parameter fits first, then joint fits using the public default
   automatic route. Compare estimated scales, initial-scale sensitivity, boundary
   frequency, field recovery and uncertainty coverage. In well-observed matched
   positive-q conditions, target median estimated/generating ratios between **0.5
   and 2**, while reporting the entire error distribution and information limits.
   Do not require every noisy realization to recover its generating parameter.
-- [ ] Repeat the independent blocked-holdout application benchmark, preserving the
+- [x] Repeat the independent blocked-holdout application benchmark, preserving the
   existing count-poisoning leakage tests. Hyperparameter fitting uses training
   observations only; validation is used only where a method explicitly requires
   it; final test observations cannot select the learning procedure or its settings.
   Keep the intended retrospective reconstruction task explicit.
-- [ ] Compare automatic fitting with static inference, validation-tuned fixed q
+- [x] Compare automatic fitting with static inference, validation-tuned fixed q
   under the same spatial/nuisance-parameter policy, and the time-varying occupancy
   map. Record predictive scores, full-field error, false drift, coverage and cost.
   A predeclared non-inferiority margin is **0.02 bits/spike** against tuned fixed-q
@@ -650,19 +650,58 @@ sample and a documented change of scope; do not relabel failed acceptance as suc
   to True while leaving the failed optimizer behavior unchanged. Specify public
   method/flag semantics and repeated-fit behavior once the winning procedure is
   established, with a runnable constructor-default example. Implemented; its
-  statistical support is conditional on the pending final gates.
-- [ ] Add compact regression tests for observed failure cases, leakage, boundary
+  statistical support is established by the final reports below.
+- [x] Add compact regression tests for observed failure cases, leakage, boundary
   handling, numerical/optimizer convergence, initialization robustness and actual
   drift-only/joint learning. Store reproducible evaluation artifacts and update
   model docs, this plan and the changelog around the supported guarantees.
-- [ ] Run graph/math/fitting-contract tests, checks for any touched shared inference
-  or fitting machinery, Ruff and mypy; run normal CI and obtain final review.
+- [x] Run local graph/math/fitting-contract and affected shared-model checks,
+  Ruff and mypy.
+- [ ] Open/review the PR and run hosted CI before merge. Local commits are
+  complete; no branch publication or merge has been performed.
 
 **Merge when these gates pass.** Validation-based tuning can remain a useful
 alternative, but it is not a substitute for the learning feature without an explicit
 scope decision. Real recordings, external MRF/spline parity, minibatch/time-buffer
 methods and parallel performance remain separate follow-ups. Minibatching is a
 scaling project and does not resolve the measured estimation failures.
+
+## Final automatic-estimation evidence (2026-10-08)
+
+The frozen seeds 100--119 pass every declared informative recovery and predictive
+gate. All 200 matched known/joint fits and all 80 automatic application fits
+reach the projected-gradient tolerance. Joint median field-variance recovery
+ratios are **1.037 slow, 0.992 fast, and 0.982 branching**; coefficient-q medians
+are **1.803, 1.204, and 1.268**, respectively. These satisfy the original ratio
+criterion too, while full distributions still expose shape/scale tradeoffs.
+
+Held-out automatic gains versus static are **0.472 smooth, 0.528 remapping, and
+0.292 sparse bits/spike**, with all lower paired-session 95% bounds above zero.
+Moving conditions also improve on validation-tuned fixed q (mean gains 0.003--0.012
+bits/spike). Stable-control loss versus static is 0.0014 bits/spike, well within
+the predeclared 0.02 margin. Sparse occupancy-map comparison is inconclusive;
+the other conditions favor graph fitting. This validates retrospective synthetic
+reconstruction, not causal forecasts or biological drift identification.
+
+Known/joint informative field coverage is approximately 87--90% for nominal 90%
+intervals. The sparse/short joint case has **76.1% coverage**, numerical shape/
+amplitude bounds in 15/20 sessions, and poor raw-q recovery despite a near-unit
+median field-variance ratio. It remains an explicitly uninformative condition,
+with no recovery acceptance claim. Static controls select zero in 63.3% of neuron
+fits; positive point estimates alone do not establish genuine drift.
+
+Reproducible data, settings, descriptive costs, full distributions, figures, and
+limitations are in [the validation report](../validation/graph-place-field-learning/README.md).
+The normal API and runnable constructor-default example are in
+[the usage guide](../graph-place-fields.md). The report documents the correction
+of numerical bound labels for masked static placeholders; scientific fit results
+and gates are unchanged.
+
+Validation: **211 targeted checks**, **178 additional affected slow checks**,
+and **2454 package fast checks** (one skip) pass. The extended joint-start/masking
+regression also passes. Whole-source/notebook/script Ruff and formatting checks
+(162 files) and package mypy (49 source files) pass. Hosted CI and external review
+have not run for these local commits; no open PR was found for this branch.
 
 ## Global Constraints
 

@@ -182,13 +182,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`GraphPlaceFieldModel.fit()` now estimates drift by default** with joint
+  trajectory Laplace evidence, an exact static candidate, profiles and bounded
+  L-BFGS. `update_drift_scale=True` and `inference_method="joint"` are constructor
+  defaults. Fixed q remains explicit; `fit_em()` and `fit_sgd()` retain experimental
+  optimizers. To reproduce the original graph fitting path, select sequential
+  inference, fixed drift, and `fit_em()`. `score()` uses the selected evidence
+  approximation and restarts from the fitted initial prior.
 - **`GraphPlaceFieldModel` now uses five damped Newton iterations per observation**
   by default (was one). Iterated inference logs observed bins whose remaining
   relative log-rate Newton step exceeds 1e-6, including under JIT/SGD. Explicit
   `max_newton_iter=1` preserves the previous single-step approximation. A paired
   analytic-field benchmark and an SGD-only drift-scale objective/profile study
-  record accuracy, optimization, and runtime evidence; joint spatial drift-scale
-  learning remains experimental.
+  record accuracy, optimization, and runtime evidence for the sequential path;
+  normal graph fitting now uses joint inference and bounded evidence optimization.
 - **Refitting an oscillator model restarts from the constructor's
   parameters**: `fit` (and the Gaussian models' `fit_sgd`) on
   `CorrelatedNoiseModel`, `DirectedInfluenceModel`,
