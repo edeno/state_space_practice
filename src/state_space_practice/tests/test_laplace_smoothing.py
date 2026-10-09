@@ -5,7 +5,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from state_space_practice.laplace_smoothing import poisson_laplace_smoother
+from state_space_practice import laplace_smoothing
+from state_space_practice.laplace_smoothing import (
+    _iterate_mode,
+    poisson_laplace_smoother,
+)
 from state_space_practice.tests.graph_math_reference import joint_poisson_laplace
 
 
@@ -22,7 +26,6 @@ def joint_problem():
     )
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize("q", [0.0, 0.03, 1e-8])
 def test_joint_mode_curvature_lag_and_evidence_match_dense_reference(joint_problem, q):
     args = dict(joint_problem, noise=q * jnp.eye(2))
@@ -39,6 +42,7 @@ def test_joint_mode_curvature_lag_and_evidence_match_dense_reference(joint_probl
     )
     assert result.relative_newton_step < 1e-8
     assert result.n_rejected_steps == 0
+    assert bool(result.converged)
     np.testing.assert_allclose(result.mean, reference.mean, atol=1e-7, rtol=1e-7)
     np.testing.assert_allclose(
         result.covariance, reference.covariance, atol=1e-7, rtol=1e-7
@@ -132,22 +136,33 @@ def test_static_evidence_is_order_invariant_and_continuous_at_zero():
 
 
 @pytest.mark.slow
-def test_mixed_static_dynamic_vmap_has_finite_gradients(joint_problem):
-    def loss(scales):
-        return jax.vmap(
-            lambda q: (
-                poisson_laplace_smoother(
-                    **dict(joint_problem, noise=q * jnp.eye(2))
-                ).log_evidence
-            )
-        )(scales).sum()
+def test_mixed_static_dynamic_vmap_gradients_match_unbatched(joint_problem):
+    """Batching static and dynamic neurons must not change either gradient."""
 
-    gradient = jax.grad(loss)(jnp.array([0.0, 0.03]))
-    assert np.all(np.isfinite(gradient))
-    assert abs(float(gradient[1])) > 1e-3
+    def evidence(q, shift):
+        args = dict(
+            joint_problem,
+            mean0=joint_problem["mean0"] + shift,
+            noise=q * jnp.eye(2),
+        )
+        return poisson_laplace_smoother(**args).log_evidence
+
+    scales = jnp.array([0.0, 0.03])
+    shifts = jnp.array([0.1, -0.2])
+    batched_q, batched_shift = jax.grad(
+        lambda q, m: jax.vmap(evidence)(q, m).sum(), argnums=(0, 1)
+    )(scales, shifts)
+    for i in range(2):
+        q_grad, shift_grad = jax.grad(evidence, argnums=(0, 1))(scales[i], shifts[i])
+        assert float(batched_q[i]) == pytest.approx(float(q_grad), rel=1e-10, abs=1e-12)
+        assert float(batched_shift[i]) == pytest.approx(
+            float(shift_grad), rel=1e-10, abs=1e-12
+        )
+        # Guard: both the static and the dynamic neuron carry real gradients.
+        assert abs(float(shift_grad)) > 1e-3
+    assert abs(float(batched_q[1])) > 1e-3
 
 
-@pytest.mark.slow
 def test_missing_observations_leave_full_markov_prior(joint_problem):
     args = dict(joint_problem, noise=0.03 * jnp.eye(2), valid=jnp.zeros(5, dtype=bool))
     result = poisson_laplace_smoother(**args)
@@ -168,7 +183,66 @@ def test_iteration_exhaustion_is_reported(joint_problem):
         **dict(joint_problem, noise=0.03 * jnp.eye(2)), max_iter=1
     )
     assert result.n_iterations == 1
+    assert result.n_rejected_steps == 0
     assert result.relative_newton_step > 1e-4
+    assert not bool(result.converged)
+
+
+def test_iterate_mode_stops_on_fully_rejected_line_search():
+    """A line search with no usable trial keeps the path and stops iterating."""
+    initial = jnp.zeros(2)
+
+    def target(path):
+        # Newton target of the concave merit -|path - 1|^2 below.
+        return jnp.ones_like(path)
+
+    def unusable_merit(path):
+        # Finite only at the current point; every trial step (>= 0.5**19) is
+        # non-finite, so no Armijo step can be accepted.
+        finite = -jnp.sum((path - 1.0) ** 2)
+        return jnp.where(jnp.max(jnp.abs(path)) < 1e-9, finite, jnp.nan)
+
+    path, step, n_iterations, n_rejected = _iterate_mode(
+        initial, target, unusable_merit, max_iter=50, tolerance=1e-8
+    )
+    np.testing.assert_array_equal(path, initial)
+    assert int(n_rejected) == 1
+    assert int(n_iterations) == 1  # stopped by the rejection, not by max_iter
+    assert float(step) == pytest.approx(1.0)  # the unaccepted Newton step remains
+
+    # Guard: with a finite merit the same Newton step is accepted and converges.
+    path, step, n_iterations, n_rejected = _iterate_mode(
+        initial, target, lambda p: -jnp.sum((p - 1.0) ** 2), max_iter=50, tolerance=1e-8
+    )
+    assert int(n_rejected) == 0
+    np.testing.assert_allclose(path, jnp.ones(2))
+    assert float(step) == 0.0
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("q", [0.0, 0.03])
+def test_rejected_line_search_is_never_reported_converged(
+    joint_problem, q, monkeypatch
+):
+    """A rejection makes the result unconverged even at a small Newton step."""
+    iterate = laplace_smoothing._iterate_mode
+    calls = []
+
+    def iterate_with_one_rejection(*args, **kwargs):
+        path, step, n, rejected = iterate(*args, **kwargs)
+        calls.append(None)
+        return path, step, n, rejected + 1
+
+    monkeypatch.setattr(laplace_smoothing, "_iterate_mode", iterate_with_one_rejection)
+    # The unjitted body re-traces with the patched iteration; the compiled
+    # cache is neither used nor polluted.
+    result = poisson_laplace_smoother.__wrapped__(
+        **dict(joint_problem, noise=q * jnp.eye(2))
+    )
+    assert calls  # guard: the patched iteration was used
+    assert float(result.relative_newton_step) < 1e-8  # the mode itself converged
+    assert int(result.n_rejected_steps) == 1
+    assert not bool(result.converged)
 
 
 @pytest.mark.slow
