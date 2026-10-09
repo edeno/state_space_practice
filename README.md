@@ -96,10 +96,10 @@ missing modules in:
   choice model, theta-sweep amplitude tracking, streaming filters)
 - [Spatial bandit latent roadmap](docs/plans/2026-04-05-bandit-latent-roadmap.md)
 - [Drifting graph-GP place fields](docs/plans/2026-07-16-drifting-graph-gp-place-field.md)
-  — Stages 0–2 implemented: geometry-aware static and drifting place-field
-  inference and posterior field trajectories. Automatic drift-scale fitting
-  now uses joint Laplace evidence and profile-initialized L-BFGS; fixed scales
-  and experimental EM/Adam remain available. See the [usage guide](docs/graph-place-fields.md)
+  — geometry-aware static and drifting place-field inference with posterior
+  field trajectories and automatic drift-scale fitting by joint Laplace
+  evidence (profile-initialized, bounded L-BFGS); fixed scales and experimental
+  EM/Adam fitting are also available. See the [usage guide](docs/graph-place-fields.md)
   for units and diagnostics. Richer dynamics and external estimator comparisons
   remain deferred.
 

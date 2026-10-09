@@ -23,7 +23,7 @@ positions = env.bin_centers[rng.integers(env.n_bins, size=len(times))]
 spikes = rng.poisson(np.exp(np.linspace(-1, 2, len(times))))
 model = GraphPlaceFieldModel(env, dt=0.1)
 model.fit(times, positions, spikes)
-log_rate = model.predict_log_rate_trajectory()  # neuron x time x active bin
+log_rate = model.predict_log_rate_trajectory()  # neuron 0: (n_time, n_bins)
 print(model.drift_scale, model.field_drift_scale_, model.converged_)
 ```
 
@@ -37,11 +37,16 @@ For a supplied scale, use
 `q=0` gives a reduced static-state solve with compatible evidence constants.
 Other enabled parameters still learn. Also set `update_kappa2=False` to hold
 the entire positive Q covariance fixed. Setting every `update_*` flag to False
-performs inference at the supplied parameters. `fit_mle()` is the explicit alias
-for the normal estimator. `fit_em()` (or `fit(method="em")`) and `fit_sgd()`
-retain experimental alternatives; `inference_method="sequential"` retains the
-older local Laplace filter/RTS approximation. These alternatives do not carry
-the automatic estimator's validation guarantees.
+performs inference at fixed parameters, but with the default `warm_start=True`
+the prior mean `init_mean` is first set to the static GLM MAP of the training
+data, so the fixed prior mean is data-derived. To infer at a fully supplied
+prior, set `model.init_mean` (shape `(n_neurons, rank)`) and fit with
+`warm_start=False`. `fit_mle()` is the explicit alias for the normal estimator.
+`fit_em()` (or `fit(method="em")`) and `fit_sgd()` retain experimental
+alternatives; `inference_method="sequential"` retains the older local Laplace
+filter/RTS approximation. These alternatives do not carry
+the automatic estimator's validation guarantees. `fit(verbose=...)` affects only
+`method="em"` (per-iteration log messages); the normal estimator ignores it.
 
 The coefficient model remains `P0=tau2*diag(S)`, `Q_c=q_c*diag(S)`, with
 `S=(kappa2+lambda)**(-alpha)`. Stored q and tau2 retain coefficient-variance units.
@@ -93,5 +98,4 @@ ordinary Poisson observations; `max_firing_rate_hz` clamps only the causal
 sequential filter outputs, which are retained separately as `filtered_mean` and
 `filtered_cov`. Those causal outputs differ from joint smoothed trajectories.
 
-See the [execution and acceptance plan](plans/2026-07-16-drifting-graph-gp-place-field.md#remaining-work-before-merge-automatic-drift-scale-estimation-2026-10-06)
-and [reproducible validation](validation/graph-place-field-learning/README.md).
+See the [reproducible validation](validation/graph-place-field-learning/README.md).

@@ -22,10 +22,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   trajectories, rate maps, and sequence evidence scoring. The normal `fit()`
   profiles exact-zero and positive scales, then optimizes joint Laplace evidence
   with full-sequence bounded L-BFGS. Fixed q, experimental `fit_em()`/`fit_sgd()`,
-  final conditional profiles, bound hits and convergence diagnostics remain
+  final conditional profiles, bound hits and convergence diagnostics are also
   available. Component baseline prior means are free; spatial prior means stay
   zero. Mean field-increment variance is reported separately from coefficient q
-  because q and fitted spatial shape can trade off. The model uses
+  because q and fitted spatial shape can trade off. Constructor defaults are
+  `inference_method="joint"` (joint-trajectory Laplace inference) and
+  `update_drift_scale=True`; `inference_method="sequential"` selects the local
+  Laplace filter/RTS approximation. That causal filter (which also supplies
+  `filtered_mean`/`filtered_cov` under joint inference) takes up to
+  `max_newton_iter=5` damped Newton iterations per observation and logs observed
+  bins whose remaining relative log-rate step exceeds 1e-6. `score()` uses the selected evidence
+  approximation and restarts from the fitted initial prior. The static estimator
+  rejects unpenalized modes that occupied bins cannot identify (for example, a
+  parity fit with an unvisited graph component). The model uses
   the shared fitting/result contracts and requires the `spatial` extra and x64.
 - **Public API and version at package level**: `state_space_practice.__version__`
   and lazily loaded (PEP 562) entry points — `kalman_filter`, `kalman_smoother`,
@@ -182,20 +191,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
-- **`GraphPlaceFieldModel.fit()` now estimates drift by default** with joint
-  trajectory Laplace evidence, an exact static candidate, profiles and bounded
-  L-BFGS. `update_drift_scale=True` and `inference_method="joint"` are constructor
-  defaults. Fixed q remains explicit; `fit_em()` and `fit_sgd()` retain experimental
-  optimizers. To reproduce the original graph fitting path, select sequential
-  inference, fixed drift, and `fit_em()`. `score()` uses the selected evidence
-  approximation and restarts from the fitted initial prior.
-- **`GraphPlaceFieldModel` now uses five damped Newton iterations per observation**
-  by default (was one). Iterated inference logs observed bins whose remaining
-  relative log-rate Newton step exceeds 1e-6, including under JIT/SGD. Explicit
-  `max_newton_iter=1` preserves the previous single-step approximation. A paired
-  analytic-field benchmark and an SGD-only drift-scale objective/profile study
-  record accuracy, optimization, and runtime evidence for the sequential path;
-  normal graph fitting now uses joint inference and bounded evidence optimization.
 - **Refitting an oscillator model restarts from the constructor's
   parameters**: `fit` (and the Gaussian models' `fit_sgd`) on
   `CorrelatedNoiseModel`, `DirectedInfluenceModel`,
@@ -690,19 +685,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Static graph fits reject unidentifiable unpenalized modes, including parity
-  fits with an unvisited graph component, instead of returning a finite
-  covariance for a singular Hessian.
-- Joint Poisson smoothing preserves explicit float32 inputs and promotes mixed
-  input precisions consistently when x64 is enabled.
-- Drift-scale profiles refine valid basins next to non-finite samples and reject
-  unusable bounded-search trials while retaining raw evidence diagnostics.
-- Graph-field evidence selection compares separate amplitude peaks and interval
-  endpoints instead of assuming a unimodal objective.
-- Graph-field EM, scoring, and SGD report exhausted Fisher line searches using
-  observed-row counts; masked rows are excluded from the failure fraction.
-- Graph-field filtering and static Newton fits reuse compiled kernels across
-  repeated calls and parameter changes.
 - **Hamiltonian `fit_sgd` gradient memory no longer scales with the MLP
   size**: the EKF predict steps inside the Hamiltonian filter and smoother
   scans (`run_ekf_filter` / `run_ekf_smoother` and the switching
