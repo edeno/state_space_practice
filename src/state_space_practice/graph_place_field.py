@@ -526,6 +526,18 @@ def _bin_ids(
     return np.asarray(ids, dtype=np.int_)
 
 
+def _validate_interpolation(interpolation: str) -> None:
+    if interpolation not in ("nearest", "linear"):
+        raise ValueError(
+            f"interpolation must be 'nearest' or 'linear', got {interpolation!r}."
+        )
+    if interpolation == "linear":
+        raise NotImplementedError(
+            "linear interpolation is not implemented; only nearest-bin lookup is "
+            "supported."
+        )
+
+
 def graph_design_matrix(
     env: Environment,
     basis: GraphBasis,
@@ -558,16 +570,7 @@ def graph_design_matrix(
     valid : NDArray[bool], shape (n_time,)
         ``True`` where the sample fell inside the environment.
     """
-    if interpolation not in ("nearest", "linear"):
-        raise ValueError(
-            f"interpolation must be 'nearest' or 'linear', got {interpolation!r}."
-        )
-    if interpolation == "linear":
-        raise NotImplementedError(
-            "linear interpolation is not implemented; only nearest-bin lookup is "
-            "supported."
-        )
-
+    _validate_interpolation(interpolation)
     _check_basis_matches_env(env, basis)
     bin_ids = _bin_ids(env, times, trajectory)
     valid = bin_ids >= 0
@@ -1564,7 +1567,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         alpha: float = 1.0,
         tau2: float = 1.0,
         init_drift_scale: float = 1e-3,
-        interpolation: str = "nearest",
+        interpolation: Literal["nearest"] = "nearest",
         laplacian_convention: LaplacianConvention = "distance",
         update_drift_scale: bool = True,
         update_amplitude: bool = True,
@@ -1653,18 +1656,16 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_smoother_iter = validate_int(
             max_smoother_iter, "max_smoother_iter", positive=True
         )
-        if not kappa2 > 0:
-            raise ValueError(f"kappa2 must be positive, got {kappa2}.")
-        if not tau2 > 0:
-            raise ValueError(f"tau2 must be positive, got {tau2}.")
-        if not alpha > 0:
-            raise ValueError(f"alpha must be positive, got {alpha}.")
-        if not init_drift_scale >= 0:
-            raise ValueError(f"init_drift_scale must be >= 0, got {init_drift_scale}.")
-        if not max_firing_rate_hz > 0:  # also rejects NaN, matching the checks above
-            raise ValueError(
-                f"max_firing_rate_hz must be positive, got {max_firing_rate_hz}."
-            )
+        kappa2 = validate_scalar(kappa2, "kappa2", positive=True)
+        tau2 = validate_scalar(tau2, "tau2", positive=True)
+        alpha = validate_scalar(alpha, "alpha", positive=True)
+        init_drift_scale = validate_scalar(
+            init_drift_scale, "init_drift_scale", nonnegative=True
+        )
+        max_firing_rate_hz = validate_scalar(
+            max_firing_rate_hz, "max_firing_rate_hz", positive=True
+        )
+        _validate_interpolation(interpolation)
         if isinstance(max_newton_iter, bool) or not isinstance(
             max_newton_iter, (int, np.integer)
         ):

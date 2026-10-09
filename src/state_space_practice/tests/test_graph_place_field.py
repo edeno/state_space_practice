@@ -796,6 +796,21 @@ def test_model_rejects_bad_hyperparameters(small_grid_env):
         legacy_graph_model(small_grid_env, dt=0.02, alpha=0.0)
 
 
+@pytest.mark.parametrize(
+    "name", ["kappa2", "tau2", "alpha", "init_drift_scale", "max_firing_rate_hz"]
+)
+def test_model_rejects_nonfinite_hyperparameters(small_grid_env, name):
+    with pytest.raises(ValueError, match=name):
+        legacy_graph_model(small_grid_env, dt=0.02, **{name: np.inf})
+
+
+def test_model_rejects_unsupported_interpolation_at_construction(small_grid_env):
+    with pytest.raises(ValueError, match="interpolation"):
+        legacy_graph_model(small_grid_env, dt=0.02, interpolation="cubic")
+    with pytest.raises(NotImplementedError, match="linear"):
+        legacy_graph_model(small_grid_env, dt=0.02, interpolation="linear")
+
+
 # -------------------------------------------------------- E-step (masked filter)
 def _toy_trajectory(env, n_time, seed=0):
     """A trajectory that visits real bin centers (so all rows are in-bounds)."""
