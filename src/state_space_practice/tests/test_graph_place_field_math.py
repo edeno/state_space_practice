@@ -696,9 +696,12 @@ def test_graph_hyperparameter_gradients_match_directional_finite_differences(
 
 
 @pytest.mark.slow
-def test_basis_coordinate_changes_preserve_field_posterior_and_evidence(topology_env):
+@pytest.mark.parametrize("inference_method", ["sequential", "joint"])
+def test_basis_coordinate_changes_preserve_field_posterior_and_evidence(
+    topology_env, inference_method
+):
     env = topology_env
-    model = legacy_graph_model(env, dt=0.1, rank=3)
+    model = legacy_graph_model(env, dt=0.1, rank=3, inference_method=inference_method)
     model.init_mean = jnp.array([[0.4, -0.1, 0.2]])
     model.drift_scale = jnp.array([0.03])
     times = np.arange(8) * 0.1
@@ -733,6 +736,7 @@ def test_basis_coordinate_changes_preserve_field_posterior_and_evidence(topology
     )
     np.testing.assert_allclose(changed_variance, variance, atol=1e-10)
     assert changed_evidence == pytest.approx(evidence, abs=1e-10)
+    assert np.isfinite(evidence)  # guard: joint inference converged (else -inf)
 
 
 @pytest.mark.slow

@@ -340,3 +340,58 @@ def test_joint_fit_attributes_filter_nonconvergence_to_causal_outputs(
     for message in messages:
         assert "filtered_mean" in message
         assert "posterior and evidence" not in message
+
+
+@pytest.mark.slow
+def test_static_candidate_replaces_positive_profile_choice(learning_env, monkeypatch):
+    """Re-optimized zero drift wins over the profile's positive scale here.
+
+    The single-round profile at the warm-start nuisance parameters prefers a
+    small positive q, but L-BFGS of the static candidate reaches at least the
+    positive-drift evidence, so the fit must store exact zero drift.
+    """
+    rng = np.random.default_rng(0)
+    n_time = 100
+    bins = rng.integers(learning_env.n_bins, size=n_time)
+    positions = np.asarray(learning_env.bin_centers)[bins]
+    rate_hz = 20 * np.exp(-((np.arange(learning_env.n_bins) - 2.5) ** 2) / 4)
+    counts = rng.poisson(rate_hz[bins] * 0.1).astype(float)  # stationary field
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+
+    profile_scales, candidates = [], []
+    profile, optimize = model._profile_drift, model._fit_lbfgs_prepared
+
+    def recording_profile(*args, **kwargs):
+        profiles = profile(*args, **kwargs)
+        profile_scales.append([p.scale for p in profiles])
+        return profiles
+
+    def recording_optimize(*args, **kwargs):
+        static = bool(jnp.all(model._mle_static_mask))
+        result = optimize(*args, **kwargs)
+        candidates.append((static, model.log_likelihood_))
+        return result
+
+    monkeypatch.setattr(model, "_profile_drift", recording_profile)
+    monkeypatch.setattr(model, "_fit_lbfgs_prepared", recording_optimize)
+    model.fit_mle(
+        np.arange(n_time) * 0.1,
+        positions,
+        counts,
+        profile_rounds=1,
+        profile_points=9,
+    )
+
+    # Guard: the round profile chose positive drift, so the positive-drift
+    # optimization ran first and the static candidate then competed with it.
+    assert profile_scales[0][0] > 0
+    assert [static for static, _ in candidates] == [False, True]
+    (_, positive_ll), (_, static_ll) = candidates
+    assert static_ll >= positive_ll - 1e-6
+
+    assert float(model.drift_scale[0]) == 0.0
+    assert bool(jnp.all(model._mle_static_mask))
+    assert "drift_scale" not in model.parameter_bound_hits_
+    assert model.converged_
+    assert model.log_likelihood_ == static_ll
+    assert model.drift_profiles_[0].scale == 0  # final diagnostic profile agrees

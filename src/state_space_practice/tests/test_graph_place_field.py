@@ -1264,8 +1264,11 @@ def test_missing_positions_keep_timeline_and_validate_observation_count(
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("inference_method", ["sequential", "joint"])
 @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
-def test_masked_spike_counts_cannot_leak_into_fitted_fields(small_grid_env, method):
+def test_masked_spike_counts_cannot_leak_into_fitted_fields(
+    small_grid_env, method, inference_method
+):
     """Held-out spikes must not affect warm starts, fitting, or smoothing."""
     times, trajectory = _toy_trajectory(small_grid_env, 100, seed=63)
     spikes = np.random.default_rng(64).poisson(0.3, size=100).astype(float)
@@ -1275,7 +1278,9 @@ def test_masked_spike_counts_cannot_leak_into_fitted_fields(small_grid_env, meth
     poisoned[heldout] = 1000.0
 
     def fit(counts):
-        model = legacy_graph_model(small_grid_env, dt=0.02, rank=6)
+        model = legacy_graph_model(
+            small_grid_env, dt=0.02, rank=6, inference_method=inference_method
+        )
         if method == "fit":
             model.fit_em(times, trajectory, counts, max_iter=3, verbose=False)
         else:
