@@ -41,6 +41,7 @@ from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.likelihood_optimization import (
     LikelihoodOptimum,
     minimize_likelihood,
+    warn_if_unconverged,
 )
 from state_space_practice.parameter_transforms import (
     ParameterTransform,
@@ -440,13 +441,14 @@ class SGDFittableMixin:
     #: training objective).
     log_likelihood_: FittedAttribute[float] = FittedAttribute()
     #: The last fit's trajectory: one log-likelihood per accepted EM E-step,
-    #: or the per-step SGD training objective (log-likelihood plus any
-    #: penalty term).
+    #: or the training objective (log-likelihood plus any penalty term) per
+    #: SGD step or per accepted L-BFGS iterate (starting point included).
     log_likelihood_history_: FittedAttribute[list[float]] = FittedAttribute()
     #: Length of ``log_likelihood_history_`` after an EM fit (EM's final
     #: synchronising E-step can make it ``max_iter + 1``); ``None`` before
-    #: fitting and after ``fit_sgd``.
+    #: fitting and after ``fit_sgd``/``fit_lbfgs``.
     n_iter_: int | None = None
+    #: L-BFGS result with projected-gradient diagnostics (``fit_lbfgs``).
     optimizer_result_: FittedAttribute[LikelihoodOptimum] = FittedAttribute()
 
     def _build_param_spec(
@@ -580,19 +582,19 @@ class SGDFittableMixin:
     ) -> None:
         """Record a finished fit, replacing whatever an earlier fit recorded.
 
-        Every ``fit`` (EM) and ``fit_sgd`` calls this, so switching fitters
-        never leaves the previous fitter's results behind.
+        Every fitter (EM ``fit``, ``fit_sgd``, ``fit_lbfgs``) calls this, so
+        switching fitters never leaves the previous fitter's results behind.
 
         Parameters
         ----------
         log_likelihoods : list[float]
             The fit's history (``log_likelihood_history_``): per-iteration EM
-            log-likelihoods, or per-step SGD training objective (the
-            log-likelihood plus any penalty term).
+            log-likelihoods, or the training objective (the log-likelihood
+            plus any penalty term) per SGD step or accepted L-BFGS iterate.
         converged : bool
             Whether the fit met its convergence criterion (``converged_``).
         n_iter : int or None
-            EM iterations (``n_iter_``); ``None`` for SGD.
+            EM iterations (``n_iter_``); ``None`` for gradient fitters.
         log_likelihood : float or None
             Log-likelihood at the stored parameters (``log_likelihood_``).
             Defaults to the last history entry; with an empty history and no
@@ -840,16 +842,18 @@ class SGDFittableMixin:
         per-time-row transformed coordinates. Other arguments go through the
         same data, parameter and final-inference hooks as ``fit_sgd``. Stores
         projected-gradient/budget diagnostics in ``optimizer_result_``; a small
-        relative objective change alone is not reported as convergence.
+        relative objective change alone is not reported as convergence, and a
+        fit that does not converge emits a ``StateSpaceWarning``.
         """
         max_iter = validate_int(kwargs.pop("max_iter", 500), "max_iter", positive=True)
         tolerance = validate_scalar(
             kwargs.pop("gradient_tolerance", 1e-7), "gradient_tolerance", positive=True
         )
         args, kwargs = self._prepare_sgd_data(*args, **kwargs)
-        self._fit_lbfgs_prepared(
+        result = self._fit_lbfgs_prepared(
             args, kwargs, max_iter=max_iter, gradient_tolerance=tolerance
         )
+        warn_if_unconverged(result, f"{type(self).__name__}.fit_lbfgs")
         return self.log_likelihood_history_
 
     # Declared as ``(*args, **kwargs)`` so subclasses can replace the data

@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     STOCHASTIC_ROW,
@@ -150,6 +151,14 @@ def test_lbfgs_uses_shared_transforms_and_result_contract(model_class):
     model.fit_sgd(jnp.array(3.0), num_steps=1)
     with pytest.raises(RuntimeError):
         _ = model.optimizer_result_
+
+
+@pytest.mark.slow
+def test_lbfgs_warns_when_budget_is_exhausted():
+    model = _ToyModel(scale=0.1)
+    with pytest.warns(StateSpaceWarning, match="did not converge"):
+        model.fit_lbfgs(jnp.array(3.0), max_iter=1)
+    assert not model.converged_
 
 
 class _UnconstrainedToyModel(_ToyModel):

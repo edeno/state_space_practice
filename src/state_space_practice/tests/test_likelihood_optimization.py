@@ -124,3 +124,30 @@ def test_budget_exhaustion_is_not_likelihood_convergence():
     assert result.loss < objective(np.array([-1.0, 1.0]))[0]
     assert result.gradient_norm > 1e-3
     assert not result.converged
+
+
+def test_profile_counts_unusable_evaluations():
+    def objective(q):
+        return np.nan if q > 1e-3 else (q - 1e-3) ** 2 + 1
+
+    result = profile_scale(objective, bounds=(1e-8, 10.0), n_grid=9)
+    assert result.n_nonfinite > 0
+    assert result.n_nonfinite == int(np.sum(result.scales > 1e-3))
+    assert profile_scale(lambda q: q**2 + 1).n_nonfinite == 0
+
+
+def test_optimizer_history_records_accepted_iterates_only():
+    """Line-search trials, including unusable ones, are not likelihood history."""
+
+    def objective(x):
+        if x[0] > 2.5:
+            return np.inf, np.array([2 * (x[0] - 3)])
+        return float((x[0] - 3) ** 2), np.array([2 * (x[0] - 3)])
+
+    result = minimize_likelihood(objective, np.array([0.0]))
+    history = np.asarray(result.loss_history)
+    assert np.all(np.isfinite(history))
+    assert np.all(np.diff(history) <= 0)
+    assert len(history) == result.n_iter + 1
+    assert history[0] == 9.0
+    assert history[-1] == result.loss

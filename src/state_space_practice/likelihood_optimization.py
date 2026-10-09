@@ -4,18 +4,34 @@ These routines operate on caller-supplied objectives. They do not change the
 inference approximation or declare a finite profile to be a global proof.
 """
 
+import warnings
 from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import minimize, minimize_scalar
+from scipy.optimize import OptimizeResult, minimize, minimize_scalar
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.utils import validate_int, validate_scalar
 
 
 class ScaleProfile(NamedTuple):
-    """Minimum negative log likelihood, including the exact zero-scale candidate."""
+    """Minimum negative log likelihood, including the exact zero-scale candidate.
+
+    Attributes
+    ----------
+    scale, loss : float
+        Selected scale and its loss.
+    scales, losses : NDArray, shape (n_evaluated,)
+        Every evaluated scale (zero, the log grid, then refinements) and loss.
+    at_upper_bound : bool
+        Whether the selected scale is the upper grid bound.
+    flat : bool
+        Whether all finite losses agree within the objective tolerance.
+    n_nonfinite : int
+        Number of evaluations whose loss was non-finite and was skipped.
+    """
 
     scale: float
     loss: float
@@ -23,10 +39,16 @@ class ScaleProfile(NamedTuple):
     losses: NDArray[np.float64]
     at_upper_bound: bool
     flat: bool
+    n_nonfinite: int
 
 
 class LikelihoodOptimum(NamedTuple):
-    """Result with explicit projected-gradient and finite-iteration diagnostics."""
+    """Result with explicit projected-gradient and finite-iteration diagnostics.
+
+    ``gradient_norm`` is the max-abs projected gradient. ``loss_history`` holds
+    the starting loss and the loss after each accepted iteration (length
+    ``n_iter + 1``); line-search trials are not included.
+    """
 
     parameters: NDArray[np.float64]
     loss: float
@@ -35,6 +57,18 @@ class LikelihoodOptimum(NamedTuple):
     n_iter: int
     loss_history: list[float]
     message: str
+
+
+def warn_if_unconverged(result: LikelihoodOptimum, name: str) -> None:
+    """Emit a ``StateSpaceWarning`` when ``result`` did not converge."""
+    if not result.converged:
+        warnings.warn(
+            f"{name}: L-BFGS did not converge ({result.message}); max-abs "
+            f"projected gradient {result.gradient_norm:.3g}. Increase max_iter "
+            "or inspect optimizer_result_.",
+            StateSpaceWarning,
+            stacklevel=3,
+        )
 
 
 def profile_scale(
@@ -109,6 +143,7 @@ def profile_scale(
         losses,
         bool(scales[index] == hi),
         bool(np.ptp(losses[finite]) <= tolerance),
+        int(np.sum(~finite)),
     )
 
 
@@ -141,8 +176,12 @@ def minimize_likelihood(
     def evaluate(x: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
         loss, gradient = value_and_gradient(x)
         last[:] = [(np.array(x), float(loss), np.asarray(gradient, dtype=float))]
-        history.append(float(loss))
+        if not history:
+            history.append(float(loss))
         return float(loss), np.asarray(gradient, dtype=float)
+
+    def record(intermediate_result: OptimizeResult) -> None:
+        history.append(float(intermediate_result.fun))
 
     result = minimize(
         evaluate,
@@ -150,6 +189,7 @@ def minimize_likelihood(
         jac=True,
         method="L-BFGS-B",
         bounds=bounds,
+        callback=record,
         options={"maxiter": max_iter, "gtol": tolerance, "ftol": 1e-14, "maxls": 40},
     )
     x = np.asarray(result.x)
@@ -158,7 +198,6 @@ def minimize_likelihood(
         _, loss, gradient = last[0]
     else:
         loss, gradient = value_and_gradient(x)
-    history.append(float(loss))
     projected = np.asarray(gradient).copy()
     if bounds is not None:
         lo, hi = (
