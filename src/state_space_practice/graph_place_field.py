@@ -36,6 +36,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import warnings
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
@@ -56,14 +57,22 @@ from state_space_practice.em_driver import (
     run_em,
     snapshot_attributes,
 )
-from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.kalman import process_cov_residual_form, rts_backward_scan
 from state_space_practice.laplace_smoothing import (
     LaplaceTrajectoryResult,
     poisson_laplace_smoother,
 )
-from state_space_practice.likelihood_optimization import ScaleProfile, profile_scale
+from state_space_practice.likelihood_optimization import (
+    ScaleProfile,
+    profile_scale,
+    warn_if_unconverged,
+)
 from state_space_practice.point_process_kalman import (
     _log_line_search_failures,
     _validate_filter_numerics,
@@ -295,9 +304,7 @@ def _laplacian_key(
     return int(matrix.shape[0]), int(matrix.nnz), digest.hexdigest()
 
 
-def _env_key(
-    env: Environment, convention: LaplacianConvention
-) -> tuple[int, int, str]:
+def _env_key(env: Environment, convention: LaplacianConvention) -> tuple[int, int, str]:
     """Fingerprint of ``env`` under the requested Laplacian convention."""
     return _laplacian_key(build_graph_laplacian(env, convention), convention)
 
@@ -2248,6 +2255,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         mean option is experimental because freely fitting every prior mean can
         collapse the fitted initial-state variance.
         """
+        start = snapshot_attributes(
+            self, ("kappa2", "tau2", "init_mean", "drift_scale", "n_neurons", "_n_time")
+        )
         self._clear_fit_state()
         try:
             return self._fit_mle(
@@ -2264,6 +2274,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             )
         except Exception:
             self._clear_fit_state()
+            restore_attributes(self, start)
             raise
         finally:
             self._mle_field_coordinates = False
@@ -2379,12 +2390,14 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.init_mean = self.init_mean.at[:, self.basis.n_components :].set(0.0)
         histories: list[float] = []
         profiles: tuple[ScaleProfile, ...] = ()
+        n_unusable = 0
         for _round in range(profile_rounds if self.update_drift_scale else 1):
             assert self.init_mean is not None and self.drift_scale is not None
             if self.update_drift_scale:
                 profiles = self._profile_drift(
                     Z, spk, valid, drift_bounds, profile_points
                 )
+                n_unusable += sum(p.n_nonfinite for p in profiles)
                 factor = float(self._field_shape_factor())
                 chosen = jnp.asarray([p.scale for p in profiles]) / factor
                 self._mle_static_mask = chosen == 0
@@ -2412,6 +2425,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 "init_mean",
                 "drift_scale",
                 "_mle_static_mask",
+                "_mle_field_coordinates",
+                "_mle_baseline_mean",
                 "_is_fitted",
                 "log_likelihoods",
                 "log_likelihood_",
@@ -2426,20 +2441,31 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.drift_scale = jnp.full(self.n_neurons, drift_bounds[0])
             if self.update_amplitude:
                 self.tau2 = max(self.tau2, 0.1 / float(self._field_shape_factor()))
-            static_result = self._fit_lbfgs_prepared(
-                args,
-                {},
-                max_iter=max_iter,
-                gradient_tolerance=tolerance,
-                bounds=self._mle_parameter_bounds(drift_bounds)[0],
-            )
-            histories.extend(self.log_likelihood_history_)
-            if self.log_likelihood_ >= positive_ll - 1e-6:
-                result = static_result
-            else:
+            try:
+                static_result = self._fit_lbfgs_prepared(
+                    args,
+                    {},
+                    max_iter=max_iter,
+                    gradient_tolerance=tolerance,
+                    bounds=self._mle_parameter_bounds(drift_bounds)[0],
+                )
+            except NonFiniteLikelihoodError as error:
                 restore_attributes(self, positive_state)
+                warnings.warn(
+                    f"The zero-drift candidate was unusable ({error}); keeping "
+                    "the positive-drift fit.",
+                    StateSpaceWarning,
+                    stacklevel=3,
+                )
+            else:
+                histories.extend(self.log_likelihood_history_)
+                if self.log_likelihood_ >= positive_ll - 1e-6:
+                    result = static_result
+                else:
+                    restore_attributes(self, positive_state)
         if self.update_drift_scale:
             profiles = self._profile_drift(Z, spk, valid, drift_bounds, profile_points)
+            n_unusable += sum(p.n_nonfinite for p in profiles)
         self.drift_profiles_ = profiles
         bounds, names = self._mle_parameter_bounds(drift_bounds)
         lo, hi = np.asarray(bounds).T
@@ -2458,10 +2484,22 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         )
         self.optimizer_result_ = result
         self.log_likelihoods = histories
-        if any(p.at_upper_bound for p in profiles):
-            logger.warning(
-                "Drift scale profile reached its upper bound; expand drift_bounds."
+        if n_unusable:
+            warnings.warn(
+                f"{n_unusable} drift profile evaluations had unconverged or "
+                "non-finite evidence and were skipped, so the selected drift "
+                "scale may be biased. Increase max_smoother_iter (currently "
+                f"{self.max_smoother_iter}).",
+                StateSpaceWarning,
+                stacklevel=3,
             )
+        if any(p.at_upper_bound for p in profiles):
+            warnings.warn(
+                "Drift scale profile reached its upper bound; expand drift_bounds.",
+                StateSpaceWarning,
+                stacklevel=3,
+            )
+        warn_if_unconverged(result, "GraphPlaceFieldModel.fit_mle")
         return histories
 
     def _mle_parameter_bounds(
@@ -2734,4 +2772,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 "trajectory contains no in-bounds observations for this environment; "
                 "the marginal log-likelihood would depend on no data."
             )
-        return -float(self._forward_loss(self._current_params(), Z, spk, valid))
+        loss = float(self._forward_loss(self._current_params(), Z, spk, valid))
+        if not np.isfinite(loss):
+            raise NonFiniteLikelihoodError(
+                "Held-out log-likelihood is non-finite: joint Laplace inference "
+                "did not converge within max_smoother_iter="
+                f"{self.max_smoother_iter} for at least one neuron, or the "
+                "evidence overflowed. Increase max_smoother_iter (x64 required)."
+            )
+        return -loss

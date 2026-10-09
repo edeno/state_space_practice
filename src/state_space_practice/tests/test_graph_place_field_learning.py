@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 from scipy.optimize import minimize_scalar
 
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 from state_space_practice.fitted_state import is_set
 from state_space_practice.graph_place_field import GraphPlaceFieldModel
 from state_space_practice.tests.graph_helpers import line_env
@@ -241,3 +245,65 @@ def test_unconverged_joint_evidence_is_rejected(learning_env):
         model.fit(times, positions, np.array([8.0, 0.0]), warm_start=False)
     assert not model._is_fitted
     assert not is_set(model, "smoother_diagnostics_")
+
+
+@pytest.mark.slow
+def test_score_raises_when_joint_inference_is_unconverged(learning_env, scalar_data):
+    model = scalar_model(learning_env, 0.03)
+    model.update_drift_scale = False
+    model.fit_mle(*scalar_data, warm_start=False)
+    assert np.isfinite(model.score(*scalar_data))
+    model.max_smoother_iter = 2
+    with pytest.raises(NonFiniteLikelihoodError, match="max_smoother_iter"):
+        model.score(*scalar_data)
+
+
+@pytest.mark.slow
+def test_profile_warns_about_unconverged_scales(learning_env, scalar_data):
+    model = scalar_model(learning_env, 0.03)
+    model.max_smoother_iter = 4
+    with pytest.warns(StateSpaceWarning, match="drift profile"):
+        model.fit_mle(*scalar_data, warm_start=False)
+    assert model.drift_profiles_[0].n_nonfinite > 0
+
+
+@pytest.mark.slow
+def test_fit_warns_when_optimizer_budget_is_exhausted(learning_env, scalar_data):
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+    with pytest.warns(StateSpaceWarning, match="did not converge"):
+        model.fit(*scalar_data, max_iter=1, profile_rounds=1, profile_points=5)
+    assert not model.converged_
+
+
+@pytest.mark.slow
+def test_failed_fit_restores_starting_hyperparameters(learning_env, scalar_data):
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+    model.max_smoother_iter = 2
+    start = (model.kappa2, model.tau2, model.init_mean, model.drift_scale)
+    with pytest.raises(ValueError, match="finite likelihood"):
+        model.fit(*scalar_data, profile_points=5, profile_rounds=1)
+    assert (model.kappa2, model.tau2, model.init_mean, model.drift_scale) == start
+    assert not model._is_fitted
+
+
+@pytest.mark.slow
+def test_unusable_static_candidate_keeps_positive_fit(
+    learning_env, scalar_data, monkeypatch
+):
+    model = scalar_model(learning_env, 0.03)
+    optimize = model._fit_lbfgs_prepared
+
+    def static_candidate_fails(*args, **kwargs):
+        mask = model._mle_static_mask
+        if mask is not None and bool(jnp.all(mask)):
+            # Same contract as an unusable evidence evaluation.
+            model._clear_fit_state()
+            raise NonFiniteLikelihoodError("L-BFGS initial objective is non-finite.")
+        return optimize(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_fit_lbfgs_prepared", static_candidate_fails)
+    with pytest.warns(StateSpaceWarning, match="zero-drift candidate"):
+        model.fit_mle(*scalar_data, warm_start=False)
+    assert float(model.drift_scale[0]) > 1e-3
+    assert model.converged_
+    assert np.isfinite(model.score(*scalar_data))
