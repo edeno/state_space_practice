@@ -191,6 +191,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`GraphBasis` gains a trailing `laplacian_convention` field** (default
+  `"distance"`), set by `build_graph_basis(..., laplacian_convention=...)`.
+  The existing fields keep their positions and `env_key` keeps its
+  `(n_bins, nnz, digest)` layout, so positional construction from the six
+  original fields still works; unpacking a basis into exactly six names does
+  not. The digest now also covers the convention, so keys from earlier
+  versions differ.
 - **Refitting an oscillator model restarts from the constructor's
   parameters**: `fit` (and the Gaussian models' `fit_sgd`) on
   `CorrelatedNoiseModel`, `DirectedInfluenceModel`,
