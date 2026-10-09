@@ -179,7 +179,7 @@ def _iterate_mode(
     return path, relative(path, proposed), n, rejected
 
 
-@partial(typed_jit, static_argnames=("dt", "max_iter", "tolerance"))
+@partial(typed_jit, static_argnames=("dt", "max_iter", "tolerance", "static_noise"))
 def poisson_laplace_smoother(
     mean0: ArrayLike,
     covariance0: ArrayLike,
@@ -192,6 +192,7 @@ def poisson_laplace_smoother(
     dt: float,
     max_iter: int = 50,
     tolerance: float = 1e-8,
+    static_noise: bool | None = None,
 ) -> LaplaceTrajectoryResult:
     """Infer the full trajectory mode and normalized joint Laplace evidence.
 
@@ -226,6 +227,12 @@ def poisson_laplace_smoother(
         Newton iteration cap, by default 50.
     tolerance : float, optional
         Relative Newton step tolerance, by default 1e-8.
+    static_noise : bool or None, optional
+        Which solver to run. ``None`` (default) tests ``noise == 0`` with
+        ``lax.cond``; under ``vmap`` with a batched noise that becomes a select
+        that evaluates both solvers. ``True``/``False`` runs only the
+        zero-noise/positive-definite solver; the caller guarantees the noise
+        matches.
 
     Returns
     -------
@@ -417,6 +424,9 @@ def poisson_laplace_smoother(
             (residual <= tolerance) & (rejected == 0),
         )
 
-    return cast(
-        LaplaceTrajectoryResult, jax.lax.cond(is_static, static, dynamic, operand=None)
-    )
+    if static_noise is None:
+        return cast(
+            LaplaceTrajectoryResult,
+            jax.lax.cond(is_static, static, dynamic, operand=None),
+        )
+    return static(None) if static_noise else dynamic(None)

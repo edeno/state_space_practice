@@ -276,3 +276,27 @@ def test_joint_core_agrees_with_temporal_rate_gp():
     assert float(common.log_evidence) == pytest.approx(
         float(existing.log_marginal_likelihood), abs=1e-7
     )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(("q", "static_noise"), [(0.0, True), (0.03, False)])
+def test_noise_structure_hint_matches_automatic_branch(joint_problem, q, static_noise):
+    """A caller-supplied branch gives the automatic result, including gradients."""
+
+    def evidence(scale, hint):
+        args = dict(joint_problem, noise=scale * q * jnp.eye(2))
+        return poisson_laplace_smoother(**args, static_noise=hint).log_evidence
+
+    automatic = poisson_laplace_smoother(**joint_problem, noise=q * jnp.eye(2))
+    hinted = poisson_laplace_smoother(
+        **joint_problem, noise=q * jnp.eye(2), static_noise=static_noise
+    )
+    assert bool(hinted.converged)
+    for a, b in zip(automatic, hinted, strict=True):
+        np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        jax.grad(evidence)(1.0, static_noise),
+        jax.grad(evidence)(1.0, None),
+        rtol=1e-10,
+        atol=1e-12,
+    )
