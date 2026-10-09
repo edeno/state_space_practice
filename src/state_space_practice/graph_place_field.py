@@ -883,7 +883,8 @@ def fit_static_graph_glm(
     weights : Array, shape (rank,) or (n_neurons, rank)
         MAP coefficients.
     cov : Array, shape (rank, rank) or (n_neurons, rank, rank)
-        Laplace posterior covariance (inverse Fisher + penalty) at the MAP.
+        Laplace posterior covariance, the inverse of (Fisher information +
+        penalty), at the MAP.
 
     Raises
     ------
@@ -1464,8 +1465,8 @@ def _graph_forward_loss(
     alpha: float,
     max_log_count: float,
     max_newton_iter: int,
-    inference_method: str = "sequential",
-    max_smoother_iter: int = 50,
+    inference_method: Literal["sequential", "joint"],
+    max_smoother_iter: int,
 ) -> Array:
     """Pure shared objective for gradient optimization and scale profiles."""
     S = (params["kappa2"] + eigvals) ** (-alpha)
@@ -1534,7 +1535,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     With fitted shape, q and kappa2 can trade off; ``field_drift_scale_`` gives
     the resulting mean active-bin log-rate increment variance per transition.
 
-    x64 is required (see the module and repo CLAUDE.md notes).
+    Requires ``jax.config.update("jax_enable_x64", True)`` before importing
+    the package; joint Newton convergence (relative step 1e-8) is not
+    reachable in float32.
+
+    ``smoother_diagnostics_`` (joint inference only) holds the per-neuron
+    :class:`LaplaceTrajectoryResult`, each field with a leading ``n_neurons``
+    axis; it is unset after a sequential-inference fit.
     """
 
     smoother_mean: FittedAttribute[Array] = FittedAttribute()
@@ -1724,8 +1731,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     def _spectral_shape_current(self) -> Array:
         """Spectral shape ``S`` at the current ``kappa2``.
 
-        Recomputed on every call rather than cached: ``kappa2`` is fittable by
-        ``fit_sgd``, so a construction-time snapshot would silently go stale. All
+        Recomputed on every call rather than cached: ``kappa2`` is fitted by
+        ``fit``/``fit_sgd``, so a construction-time snapshot would go stale. All
         consumers of ``S`` (prior, drift, filter, M-step) must call this.
         """
         return jnp.asarray(spectral_shape(self.basis.eigvals, self.kappa2, self.alpha))
@@ -1774,7 +1781,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         return jnp.asarray(Z_full), spikes_arr.T, jnp.asarray(valid)
 
     def _e_step(self, Z: Array, spikes: Array, valid: Array | None = None) -> float:
-        """Per-neuron vmap Laplace-EKF smoother; returns total marginal LL."""
+        """Per-neuron posterior inference; returns the total log evidence.
+
+        Always runs the causal sequential filter for ``filtered_mean`` /
+        ``filtered_cov``. Smoothed moments and the returned evidence come from
+        the joint Laplace smoother under ``inference_method="joint"`` (``-inf``
+        when it did not converge) and from the filter plus RTS otherwise.
+        """
         assert self.init_mean is not None
         assert self.drift_scale is not None
         if valid is None:
@@ -1872,7 +1885,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.init_mean = w0
 
     def _m_step(self) -> None:
-        """Closed-form scalar updates of per-neuron q_c and shared tau2."""
+        """Closed-form updates of per-neuron q_c, shared tau2 and ``init_mean``.
+
+        q_c and tau2 are floored at 1e-12 so the next E-step's covariances stay
+        positive definite; EM therefore cannot reach exactly zero drift (the
+        default ``fit`` profiles q=0 explicitly).
+        """
         assert self.smoother_mean is not None
         assert self.smoother_cov is not None
         assert self.smoother_cross_cov is not None
@@ -1948,9 +1966,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         parameters using full-sequence gradients. ``tolerance`` is the maximum
         projected gradient in optimizer coordinates, per time row (default
         1e-7); ``max_iter`` defaults to 500 per nuisance optimization. The
-        returned history includes profile-round/static-candidate restarts and
-        line-search evaluations, so it need not be monotone. Its last entry is
-        the evidence at the selected parameters; ``n_iter_`` is None.
+        returned history concatenates the accepted iterates of each
+        profile-round and static-candidate optimization, so it need not be
+        monotone across restarts. Its last entry is the evidence at the
+        selected parameters; ``n_iter_`` is None.
 
         Set ``update_drift_scale=False`` to retain a supplied scale, including
         zero. Spatial prior means stay zero while component baselines are free.
@@ -1963,6 +1982,29 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         tolerance 1e-4. EM/Adam and sequential inference do not carry the
         automatic estimator's validation guarantees. See :meth:`fit_mle` for
         profile and numerical diagnostics.
+
+        Parameters
+        ----------
+        times : NDArray, shape (n_time,)
+        trajectory : NDArray, shape (n_time, n_position_dims)
+        spikes : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+        method : {"mle", "em"}, optional
+            Evidence optimization (default) or experimental EM.
+        max_iter, tolerance : optional
+            Iteration cap and convergence tolerance for the selected method
+            (defaults above).
+        warm_start : bool, optional
+            Re-initialize from a static GLM fit (default) or resume stored
+            parameters with compatible shapes.
+        verbose : bool, optional
+            Per-iteration EM logging; ignored by ``method="mle"``.
+        drift_bounds, profile_points, profile_rounds, initial_mean_mode
+            ``method="mle"`` only; see :meth:`fit_mle`.
+
+        Returns
+        -------
+        list of float
+            The fit's log-likelihood history (``log_likelihood_history_``).
         """
         if method == "em":
             return self.fit_em(
@@ -2242,7 +2284,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         if not np.isfinite(final_ll):
             self._clear_fit_state()
             raise NonFiniteLikelihoodError(
-                "GraphPlaceFieldModel.fit_sgd: the final E-step produced a non-finite "
+                "GraphPlaceFieldModel: the final E-step produced a non-finite "
                 "marginal log-likelihood; the model was not fitted."
             )
         self.log_likelihoods = [final_ll]
@@ -2272,7 +2314,39 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         ``optimizer_result_`` expose numerical bounds and projected gradients.
         Only component baseline prior means are fitted by default. The ``full``
         mean option is experimental because freely fitting every prior mean can
-        collapse the fitted initial-state variance.
+        collapse the fitted initial-state variance. A failed fit clears any
+        earlier fit results and restores the starting hyperparameters.
+
+        Parameters
+        ----------
+        times : NDArray, shape (n_time,)
+        trajectory : NDArray, shape (n_time, n_position_dims)
+        spikes : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+        max_iter : int, optional
+            L-BFGS iteration cap per optimization, by default 500.
+        gradient_tolerance : float, optional
+            Max-abs projected gradient per time row in optimizer coordinates,
+            by default 1e-7.
+        drift_bounds : tuple of float, optional
+            Positive profile range for q in coefficient-variance units, mapped
+            to field-variance units with the constructor's spectral shape;
+            by default ``(1e-8, 10.0)``.
+        profile_points : int, optional
+            Log-grid points per drift profile (at least 3), by default 49.
+        profile_rounds : int, optional
+            Alternations of drift profiling and nuisance optimization, by
+            default 3.
+        warm_start : bool, optional
+            Re-initialize from a static GLM fit (default) or resume stored
+            parameters with compatible shapes.
+        initial_mean_mode : {"baseline", "full"}, optional
+            Free only component baseline prior means (default) or every mean.
+
+        Returns
+        -------
+        list of float
+            Concatenated accepted-iterate log-likelihood history; the last
+            entry is the evidence at the selected parameters.
         """
         start = snapshot_attributes(
             self, ("kappa2", "tau2", "init_mean", "drift_scale", "n_neurons", "_n_time")
@@ -2348,18 +2422,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     ) -> list[float]:
         """Profile q including zero, then optimize learnable parameters by L-BFGS.
 
-        Uses the selected inference approximation. ``update_*`` flags
-        determine trainable parameters; fixed drift stays fixed. Positive-scale
-        profiles use coefficient-variance ``drift_bounds`` and refine sampled
-        minima. Exact zero is a separate candidate. ``drift_profiles_`` and
-        ``optimizer_result_`` expose boundary/gradient diagnostics. This path
-        uses the selected inference approximation.
-        Optimization uses field-variance coordinates internally; stored q/tau2
-        retain coefficient units. Only component baseline prior means are free
-        by default; spatial prior means stay zero. ``initial_mean_mode="full"``
-        retains the experimental fit of every mean together with its variance.
-        Profiles use mean field-variance units and bounds mapped using the
-        constructor's spectral shape, which stays fixed throughout the search.
+        Uses the selected inference approximation; ``update_*`` flags determine
+        trainable parameters. ``drift_bounds`` are coefficient-variance bounds
+        mapped to field-variance units using the constructor's spectral shape.
+        Exact zero is a separate candidate. Optimization uses field-variance
+        coordinates internally; stored q/tau2 retain coefficient units. Only
+        component baseline prior means are free by default; spatial prior means
+        stay zero.
         """
         max_iter = validate_int(max_iter, "max_iter", positive=True)
         if initial_mean_mode not in ("baseline", "full"):

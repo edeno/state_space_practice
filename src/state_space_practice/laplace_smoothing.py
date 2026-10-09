@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from jax import Array
 from jax.scipy.linalg import cho_solve, solve_triangular
 from jax.scipy.special import gammaln
+from jax.typing import ArrayLike
 
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.utils import symmetrize, typed_jit
@@ -29,6 +30,10 @@ def _clipped_exp(log_rate: Array) -> Array:
 
 
 class LinearSiteResult(NamedTuple):
+    """Gaussian-site smoother moments: mean ``(n_time, rank)``, covariance
+    ``(n_time, rank, rank)``, lag-one cross-covariance ``Cov(x_t, x_{t+1})``
+    ``(n_time - 1, rank, rank)`` and scalar log normalizer."""
+
     mean: Array
     covariance: Array
     cross_covariance: Array
@@ -38,7 +43,10 @@ class LinearSiteResult(NamedTuple):
 class LaplaceTrajectoryResult(NamedTuple):
     """Joint mode, inverse-Hessian moments and evidence with diagnostics.
 
-    ``converged`` is true when the final relative Newton step is within the
+    ``mean`` is ``(n_time, rank)``, ``covariance`` ``(n_time, rank, rank)`` and
+    ``cross_covariance`` ``Cov(x_t, x_{t+1})`` ``(n_time - 1, rank, rank)``; the
+    remaining fields are scalars. ``relative_newton_step`` is
+    ``max|proposed - path| / (1 + max|path|)`` at exit. ``converged`` is true when the final relative Newton step is within the
     solver tolerance and no line search was fully rejected; the evidence and
     its implicit derivatives are only valid when it holds.
     """
@@ -122,7 +130,11 @@ def _iterate_mode(
     max_iter: int,
     tolerance: float,
 ) -> tuple[Array, Array, Array, Array]:
-    """Adaptive, gradient-stopped Armijo iteration; rejected steps keep the mode."""
+    """Adaptive, gradient-stopped Armijo iteration.
+
+    A fully rejected line search stops the iteration at the current point and
+    is counted in the returned rejection count.
+    """
     trial_steps = 0.5 ** jnp.arange(20, dtype=initial.dtype)
 
     def relative(path: Array, proposed: Array) -> Array:
@@ -169,13 +181,13 @@ def _iterate_mode(
 
 @partial(typed_jit, static_argnames=("dt", "max_iter", "tolerance"))
 def poisson_laplace_smoother(
-    mean0: Array,
-    covariance0: Array,
-    transition: Array,
-    noise: Array,
-    design: Array,
-    counts: Array,
-    valid: Array,
+    mean0: ArrayLike,
+    covariance0: ArrayLike,
+    transition: ArrayLike,
+    noise: ArrayLike,
+    design: ArrayLike,
+    counts: ArrayLike,
+    valid: ArrayLike,
     *,
     dt: float,
     max_iter: int = 50,
@@ -192,6 +204,34 @@ def poisson_laplace_smoother(
     At exactly zero noise, derivatives describe the reduced deterministic
     model with noise fixed to zero; they are not right derivatives in Q.
     Compare zero with positive-noise evidence explicitly when learning Q.
+    Only first derivatives are exact: the one-Newton-map construction does not
+    give correct second derivatives (e.g. ``jax.hessian`` of the evidence).
+
+    Parameters
+    ----------
+    mean0 : ArrayLike, shape (rank,)
+    covariance0 : ArrayLike, shape (rank, rank)
+        Positive definite prior covariance of the first state.
+    transition : ArrayLike, shape (rank, rank)
+    noise : ArrayLike, shape (rank, rank)
+        Process covariance; positive definite or exactly zero.
+    design : ArrayLike, shape (n_time, rank)
+        Log-rate design rows (the log rate is ``design[t] @ x_t + log(dt)``).
+    counts : ArrayLike, shape (n_time,)
+    valid : ArrayLike of bool, shape (n_time,)
+        Observed rows; ``False`` rows contribute no likelihood.
+    dt : float
+        Bin width in seconds.
+    max_iter : int, optional
+        Newton iteration cap, by default 50.
+    tolerance : float, optional
+        Relative Newton step tolerance, by default 1e-8.
+
+    Returns
+    -------
+    LaplaceTrajectoryResult
+        Mode, inverse-Hessian moments, and the Laplace log evidence including
+        the Poisson ``-log(y!)`` constants.
     """
     # Use one promoted floating dtype for loop carries and both cond branches.
     dtype = jnp.result_type(
@@ -201,6 +241,7 @@ def poisson_laplace_smoother(
         jnp.asarray(value, dtype=dtype)
         for value in (mean0, covariance0, transition, noise, design, counts)
     )
+    valid = jnp.asarray(valid)
     n_time, rank = design.shape
     identity = jnp.eye(rank, dtype=dtype)
     is_static = jnp.all(noise == 0)

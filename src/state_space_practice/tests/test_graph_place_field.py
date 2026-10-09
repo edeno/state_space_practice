@@ -1238,7 +1238,7 @@ def test_fit_sgd_runs_with_explicit_fixed_drift(small_grid_env):
 
     assert lls and np.all(np.isfinite(lls))
     np.testing.assert_allclose(np.asarray(model.drift_scale), [2e-3], atol=0.0)
-    assert model.smoother_mean is not None
+    assert np.all(np.isfinite(np.asarray(model.smoother_mean)))
 
 
 # Generating-q recovery is not an acceptance claim for these spatial-field tests.
@@ -1246,8 +1246,9 @@ def test_fit_sgd_runs_with_explicit_fixed_drift(small_grid_env):
 # EM updates near initialization. Those observations do not establish structural
 # non-identifiability: the independent scalar math study, with fixed known priors,
 # has informative reference and approximate average q profiles. They also do not
-# validate automatic q learning with other graph-field parameters fitted jointly.
-# Drift learning therefore remains experimental and fixed by default. Its M-step
+# validate automatic q learning with other graph-field parameters fitted jointly,
+# so these tests fix drift (legacy_graph_model); automatic drift learning is
+# validated in test_graph_place_field_learning.py. The EM M-step
 # algebra is checked both below and against independent complete-density numerical
 # optimization in test_graph_place_field_math.py; trajectory recovery is checked
 # by test_fixed_scale_model_tracks_drifting_field_over_time.

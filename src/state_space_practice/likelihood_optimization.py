@@ -78,7 +78,7 @@ def profile_scale(
     n_grid: int = 49,
     objective_tolerance: float = 1e-6,
 ) -> ScaleProfile:
-    """Search zero and a log grid, refining every sampled local minimum.
+    """Search zero and a log grid, refining every strict sampled local minimum.
 
     ``objective`` receives the scale itself, including exactly zero. Bounds
     apply to the positive grid. Zero is preferred when its loss is within
