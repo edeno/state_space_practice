@@ -58,7 +58,7 @@ from state_space_practice.em_driver import (
 )
 from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute
-from state_space_practice.kalman import rts_backward_scan, sum_of_outer_products
+from state_space_practice.kalman import process_cov_residual_form, rts_backward_scan
 from state_space_practice.laplace_smoothing import (
     LaplaceTrajectoryResult,
     poisson_laplace_smoother,
@@ -73,6 +73,7 @@ from state_space_practice.point_process_kalman import (
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
+    as_2d_count_matrix,
     psd_solve,
     symmetrize,
     typed_jit,
@@ -1866,12 +1867,15 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
             def _increment_stats(sm: Array, sc: Array, scc: Array) -> Array:
                 # sm (T, rank), sc (T, rank, rank), scc (T-1, rank, rank)
-                gamma = jnp.sum(sc, axis=0) + sum_of_outer_products(sm, sm)
-                gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
-                gamma2 = gamma - jnp.outer(sm[0], sm[0]) - sc[0]
-                beta = (scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])).T
-                q_inc = (gamma2 - beta.T - beta + gamma1) / (n_time - 1)
-                return jnp.diag(q_inc)
+                return jnp.diag(
+                    process_cov_residual_form(
+                        sm,
+                        sc[1:].sum(0),
+                        sc[:-1].sum(0),
+                        scc.sum(0),
+                        self.transition_matrix,
+                    )
+                )
 
             diag_q_inc = jax.vmap(_increment_stats)(
                 self.smoother_mean,
@@ -2010,15 +2014,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_iter = validate_int(max_iter, "max_iter", positive=True)
         tolerance = validate_scalar(tolerance, "tolerance", positive=True)
 
-        spikes_arr = jnp.asarray(spikes)
-        if spikes_arr.ndim == 1:
-            spikes_arr = spikes_arr[:, None]
-        validate_count_array(spikes_arr, "spikes", allow_empty=False)
-        if spikes_arr.ndim != 2:
-            raise ValueError(
-                "spikes must be 1D (n_time,) or 2D (n_time, n_neurons); "
-                f"got shape {spikes_arr.shape}."
-            )
+        spikes_arr = as_2d_count_matrix(spikes, "spikes")
         self.n_neurons = int(spikes_arr.shape[1])
         Z, spk, valid = self._design_and_spikes(times, trajectory, spikes_arr)
         self._n_time = int(Z.shape[0])
@@ -2138,10 +2134,21 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             )
         if self._mle_static_mask is not None:
             drift_scale = jnp.where(self._mle_static_mask, 0.0, drift_scale)
-        return _graph_forward_loss(
+        return self._forward_loss(
             dict(
                 kappa2=kappa2, tau2=tau2, init_mean=init_mean, drift_scale=drift_scale
             ),
+            Z,
+            spikes,
+            valid,
+        )
+
+    def _forward_loss(
+        self, params: SGDParams, Z: Array, spikes: Array, valid: Array
+    ) -> Array:
+        """Mean negative log-likelihood at ``params`` under this configuration."""
+        return _graph_forward_loss(
+            params,
             Z,
             spikes,
             valid,
@@ -2153,6 +2160,16 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             max_newton_iter=self.max_newton_iter,
             inference_method=self.inference_method,
             max_smoother_iter=self.max_smoother_iter,
+        )
+
+    def _current_params(self) -> SGDParams:
+        """Stored hyperparameters in the ``_graph_forward_loss`` layout."""
+        assert self.init_mean is not None and self.drift_scale is not None
+        return dict(
+            kappa2=jnp.asarray(self.kappa2),
+            tau2=jnp.asarray(self.tau2),
+            init_mean=self.init_mean,
+            drift_scale=self.drift_scale,
         )
 
     def _store_sgd_params(self, params: SGDParams) -> None:
@@ -2265,13 +2282,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         drift_bounds: tuple[float, float],
         profile_points: int,
     ) -> tuple[ScaleProfile, ...]:
-        assert self.init_mean is not None and self.drift_scale is not None
-        base = dict(
-            kappa2=jnp.asarray(self.kappa2),
-            tau2=jnp.asarray(self.tau2),
-            init_mean=self.init_mean,
-            drift_scale=self.drift_scale,
-        )
+        base = self._current_params()
         factor = float(self._field_shape_factor())
         results = []
         for cell in range(self.n_neurons):
@@ -2282,22 +2293,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     init_mean=base["init_mean"][cell : cell + 1],
                     drift_scale=jnp.atleast_1d(q / factor),
                 )
-                return float(
-                    _graph_forward_loss(
-                        params,
-                        Z,
-                        spk[cell : cell + 1],
-                        valid,
-                        jnp.asarray(self.basis.eigvals),
-                        self.transition_matrix,
-                        dt=self.dt,
-                        alpha=self.alpha,
-                        max_log_count=self._max_log_count,
-                        max_newton_iter=self.max_newton_iter,
-                        inference_method=self.inference_method,
-                        max_smoother_iter=self.max_smoother_iter,
-                    )
-                )
+                return float(self._forward_loss(params, Z, spk[cell : cell + 1], valid))
 
             results.append(
                 profile_scale(
@@ -2317,13 +2313,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         trajectory: NDArray[np.float64],
         spikes: ArrayLike,
         *,
-        max_iter: int = 500,
-        gradient_tolerance: float = 1e-7,
-        drift_bounds: tuple[float, float] = (1e-8, 10.0),
-        profile_points: int = 49,
-        profile_rounds: int = 3,
-        warm_start: bool = True,
-        initial_mean_mode: Literal["baseline", "full"] = "baseline",
+        max_iter: int,
+        gradient_tolerance: float,
+        drift_bounds: tuple[float, float],
+        profile_points: int,
+        profile_rounds: int,
+        warm_start: bool,
+        initial_mean_mode: Literal["baseline", "full"],
     ) -> list[float]:
         """Profile q including zero, then optimize learnable parameters by L-BFGS.
 
@@ -2356,6 +2352,25 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             times, trajectory, spikes, warm_start=warm_start
         )
         Z, spk, valid = args
+        if not any(
+            (
+                self.update_drift_scale,
+                self.update_amplitude,
+                self.update_kappa2,
+                self.update_init_mean,
+            )
+        ):
+            ll = self._e_step(Z, spk, valid)
+            if not np.isfinite(ll):
+                raise NonFiniteLikelihoodError(
+                    "Final joint inference is unconverged or non-finite."
+                )
+            self._is_fitted = True
+            self.log_likelihoods = [ll]
+            self._record_fit_result([ll], True, n_iter=None)
+            self.drift_profiles_ = ()
+            self.parameter_bound_hits_ = ()
+            return [ll]
         self._mle_field_coordinates = True
         self._mle_baseline_mean = (
             self.update_init_mean and initial_mean_mode == "baseline"
@@ -2383,35 +2398,14 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 self.drift_scale = jnp.maximum(
                     chosen, drift_bounds[0] * self._mle_reference_factor / factor
                 )
-            if not any(
-                (
-                    self.update_drift_scale,
-                    self.update_amplitude,
-                    self.update_kappa2,
-                    self.update_init_mean,
-                )
-            ):
-                ll = self._e_step(Z, spk, valid)
-                if not np.isfinite(ll):
-                    raise NonFiniteLikelihoodError(
-                        "Final joint inference is unconverged or non-finite."
-                    )
-                self._is_fitted = True
-                self.log_likelihoods = [ll]
-                self._record_fit_result([ll], True, n_iter=None)
-                self.drift_profiles_ = ()
-                self.parameter_bound_hits_ = ()
-                self._mle_field_coordinates = False
-                self._mle_baseline_mean = False
-                return [ll]
             result = self._fit_lbfgs_prepared(
                 args,
                 {},
                 max_iter=max_iter,
                 gradient_tolerance=tolerance,
-                bounds=self._mle_parameter_bounds(drift_bounds),
+                bounds=self._mle_parameter_bounds(drift_bounds)[0],
             )
-            histories.extend([-loss * self._n_time for loss in result.loss_history])
+            histories.extend(self.log_likelihood_history_)
             if not any(
                 (self.update_amplitude, self.update_kappa2, self.update_init_mean)
             ):
@@ -2433,7 +2427,6 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             )
             positive_state = snapshot_attributes(self, keys)
             positive_ll = self.log_likelihood_
-            positive_result = result
             self._mle_static_mask = jnp.ones(self.n_neurons, dtype=bool)
             self.drift_scale = jnp.full(self.n_neurons, drift_bounds[0])
             if self.update_amplitude:
@@ -2443,44 +2436,25 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 {},
                 max_iter=max_iter,
                 gradient_tolerance=tolerance,
-                bounds=self._mle_parameter_bounds(drift_bounds),
+                bounds=self._mle_parameter_bounds(drift_bounds)[0],
             )
-            histories.extend(
-                [-loss * self._n_time for loss in static_result.loss_history]
-            )
+            histories.extend(self.log_likelihood_history_)
             if self.log_likelihood_ >= positive_ll - 1e-6:
                 result = static_result
             else:
                 restore_attributes(self, positive_state)
-                result = positive_result
         if self.update_drift_scale:
             profiles = self._profile_drift(Z, spk, valid, drift_bounds, profile_points)
         self.drift_profiles_ = profiles
-        params, _spec = self._build_param_spec()
-        bounds = self._mle_parameter_bounds(drift_bounds)
-        hits = []
-        offset = 0
-        for name in sorted(params):
-            size = int(np.size(params[name]))
-            for index, (value, (lo, hi)) in enumerate(
-                zip(
-                    result.parameters[offset : offset + size],
-                    bounds[offset : offset + size],
-                    strict=True,
-                )
-            ):
-                if (
-                    name == "drift_scale"
-                    and self._mle_static_mask is not None
-                    and bool(self._mle_static_mask[index])
-                ):
-                    continue
-                if (lo is not None and np.isclose(value, lo, atol=1e-8, rtol=0)) or (
-                    hi is not None and np.isclose(value, hi, atol=1e-8, rtol=0)
-                ):
-                    hits.append(name)
-            offset += size
-        self.parameter_bound_hits_ = tuple(sorted(set(hits)))
+        bounds, names = self._mle_parameter_bounds(drift_bounds)
+        lo, hi = np.asarray(bounds).T
+        at_bound = np.isclose(result.parameters, lo, atol=1e-8, rtol=0) | np.isclose(
+            result.parameters, hi, atol=1e-8, rtol=0
+        )
+        if self._mle_static_mask is not None:
+            # Static drift entries sit at the lower bound by construction.
+            at_bound[names == "drift_scale"] &= ~np.asarray(self._mle_static_mask)
+        self.parameter_bound_hits_ = tuple(sorted({str(n) for n in names[at_bound]}))
         final_ll = self.log_likelihood_
         if histories:
             histories[-1] = final_ll
@@ -2488,11 +2462,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             histories, result.converged, n_iter=None, log_likelihood=final_ll
         )
         self.optimizer_result_ = result
-        self._mle_field_coordinates = False
-        self._mle_baseline_mean = False
         self.log_likelihoods = histories
-        if histories:
-            histories[-1] = final_ll
         if any(p.at_upper_bound for p in profiles):
             logger.warning(
                 "Drift scale profile reached its upper bound; expand drift_bounds."
@@ -2501,33 +2471,30 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
     def _mle_parameter_bounds(
         self, drift_bounds: tuple[float, float]
-    ) -> list[tuple[float | None, float | None]]:
-        """Map coefficient-scale bounds into the actual optimizer coordinates."""
+    ) -> tuple[list[tuple[float | None, float | None]], NDArray[np.str_]]:
+        """Map coefficient-scale bounds into the actual optimizer coordinates.
+
+        Returns one ``(lo, hi)`` pair and one parameter name per flattened
+        optimizer entry, in ``ravel_pytree`` (sorted-key) order.
+        """
         params, spec = self._build_param_spec()
+        constrained = {
+            "drift_scale": np.asarray(drift_bounds) * self._mle_reference_factor,
+            "kappa2": np.array([1e-6, 1e4 * (1 + float(np.max(self.basis.eigvals)))]),
+            "tau2": np.array([1e-8, 1e4]),
+        }
         bounds: list[tuple[float | None, float | None]] = []
+        names: list[str] = []
         for name in sorted(params):
-            if name == "drift_scale":
-                values = spec[name].to_unconstrained(
-                    jnp.asarray(drift_bounds) * self._mle_reference_factor
-                )
-                pair: tuple[float | None, float | None] = (
-                    float(values[0]),
-                    float(values[1]),
-                )
-            elif name == "kappa2":
-                values = spec[name].to_unconstrained(
-                    jnp.array([1e-6, 1e4 * (1 + float(np.max(self.basis.eigvals)))])
-                )
-                pair = (float(values[0]), float(values[1]))
-            elif name == "tau2":
-                values = spec[name].to_unconstrained(jnp.array([1e-8, 1e4]))
-                pair = (float(values[0]), float(values[1]))
-            elif name == "init_mean":
-                pair = (-200.0, 200.0)
+            if name == "init_mean":
+                pair: tuple[float | None, float | None] = (-200.0, 200.0)
             else:
-                pair = (None, None)
-            bounds.extend([pair] * int(np.size(params[name])))
-        return bounds
+                values = spec[name].to_unconstrained(jnp.asarray(constrained[name]))
+                pair = (float(values[0]), float(values[1]))
+            size = int(np.size(params[name]))
+            bounds.extend([pair] * size)
+            names.extend([name] * size)
+        return bounds, np.asarray(names)
 
     def fit_sgd(
         self,
@@ -2591,10 +2558,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         warm_start: bool = True,
     ) -> tuple[tuple[Array, Array, Array], dict[str, Any]]:
         """Validate data before binding it or replacing an earlier fit."""
-        spikes_arr = jnp.asarray(spikes)
-        if spikes_arr.ndim == 1:
-            spikes_arr = spikes_arr[:, None]
-        validate_count_array(spikes_arr, "spikes", allow_empty=False)
+        spikes_arr = as_2d_count_matrix(spikes, "spikes")
         Z, spk, valid = self._design_and_spikes(times, trajectory, spikes_arr)
         if int(jnp.sum(valid)) == 0:
             raise ValueError(
@@ -2763,15 +2727,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self._check_fitted("score")
         assert self.init_mean is not None
         assert self.drift_scale is not None
-        spikes_arr = jnp.asarray(spikes)
-        if spikes_arr.ndim == 1:
-            spikes_arr = spikes_arr[:, None]
-        validate_count_array(spikes_arr, "spikes", allow_empty=False)
-        if spikes_arr.ndim != 2:
-            raise ValueError(
-                "spikes must be 1D (n_time,) or 2D (n_time, n_neurons); "
-                f"got shape {spikes_arr.shape}."
-            )
+        spikes_arr = as_2d_count_matrix(spikes, "spikes")
         if spikes_arr.shape[1] != self.n_neurons:
             raise ValueError(
                 f"spikes has {spikes_arr.shape[1]} neurons but the model was fitted "
@@ -2783,24 +2739,4 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 "trajectory contains no in-bounds observations for this environment; "
                 "the marginal log-likelihood would depend on no data."
             )
-        return -float(
-            _graph_forward_loss(
-                dict(
-                    kappa2=jnp.asarray(self.kappa2),
-                    tau2=jnp.asarray(self.tau2),
-                    init_mean=self.init_mean,
-                    drift_scale=self.drift_scale,
-                ),
-                Z,
-                spk,
-                valid,
-                jnp.asarray(self.basis.eigvals),
-                self.transition_matrix,
-                dt=self.dt,
-                alpha=self.alpha,
-                max_log_count=self._max_log_count,
-                max_newton_iter=self.max_newton_iter,
-                inference_method=self.inference_method,
-                max_smoother_iter=self.max_smoother_iter,
-            )
-        )
+        return -float(self._forward_loss(self._current_params(), Z, spk, valid))
