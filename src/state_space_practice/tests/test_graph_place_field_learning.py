@@ -9,15 +9,15 @@ from scipy.optimize import minimize_scalar
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.fitted_state import is_set
 from state_space_practice.graph_place_field import GraphPlaceFieldModel
+from state_space_practice.tests.graph_helpers import line_env
 from state_space_practice.tests.graph_math_reference import joint_poisson_laplace
 
 neurospatial = pytest.importorskip("neurospatial")
-from neurospatial import Environment  # noqa: E402
 
 
 @pytest.fixture(scope="module")
 def learning_env():
-    return Environment.from_samples(np.linspace(0, 10, 201)[:, None], bin_size=2.0)
+    return line_env()
 
 
 @pytest.fixture(scope="module")
