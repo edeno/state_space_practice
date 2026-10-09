@@ -1465,10 +1465,7 @@ def _graph_forward_loss(
                 dt=dt,
                 max_iter=max_smoother_iter,
             )
-            usable = (result.relative_newton_step <= 1e-8) & (
-                result.n_rejected_steps == 0
-            )
-            return jnp.where(usable, result.log_evidence, -jnp.inf)
+            return jnp.where(result.converged, result.log_evidence, -jnp.inf)
         return _masked_graph_point_process_filter(
             m0,
             P0,
@@ -1803,12 +1800,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     result.covariance,
                     result.cross_covariance,
                 )
-                marginal_ll = jnp.where(
-                    (result.relative_newton_step <= 1e-8)
-                    & (result.n_rejected_steps == 0),
-                    result.log_evidence,
-                    -jnp.inf,
-                )
+                marginal_ll = jnp.where(result.converged, result.log_evidence, -jnp.inf)
             else:
                 smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
                     filtered_mean,

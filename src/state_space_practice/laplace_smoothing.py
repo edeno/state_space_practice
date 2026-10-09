@@ -20,6 +20,13 @@ from jax.scipy.special import gammaln
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.utils import symmetrize, typed_jit
 
+# Log-rate ceiling keeping exp finite in float64.
+_MAX_LOG_RATE = 600.0
+
+
+def _clipped_exp(log_rate: Array) -> Array:
+    return jnp.exp(jnp.minimum(log_rate, _MAX_LOG_RATE))
+
 
 class LinearSiteResult(NamedTuple):
     mean: Array
@@ -29,7 +36,12 @@ class LinearSiteResult(NamedTuple):
 
 
 class LaplaceTrajectoryResult(NamedTuple):
-    """Joint mode, inverse-Hessian moments and evidence with diagnostics."""
+    """Joint mode, inverse-Hessian moments and evidence with diagnostics.
+
+    ``converged`` is true when the final relative Newton step is within the
+    solver tolerance and no line search was fully rejected; the evidence and
+    its implicit derivatives are only valid when it holds.
+    """
 
     mean: Array
     covariance: Array
@@ -38,6 +50,7 @@ class LaplaceTrajectoryResult(NamedTuple):
     relative_newton_step: Array
     n_iterations: Array
     n_rejected_steps: Array
+    converged: Array
 
 
 def _linear_sites(
@@ -170,11 +183,12 @@ def poisson_laplace_smoother(
 ) -> LaplaceTrajectoryResult:
     """Infer the full trajectory mode and normalized joint Laplace evidence.
 
-    Parameters follow the graph model's direct-first-prior convention. Positive
+    The first observation is conditioned directly on ``N(mean0, covariance0)``
+    with no preceding predict step. Positive
     definite noise or exactly zero noise is supported. Missing rows contribute
     zero information while transitions remain. Inputs must be validated by the
     model layer. Gradients are implicit mode derivatives and require convergence;
-    callers must inspect ``relative_newton_step``/``n_rejected_steps``.
+    callers must inspect ``converged``.
     At exactly zero noise, derivatives describe the reduced deterministic
     model with noise fixed to zero; they are not right derivatives in Q.
     Compare zero with positive-noise evidence explicitly when learning Q.
@@ -195,17 +209,21 @@ def poisson_laplace_smoother(
     safe_noise = jnp.where(is_static, identity, noise)
     y = jnp.where(valid, counts, 0.0)
 
-    def sites(path: Array) -> tuple[Array, Array, Array]:
-        eta = jnp.sum(design * path, axis=1)
-        rate = jnp.exp(jnp.minimum(eta + jnp.log(dt), 600.0))
-        weight = jnp.where(valid, rate, 0.0)
-        return eta, weight, y - weight + weight * eta
+    # Each objective below is built twice: from live parameters for the exact
+    # Newton map at the mode, and from gradient-stopped parameters for the
+    # primal iteration. The derivative of that one exact map at its fixed
+    # point supplies the mode derivative.
 
-    def poisson_value(path: Array) -> Array:
-        eta, weight, _ = sites(path)
+    def poisson_log_likelihood(z: Array, yy: Array, path: Array) -> Array:
+        eta = jnp.sum(z * path, axis=1) + jnp.log(dt)
         return jnp.sum(
-            jnp.where(valid, y * (eta + jnp.log(dt)) - weight - gammaln(y + 1), 0.0)
+            jnp.where(valid, yy * eta - _clipped_exp(eta) - gammaln(yy + 1), 0.0)
         )
+
+    def sites(z: Array, yy: Array, path: Array) -> tuple[Array, Array, Array]:
+        eta = jnp.sum(z * path, axis=1)
+        weight = jnp.where(valid, _clipped_exp(eta + jnp.log(dt)), 0.0)
+        return eta, weight, yy - weight + weight * eta
 
     def dynamic(_: None) -> LaplaceTrajectoryResult:
         prior_chol, noise_chol = (
@@ -213,11 +231,14 @@ def poisson_laplace_smoother(
             jnp.linalg.cholesky(safe_noise),
         )
 
-        def target(path: Array) -> Array:
-            _, weight, information = sites(path)
-            return _linear_sites(
-                mean0, covariance0, transition, safe_noise, design, weight, information
-            ).mean
+        def newton_target(
+            m0: Array, p0: Array, a: Array, q: Array, z: Array, yy: Array
+        ) -> Callable[[Array], Array]:
+            def target(path: Array) -> Array:
+                _, weight, information = sites(z, yy, path)
+                return _linear_sites(m0, p0, a, q, z, weight, information).mean
+
+            return target
 
         def prior_step(previous: Array, _: None) -> tuple[Array, Array]:
             mean = transition @ previous
@@ -226,8 +247,6 @@ def poisson_laplace_smoother(
         _last_mean, rest = jax.lax.scan(prior_step, mean0, None, length=n_time - 1)
         initial = jnp.concatenate((mean0[None], rest))
 
-        # All parameters of the primal solver are stopped. The derivative of
-        # the exact Newton map at its fixed point supplies the mode derivative.
         pm, pp, pa, pq, pz, py, pchol, pqchol = jax.lax.stop_gradient(
             (
                 mean0,
@@ -241,42 +260,30 @@ def poisson_laplace_smoother(
             )
         )
 
-        def stopped_target(path: Array) -> Array:
-            eta = jnp.sum(pz * path, axis=1)
-            weight = jnp.where(
-                valid, jnp.exp(jnp.minimum(eta + jnp.log(dt), 600.0)), 0.0
-            )
-            information = py - weight + weight * eta
-            return _linear_sites(pm, pp, pa, pq, pz, weight, information).mean
-
         def stopped_merit(path: Array) -> Array:
-            eta = jnp.sum(pz * path, axis=1) + jnp.log(dt)
-            ll = jnp.sum(
-                jnp.where(
-                    valid,
-                    py * eta - jnp.exp(jnp.minimum(eta, 600.0)) - gammaln(py + 1),
-                    0.0,
-                )
-            )
             first = solve_triangular(pchol, path[0] - pm, lower=True)
             rest = solve_triangular(pqchol, (path[1:] - path[:-1] @ pa.T).T, lower=True)
-            return ll - 0.5 * (jnp.sum(first**2) + jnp.sum(rest**2))
+            return poisson_log_likelihood(pz, py, path) - 0.5 * (
+                jnp.sum(first**2) + jnp.sum(rest**2)
+            )
 
         stopped_path, residual, n, rejected = _iterate_mode(
             jax.lax.stop_gradient(initial),
-            stopped_target,
+            newton_target(pm, pp, pa, pq, pz, py),
             stopped_merit,
             max_iter,
             tolerance,
         )
         stopped_path = jax.lax.stop_gradient(stopped_path)
-        exact_target = target(stopped_path)
+        exact_target = newton_target(
+            mean0, covariance0, transition, safe_noise, design, y
+        )(stopped_path)
         mode = stopped_path + (exact_target - jax.lax.stop_gradient(exact_target))
-        eta, weight, information = sites(mode)
+        eta, weight, information = sites(design, y, mode)
         gaussian = _linear_sites(
             mean0, covariance0, transition, safe_noise, design, weight, information
         )
-        correction = poisson_value(mode) - jnp.sum(
+        correction = poisson_log_likelihood(design, y, mode) - jnp.sum(
             -0.5 * weight * eta**2 + information * eta
         )
         return LaplaceTrajectoryResult(
@@ -287,6 +294,7 @@ def poisson_laplace_smoother(
             residual,
             n,
             rejected,
+            (residual <= tolerance) & (rejected == 0),
         )
 
     def static(_: None) -> LaplaceTrajectoryResult:
@@ -305,47 +313,37 @@ def poisson_laplace_smoother(
         white_design = jnp.einsum("ti,tij->tj", design, white_loading)
         offset = jnp.sum(design * prior_path, axis=1) + jnp.log(dt)
 
-        def weights(u: Array) -> Array:
-            return jnp.where(
-                valid, jnp.exp(jnp.minimum(offset + white_design @ u, 600.0)), 0.0
-            )
+        def whitened_newton(
+            z: Array, off: Array, yy: Array
+        ) -> tuple[
+            Callable[[Array], Array], Callable[[Array], Array], Callable[[Array], Array]
+        ]:
+            def hessian(u: Array) -> Array:
+                w = jnp.where(valid, _clipped_exp(off + z @ u), 0.0)
+                return identity + z.T @ (w[:, None] * z)
 
-        def hessian(u: Array) -> Array:
-            return identity + white_design.T @ (weights(u)[:, None] * white_design)
+            def target(u: Array) -> Array:
+                w = jnp.where(valid, _clipped_exp(off + z @ u), 0.0)
+                h = identity + z.T @ (w[:, None] * z)
+                return cast(Array, u + jnp.linalg.solve(h, z.T @ (yy - w) - u))
 
-        def target(u: Array) -> Array:
-            w = weights(u)
-            gradient = white_design.T @ (y - w) - u
-            return cast(Array, u + jnp.linalg.solve(hessian(u), gradient))
-
-        def merit(u: Array) -> Array:
-            eta = offset + white_design @ u
-            return (
-                jnp.sum(jnp.where(valid, y * eta - weights(u) - gammaln(y + 1), 0.0))
-                - 0.5 * u @ u
-            )
-
-        pdesign, poffset, py = jax.lax.stop_gradient((white_design, offset, y))
-
-        def stopped_target(u: Array) -> Array:
-            w = jnp.where(
-                valid, jnp.exp(jnp.minimum(poffset + pdesign @ u, 600.0)), 0.0
-            )
-            h = identity + pdesign.T @ (w[:, None] * pdesign)
-            return cast(Array, u + jnp.linalg.solve(h, pdesign.T @ (py - w) - u))
-
-        def stopped_merit(u: Array) -> Array:
-            eta = poffset + pdesign @ u
-            return (
-                jnp.sum(
-                    jnp.where(
-                        valid,
-                        py * eta - jnp.exp(jnp.minimum(eta, 600.0)) - gammaln(py + 1),
-                        0.0,
+            def merit(u: Array) -> Array:
+                eta = off + z @ u
+                return (
+                    jnp.sum(
+                        jnp.where(
+                            valid, yy * eta - _clipped_exp(eta) - gammaln(yy + 1), 0.0
+                        )
                     )
+                    - 0.5 * u @ u
                 )
-                - 0.5 * u @ u
-            )
+
+            return hessian, target, merit
+
+        hessian, target, merit = whitened_newton(white_design, offset, y)
+        _stopped_hessian, stopped_target, stopped_merit = whitened_newton(
+            *jax.lax.stop_gradient((white_design, offset, y))
+        )
 
         u, residual, n, rejected = _iterate_mode(
             jnp.zeros(rank, dtype=dtype),
@@ -368,7 +366,14 @@ def poisson_laplace_smoother(
         )
         ll = merit(mode_u) - 0.5 * jnp.linalg.slogdet(h)[1]
         return LaplaceTrajectoryResult(
-            mean, covariance, cross, ll, residual, n, rejected
+            mean,
+            covariance,
+            cross,
+            ll,
+            residual,
+            n,
+            rejected,
+            (residual <= tolerance) & (rejected == 0),
         )
 
     return cast(
