@@ -37,8 +37,9 @@ import contextlib
 import hashlib
 import logging
 import warnings
+from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -1446,6 +1447,39 @@ def _masked_graph_point_process_filter(
     return filtered_mean, filtered_cov, marginal_ll
 
 
+_Out = TypeVar("_Out")
+
+
+def _vmap_by_noise_structure(
+    fn: Callable[..., _Out],
+    static_neurons: tuple[bool, ...] | None,
+    *batched: Array,
+) -> _Out:
+    """``vmap`` ``fn(static_noise, *args)`` over neurons, grouped by noise.
+
+    With ``static_neurons`` known, static and drifting neurons are vmapped as
+    separate groups so each runs only its own joint solver (a batched
+    ``lax.cond`` would evaluate both); outputs are restored to neuron order.
+    ``None`` vmaps every neuron with the automatic branch choice.
+    """
+    if static_neurons is None:
+        return jax.vmap(partial(fn, None))(*batched)
+    mask = np.asarray(static_neurons, dtype=bool)
+    groups = [(np.flatnonzero(m), flag) for m, flag in ((~mask, False), (mask, True))]
+    groups = [(index, flag) for index, flag in groups if index.size]
+    outputs = [
+        jax.vmap(partial(fn, flag))(*(b[index] for b in batched))
+        for index, flag in groups
+    ]
+    if len(outputs) == 1:
+        return outputs[0]
+    order = np.argsort(np.concatenate([index for index, _ in groups]))
+    return cast(
+        _Out,
+        jax.tree.map(lambda *parts: jnp.concatenate(parts)[order], *outputs),
+    )
+
+
 @partial(
     typed_jit,
     static_argnames=(
@@ -1455,6 +1489,7 @@ def _masked_graph_point_process_filter(
         "max_newton_iter",
         "inference_method",
         "max_smoother_iter",
+        "static_neurons",
     ),
 )
 def _graph_forward_loss(
@@ -1471,23 +1506,29 @@ def _graph_forward_loss(
     max_newton_iter: int,
     inference_method: Literal["sequential", "joint"],
     max_smoother_iter: int,
+    static_neurons: tuple[bool, ...] | None = None,
 ) -> Array:
-    """Pure shared objective for gradient optimization and scale profiles."""
+    """Pure shared objective for gradient optimization and scale profiles.
+
+    ``static_neurons`` (joint inference) marks neurons whose drift is exactly
+    zero; they are evaluated with zero noise and contribute no drift gradient.
+    """
     S = (params["kappa2"] + eigvals) ** (-alpha)
     P0 = jnp.diag(params["tau2"] * S)
 
-    def one(m0: Array, spk: Array, q: Array) -> Array:
+    def one(static_noise: bool | None, m0: Array, spk: Array, q: Array) -> Array:
         if inference_method == "joint":
             result = poisson_laplace_smoother(
                 m0,
                 P0,
                 transition,
-                jnp.diag(q * S),
+                jnp.zeros_like(P0) if static_noise else jnp.diag(q * S),
                 Z,
                 spk,
                 valid,
                 dt=dt,
                 max_iter=max_smoother_iter,
+                static_noise=static_noise,
             )
             return jnp.where(result.converged, result.log_evidence, -jnp.inf)
         return _masked_graph_point_process_filter(
@@ -1503,7 +1544,13 @@ def _graph_forward_loss(
             max_newton_iter=max_newton_iter,
         )[2]
 
-    ll = jax.vmap(one)(params["init_mean"], spikes, params["drift_scale"])
+    ll = _vmap_by_noise_structure(
+        one,
+        static_neurons if inference_method == "joint" else None,
+        params["init_mean"],
+        spikes,
+        params["drift_scale"],
+    )
     return -jnp.sum(ll)
 
 
@@ -1515,6 +1562,100 @@ class _GraphNeuronInference(NamedTuple):
     filtered_mean: Array
     filtered_covariance: Array
     diagnostics: LaplaceTrajectoryResult | None
+
+
+@partial(
+    typed_jit,
+    static_argnames=(
+        "dt",
+        "max_log_count",
+        "max_newton_iter",
+        "inference_method",
+        "max_smoother_iter",
+        "static_neurons",
+    ),
+)
+def _graph_posterior(
+    init_mean: Array,
+    spikes: Array,
+    drift_scale: Array,
+    Z: Array,
+    valid: Array,
+    P0: Array,
+    S: Array,
+    transition: Array,
+    *,
+    dt: float,
+    max_log_count: float,
+    max_newton_iter: int,
+    inference_method: Literal["sequential", "joint"],
+    max_smoother_iter: int,
+    static_neurons: tuple[bool, ...] | None,
+) -> _GraphNeuronInference:
+    """Per-neuron posterior inference as one compiled program.
+
+    Shapes: ``init_mean`` ``(n_neurons, rank)``, ``spikes`` ``(n_neurons,
+    n_time)``, ``drift_scale`` ``(n_neurons,)``; outputs carry a leading
+    ``n_neurons`` axis. Compiling the whole batch keeps the filter's host
+    callbacks inside a single dispatch.
+    """
+
+    def one(
+        static_noise: bool | None, m0: Array, spk: Array, q_c: Array
+    ) -> _GraphNeuronInference:
+        Q = jnp.zeros_like(P0) if static_noise else jnp.diag(q_c * S)
+        filtered_mean, filtered_cov, marginal_ll = _masked_graph_point_process_filter(
+            m0,
+            P0,
+            Z,
+            spk,
+            valid,
+            transition,
+            Q,
+            dt=dt,
+            max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
+            affected=(
+                "the causal filtered_mean/filtered_cov are"
+                if inference_method == "joint"
+                else "the posterior and evidence are"
+            ),
+        )
+        result: LaplaceTrajectoryResult | None = None
+        if inference_method == "joint":
+            result = poisson_laplace_smoother(
+                m0,
+                P0,
+                transition,
+                Q,
+                Z,
+                spk,
+                valid,
+                dt=dt,
+                max_iter=max_smoother_iter,
+                static_noise=static_noise,
+            )
+            smoother_mean, smoother_cov, smoother_cross_cov = (
+                result.mean,
+                result.covariance,
+                result.cross_covariance,
+            )
+            marginal_ll = jnp.where(result.converged, result.log_evidence, -jnp.inf)
+        else:
+            smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
+                filtered_mean, filtered_cov, transition, Q
+            )
+        return _GraphNeuronInference(
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
+            marginal_ll,
+            filtered_mean,
+            filtered_cov,
+            result,
+        )
+
+    return _vmap_by_noise_structure(one, static_neurons, init_mean, spikes, drift_scale)
 
 
 class GraphPlaceFieldModel(SGDFittableMixin):
@@ -1798,65 +1939,6 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             valid = jnp.ones((Z.shape[0],), dtype=bool)
         S = self._spectral_shape_current()
         P0 = jnp.diag(self.tau2 * S)
-        A = self.transition_matrix
-
-        def _one(m0: Array, spk: Array, q_c: Array) -> _GraphNeuronInference:
-            Q = jnp.diag(q_c * S)
-            filtered_mean, filtered_cov, marginal_ll = (
-                _masked_graph_point_process_filter(
-                    m0,
-                    P0,
-                    Z,
-                    spk,
-                    valid,
-                    A,
-                    Q,
-                    dt=self.dt,
-                    max_log_count=self._max_log_count,
-                    max_newton_iter=self.max_newton_iter,
-                    affected=(
-                        "the causal filtered_mean/filtered_cov are"
-                        if self.inference_method == "joint"
-                        else "the posterior and evidence are"
-                    ),
-                )
-            )
-            result: LaplaceTrajectoryResult | None = None
-            if self.inference_method == "joint":
-                result = poisson_laplace_smoother(
-                    m0,
-                    P0,
-                    A,
-                    Q,
-                    Z,
-                    spk,
-                    valid,
-                    dt=self.dt,
-                    max_iter=self.max_smoother_iter,
-                )
-                smoother_mean, smoother_cov, smoother_cross_cov = (
-                    result.mean,
-                    result.covariance,
-                    result.cross_covariance,
-                )
-                marginal_ll = jnp.where(result.converged, result.log_evidence, -jnp.inf)
-            else:
-                smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
-                    filtered_mean,
-                    filtered_cov,
-                    A,
-                    Q,
-                )
-            return _GraphNeuronInference(
-                smoother_mean,
-                smoother_cov,
-                smoother_cross_cov,
-                marginal_ll,
-                filtered_mean,
-                filtered_cov,
-                result,
-            )
-
         (
             self.smoother_mean,
             self.smoother_cov,
@@ -1865,7 +1947,24 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.filtered_mean,
             self.filtered_cov,
             diagnostics,
-        ) = jax.vmap(_one, in_axes=(0, 0, 0))(self.init_mean, spikes, self.drift_scale)
+        ) = _graph_posterior(
+            self.init_mean,
+            spikes,
+            self.drift_scale,
+            Z,
+            valid,
+            P0,
+            S,
+            self.transition_matrix,
+            dt=self.dt,
+            max_log_count=self._max_log_count,
+            max_newton_iter=self.max_newton_iter,
+            inference_method=self.inference_method,
+            max_smoother_iter=self.max_smoother_iter,
+            static_neurons=(
+                self._static_neurons() if self.inference_method == "joint" else None
+            ),
+        )
         if diagnostics is not None:
             self.smoother_diagnostics_ = diagnostics
         return float(jnp.sum(marginal_ll))
@@ -2199,8 +2298,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             init_mean = jnp.pad(
                 init_mean, ((0, 0), (0, self.rank - self.basis.n_components))
             )
+        static_neurons = None
         if self._mle_static_mask is not None:
             drift_scale = jnp.where(self._mle_static_mask, 0.0, drift_scale)
+            static_neurons = tuple(bool(b) for b in np.asarray(self._mle_static_mask))
         return self._forward_loss(
             dict(
                 kappa2=kappa2, tau2=tau2, init_mean=init_mean, drift_scale=drift_scale
@@ -2208,12 +2309,22 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Z,
             spikes,
             valid,
+            static_neurons,
         )
 
     def _forward_loss(
-        self, params: SGDParams, Z: Array, spikes: Array, valid: Array
+        self,
+        params: SGDParams,
+        Z: Array,
+        spikes: Array,
+        valid: Array,
+        static_neurons: tuple[bool, ...] | None = None,
     ) -> Array:
-        """Mean negative log-likelihood at ``params`` under this configuration."""
+        """Negative log-likelihood summed over neurons at ``params``.
+
+        ``static_neurons`` marks neurons whose drift is exactly zero (see
+        :func:`_graph_forward_loss`).
+        """
         return _graph_forward_loss(
             params,
             Z,
@@ -2227,7 +2338,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             max_newton_iter=self.max_newton_iter,
             inference_method=self.inference_method,
             max_smoother_iter=self.max_smoother_iter,
+            static_neurons=static_neurons,
         )
+
+    def _static_neurons(self) -> tuple[bool, ...]:
+        """Which stored per-neuron drift scales are exactly zero."""
+        assert self.drift_scale is not None
+        return tuple(bool(b) for b in np.asarray(self.drift_scale) == 0)
 
     def _current_params(self) -> SGDParams:
         """Stored hyperparameters in the ``_graph_forward_loss`` layout."""
@@ -2396,7 +2513,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     init_mean=base["init_mean"][cell : cell + 1],
                     drift_scale=jnp.atleast_1d(q / factor),
                 )
-                return float(self._forward_loss(params, Z, spk[cell : cell + 1], valid))
+                return float(
+                    self._forward_loss(
+                        params, Z, spk[cell : cell + 1], valid, (q == 0,)
+                    )
+                )
 
             results.append(
                 profile_scale(
@@ -2864,7 +2985,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 "trajectory contains no in-bounds observations for this environment; "
                 "the marginal log-likelihood would depend on no data."
             )
-        loss = float(self._forward_loss(self._current_params(), Z, spk, valid))
+        loss = float(
+            self._forward_loss(
+                self._current_params(), Z, spk, valid, self._static_neurons()
+            )
+        )
         if not np.isfinite(loss):
             raise NonFiniteLikelihoodError(
                 "Held-out log-likelihood is non-finite: joint Laplace inference "

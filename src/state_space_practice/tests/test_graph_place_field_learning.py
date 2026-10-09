@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from scipy.optimize import minimize_scalar
 
+import state_space_practice.graph_place_field as gpf
 from state_space_practice.exceptions import (
     NonFiniteLikelihoodError,
     NotFittedError,
@@ -395,3 +396,38 @@ def test_static_candidate_replaces_positive_profile_choice(learning_env, monkeyp
     assert model.converged_
     assert model.log_likelihood_ == static_ll
     assert model.drift_profiles_[0].scale == 0  # final diagnostic profile agrees
+
+
+@pytest.mark.slow
+def test_partitioned_static_neurons_match_batched_evidence(learning_env, scalar_data):
+    """Grouping static and drifting neurons leaves the objective and its gradient."""
+    times, positions, counts = scalar_data
+    spikes = np.stack([counts, counts[::-1], np.ones_like(counts)], axis=1)
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+    args, _ = model._prepare_sgd_data(times, positions, spikes, warm_start=True)
+    drift = jnp.array([0.0, 0.03, 0.0])
+    params = dict(model._current_params(), drift_scale=drift)
+
+    def loss(q, static_neurons):
+        return gpf._graph_forward_loss(
+            dict(params, drift_scale=q),
+            *args,
+            jnp.asarray(model.basis.eigvals),
+            model.transition_matrix,
+            dt=model.dt,
+            alpha=model.alpha,
+            max_log_count=model._max_log_count,
+            max_newton_iter=model.max_newton_iter,
+            inference_method="joint",
+            max_smoother_iter=model.max_smoother_iter,
+            static_neurons=static_neurons,
+        )
+
+    batched = loss(drift, None)
+    assert np.isfinite(float(batched))
+    partitioned = loss(drift, (True, False, True))
+    assert float(partitioned) == pytest.approx(float(batched), rel=1e-12)
+    grad_batched = jax.grad(loss)(drift, None)
+    grad_partitioned = jax.grad(loss)(drift, (True, False, True))
+    np.testing.assert_allclose(grad_partitioned[1], grad_batched[1], rtol=1e-10)
+    np.testing.assert_array_equal(np.asarray(grad_partitioned)[[0, 2]], 0.0)
