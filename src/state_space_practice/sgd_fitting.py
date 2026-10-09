@@ -711,9 +711,39 @@ class SGDFittableMixin:
                 cache.pop(next(iter(cache)))
         return entry, cache, key
 
-    # Declared as ``(*args, **kwargs)`` so subclasses can replace the data
-    # arguments with their own signature without an [override] violation.
-    # The optimizer settings are keyword-only, exactly as before.
+    def _baked_sgd_step(
+        self,
+        step_cache: dict[Hashable, _CompiledSGDStep] | None,
+        cache_key: Hashable,
+        optimizer: Any,
+        param_spec: SGDParamSpec,
+        n_timesteps: float,
+        data_structure: _LeafStructure,
+        frozen_structure: _LeafStructure,
+        baked_leaves: tuple[list[Any], list[Any]],
+    ) -> _CompiledSGDStep:
+        """Uncached step with data baked in, for losses that need concrete data.
+
+        Evicts the cached entry that failed to trace; callers then stop using
+        the cache for this fit (the pre-cache behaviour).
+        """
+        logger.debug(
+            "%s._sgd_loss_fn needs concrete data; compiling an uncached "
+            "SGD step with the data baked in.",
+            type(self).__name__,
+        )
+        if step_cache is not None:
+            step_cache.pop(cache_key, None)
+        return _build_sgd_step(
+            lambda: self,
+            optimizer,
+            param_spec,
+            n_timesteps,
+            data_structure,
+            frozen_structure,
+            baked_leaves=baked_leaves,
+        )
+
     def _fit_lbfgs_prepared(
         self,
         args: tuple[Any, ...],
@@ -741,29 +771,36 @@ class SGDFittableMixin:
             _DEFAULT_OPTIMIZER, param_spec, n_time, data_structure, frozen_structure
         )
 
-        def value_and_gradient(x: np.ndarray) -> tuple[float, np.ndarray]:
+        def evaluate(x: np.ndarray) -> tuple[float, np.ndarray]:
             loss, gradient = entry.value_and_grad_step(
                 unravel(jnp.asarray(x)), frozen_leaves, data_leaves
             )
             flat_gradient, _ = ravel_pytree(gradient)
             return float(loss), np.asarray(flat_gradient)
 
+        start = np.asarray(initial)
         try:
-            loss0, gradient0 = value_and_gradient(np.asarray(initial))
+            loss0, gradient0 = evaluate(start)
         except _DATA_TRACING_ERRORS:
-            if step_cache is not None:
-                step_cache.pop(cache_key, None)
-            step_cache = None
-            entry = _build_sgd_step(
-                lambda: self,
+            entry = self._baked_sgd_step(
+                step_cache,
+                cache_key,
                 _DEFAULT_OPTIMIZER,
                 param_spec,
                 n_time,
                 data_structure,
                 frozen_structure,
-                baked_leaves=(frozen_leaves, data_leaves),
+                (frozen_leaves, data_leaves),
             )
-            loss0, gradient0 = value_and_gradient(np.asarray(initial))
+            step_cache = None
+            loss0, gradient0 = evaluate(start)
+
+        def value_and_gradient(x: np.ndarray) -> tuple[float, np.ndarray]:
+            # The optimizer's first evaluation is the start, already checked.
+            if np.array_equal(x, start):
+                return loss0, gradient0.copy()
+            return evaluate(x)
+
         if not np.isfinite(loss0) or not np.isfinite(gradient0).all():
             self._clear_fit_state()
             raise NonFiniteLikelihoodError(
@@ -771,7 +808,7 @@ class SGDFittableMixin:
             )
         result = minimize_likelihood(
             value_and_gradient,
-            np.asarray(initial),
+            start,
             bounds=bounds,
             max_iter=max_iter,
             gradient_tolerance=gradient_tolerance,
@@ -815,6 +852,9 @@ class SGDFittableMixin:
         )
         return self.log_likelihood_history_
 
+    # Declared as ``(*args, **kwargs)`` so subclasses can replace the data
+    # arguments with their own signature without an [override] violation.
+    # The optimizer settings are keyword-only, exactly as before.
     def fit_sgd(self, *args: Any, **kwargs: Any) -> list[float]:
         """Fit by gradient descent on the model's SGD loss.
 
@@ -954,25 +994,18 @@ class SGDFittableMixin:
                 if step > 0:
                     raise
                 # The loss needs concrete data while tracing (e.g. it validates
-                # its inputs on the host): bake the data in as constants for
-                # this call instead, uncached (the pre-cache behaviour).
-                logger.debug(
-                    "%s._sgd_loss_fn needs concrete data; compiling an uncached "
-                    "SGD step with the data baked in.",
-                    type(self).__name__,
-                )
-                if step_cache is not None:
-                    step_cache.pop(cache_key, None)
-                step_cache = None
-                step_entry = _build_sgd_step(
-                    lambda: self,
+                # its inputs on the host): bake the data in as constants.
+                step_entry = self._baked_sgd_step(
+                    step_cache,
+                    cache_key,
                     optimizer,
                     param_spec,
                     n_timesteps,
                     data_structure,
                     frozen_structure,
-                    baked_leaves=(frozen_dynamic, data_dynamic),
+                    (frozen_dynamic, data_dynamic),
                 )
+                step_cache = None
                 loss, new_unc_params, new_opt_state, step_finite = (
                     step_entry.train_step(
                         unc_params, opt_state, frozen_dynamic, data_dynamic

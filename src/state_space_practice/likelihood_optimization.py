@@ -136,9 +136,11 @@ def minimize_likelihood(
             "Initial optimizer parameters must be a finite nonempty vector."
         )
     history: list[float] = []
+    last: list[tuple[NDArray[np.float64], float, NDArray[np.float64]]] = []
 
     def evaluate(x: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
         loss, gradient = value_and_gradient(x)
+        last[:] = [(np.array(x), float(loss), np.asarray(gradient, dtype=float))]
         history.append(float(loss))
         return float(loss), np.asarray(gradient, dtype=float)
 
@@ -150,15 +152,20 @@ def minimize_likelihood(
         bounds=bounds,
         options={"maxiter": max_iter, "gtol": tolerance, "ftol": 1e-14, "maxls": 40},
     )
-    loss, gradient = value_and_gradient(np.asarray(result.x))
+    x = np.asarray(result.x)
+    if last and np.array_equal(last[0][0], x):
+        # The optimizer usually stops at its latest evaluation; reuse it.
+        _, loss, gradient = last[0]
+    else:
+        loss, gradient = value_and_gradient(x)
     history.append(float(loss))
     projected = np.asarray(gradient).copy()
     if bounds is not None:
-        for i, (lo, hi) in enumerate(bounds):
-            if lo is not None and result.x[i] <= lo and projected[i] > 0:
-                projected[i] = 0
-            if hi is not None and result.x[i] >= hi and projected[i] < 0:
-                projected[i] = 0
+        lo, hi = (
+            np.array([np.nan if b[k] is None else b[k] for b in bounds], dtype=float)
+            for k in (0, 1)
+        )
+        projected[((x <= lo) & (projected > 0)) | ((x >= hi) & (projected < 0))] = 0
     norm = float(np.max(np.abs(projected)))
     finite = bool(np.isfinite(loss) and np.isfinite(gradient).all())
     return LikelihoodOptimum(
