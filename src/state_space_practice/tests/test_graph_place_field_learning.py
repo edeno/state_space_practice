@@ -1,5 +1,7 @@
 """Behavioral checks of the supported profile/gradient graph estimator."""
 
+import logging
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -307,3 +309,34 @@ def test_unusable_static_candidate_keeps_positive_fit(
     assert float(model.drift_scale[0]) > 1e-3
     assert model.converged_
     assert np.isfinite(model.score(*scalar_data))
+
+
+@pytest.mark.slow
+def test_joint_fit_attributes_filter_nonconvergence_to_causal_outputs(
+    learning_env, scalar_data, caplog
+):
+    """Under joint inference the causal filter only supplies filtered_*."""
+    model = GraphPlaceFieldModel(
+        learning_env,
+        0.1,
+        rank=1,
+        max_newton_iter=2,
+        init_drift_scale=0.03,
+        update_drift_scale=False,
+        update_amplitude=False,
+        update_kappa2=False,
+        update_init_mean=False,
+    )
+    with caplog.at_level(logging.WARNING, logger="state_space_practice"):
+        model.fit(*scalar_data, warm_start=False)
+        jax.effects_barrier()
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "Newton updates did not converge" in record.getMessage()
+    ]
+    assert messages  # the causal filter really is unconverged here
+    assert bool(model.smoother_diagnostics_.converged.all())
+    for message in messages:
+        assert "filtered_mean" in message
+        assert "posterior and evidence" not in message

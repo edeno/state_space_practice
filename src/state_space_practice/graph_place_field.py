@@ -1202,6 +1202,7 @@ def _log_graph_newton_nonconvergence(
     max_relative_step: Array,
     *,
     max_newton_iter: int,
+    affected: str,
 ) -> None:
     """Report exhausted Newton budgets, including under jit/grad/vmap."""
     n = int(np.asarray(n_unconverged))
@@ -1210,15 +1211,19 @@ def _log_graph_newton_nonconvergence(
             "GraphPlaceFieldModel: Newton updates did not converge in %d/%d "
             "observed time bins with max_newton_iter=%d (largest remaining "
             "relative log-rate step %.3g; tolerance 1e-6). Increase "
-            "max_newton_iter; the posterior and evidence are unconverged.",
+            "max_newton_iter; %s unconverged.",
             n,
             int(np.asarray(n_observed)),
             max_newton_iter,
             float(np.asarray(max_relative_step)),
+            affected,
         )
 
 
-@partial(typed_jit, static_argnames=("dt", "max_log_count", "max_newton_iter"))
+@partial(
+    typed_jit,
+    static_argnames=("dt", "max_log_count", "max_newton_iter", "affected"),
+)
 def _masked_graph_point_process_filter(
     init_mean: Array,
     init_cov: Array,
@@ -1231,6 +1236,7 @@ def _masked_graph_point_process_filter(
     dt: float,
     max_log_count: float,
     max_newton_iter: int,
+    affected: str = "the posterior and evidence are",
 ) -> tuple[Array, Array, Array]:
     """Filter one neuron on the full time grid with masked observations.
 
@@ -1266,6 +1272,9 @@ def _masked_graph_point_process_filter(
         observation family.
     max_newton_iter : int
         Maximum Newton iterations for each per-time Laplace update.
+    affected : str
+        Outputs named in the Newton non-convergence warning, completed by
+        "unconverged".
 
     Returns
     -------
@@ -1417,7 +1426,11 @@ def _masked_graph_point_process_filter(
             n_units=jnp.maximum(jnp.sum(valid), 1),
         )
         jax.debug.callback(
-            partial(_log_graph_newton_nonconvergence, max_newton_iter=max_newton_iter),
+            partial(
+                _log_graph_newton_nonconvergence,
+                max_newton_iter=max_newton_iter,
+                affected=affected,
+            ),
             n_unconverged,
             jnp.sum(valid),
             max_step,
@@ -1783,6 +1796,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     dt=self.dt,
                     max_log_count=self._max_log_count,
                     max_newton_iter=self.max_newton_iter,
+                    affected=(
+                        "the causal filtered_mean/filtered_cov are"
+                        if self.inference_method == "joint"
+                        else "the posterior and evidence are"
+                    ),
                 )
             )
             result: LaplaceTrajectoryResult | None = None
