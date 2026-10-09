@@ -5,6 +5,7 @@ import pytest
 
 from state_space_practice.likelihood_optimization import (
     minimize_likelihood,
+    profile_grid,
     profile_scale,
 )
 
@@ -218,3 +219,30 @@ def test_bounded_optimizer_projects_gradient_at_lower_bound():
     assert result.loss == 4
     assert result.converged
     assert result.gradient_norm == 0  # the raw gradient (4) is projected away
+
+
+def test_profile_uses_supplied_grid_losses_without_reevaluating():
+    def objective(q):
+        return float((np.log(q + 1e-3) + 2) ** 2)
+
+    reference = profile_scale(objective, n_grid=9)
+    _, points = profile_grid((1e-8, 10.0), 9)
+    calls = []
+
+    def counted(q):
+        calls.append(q)
+        return objective(q)
+
+    result = profile_scale(
+        counted, n_grid=9, grid_losses=[objective(q) for q in points]
+    )
+    assert calls  # refinement still evaluates the objective
+    assert not set(calls) & set(points.tolist())
+    assert result.scale == reference.scale
+    np.testing.assert_array_equal(result.scales, reference.scales)
+    np.testing.assert_array_equal(result.losses, reference.losses)
+
+
+def test_profile_rejects_misaligned_grid_losses():
+    with pytest.raises(ValueError, match="grid_losses"):
+        profile_scale(lambda q: q, n_grid=9, grid_losses=np.zeros(9))

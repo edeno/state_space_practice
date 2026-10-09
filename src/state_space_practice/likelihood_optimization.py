@@ -9,7 +9,7 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from scipy.optimize import OptimizeResult, minimize, minimize_scalar
 
 from state_space_practice.exceptions import StateSpaceWarning
@@ -71,19 +71,17 @@ def warn_if_unconverged(result: LikelihoodOptimum, name: str) -> None:
         )
 
 
-def profile_scale(
-    objective: Callable[[float], float],
-    *,
-    bounds: tuple[float, float] = (1e-8, 10.0),
-    n_grid: int = 49,
-    objective_tolerance: float = 1e-6,
-) -> ScaleProfile:
-    """Search zero and a log grid, refining every strict sampled local minimum.
+def profile_grid(
+    bounds: tuple[float, float], n_grid: int
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Validated log grid and the points :func:`profile_scale` samples first.
 
-    ``objective`` receives the scale itself, including exactly zero. Bounds
-    apply to the positive grid. Zero is preferred when its loss is within
-    ``objective_tolerance`` of the best value. Non-finite points are unusable;
-    an entirely non-finite search raises. Endpoint/flat diagnostics are retained.
+    Returns
+    -------
+    log_grid : NDArray, shape (n_grid,)
+        Evenly spaced log scales from ``log(lo)`` to ``log(hi)``.
+    points : NDArray, shape (n_grid + 1,)
+        Zero followed by the positive grid, with exact endpoints.
     """
     lo = validate_scalar(bounds[0], "lower scale bound", positive=True)
     hi = validate_scalar(bounds[1], "upper scale bound", positive=True)
@@ -92,13 +90,47 @@ def profile_scale(
     n_grid = validate_int(n_grid, "n_grid", positive=True)
     if n_grid < 3:
         raise ValueError("n_grid must be at least three.")
+    log_grid = np.linspace(np.log(lo), np.log(hi), n_grid)
+    points = np.concatenate(([0.0], np.exp(log_grid)))
+    points[1], points[-1] = lo, hi
+    return log_grid, points
+
+
+def profile_scale(
+    objective: Callable[[float], float],
+    *,
+    bounds: tuple[float, float] = (1e-8, 10.0),
+    n_grid: int = 49,
+    objective_tolerance: float = 1e-6,
+    grid_losses: ArrayLike | None = None,
+) -> ScaleProfile:
+    """Search zero and a log grid, refining every strict sampled local minimum.
+
+    ``objective`` receives the scale itself, including exactly zero. Bounds
+    apply to the positive grid. Zero is preferred when its loss is within
+    ``objective_tolerance`` of the best value. Non-finite points are unusable;
+    an entirely non-finite search raises. Endpoint/flat diagnostics are retained.
+    ``grid_losses``, shape ``(n_grid + 1,)``, supplies the losses at
+    :func:`profile_grid` points (for example computed in one batch), so only
+    refinements call ``objective``.
+    """
+    log_grid, grid_points = profile_grid(bounds, n_grid)
+    hi = float(grid_points[-1])
+    n_grid = log_grid.size
     tolerance = validate_scalar(
         objective_tolerance, "objective_tolerance", nonnegative=True
     )
-    log_grid = np.linspace(np.log(lo), np.log(hi), n_grid)
-    points = [0.0, *np.exp(log_grid).tolist()]
-    points[1], points[-1] = lo, hi
-    values = [float(objective(q)) for q in points]
+    points = grid_points.tolist()
+    if grid_losses is None:
+        values = [float(objective(q)) for q in points]
+    else:
+        supplied = np.asarray(grid_losses, dtype=float)
+        if supplied.shape != grid_points.shape:
+            raise ValueError(
+                f"grid_losses must have shape {grid_points.shape}; "
+                f"got {supplied.shape}."
+            )
+        values = supplied.tolist()
     raw_grid_values = np.asarray(values[1:])
     grid_values = np.where(np.isfinite(raw_grid_values), raw_grid_values, np.inf)
     for i in range(n_grid):

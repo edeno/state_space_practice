@@ -431,3 +431,32 @@ def test_partitioned_static_neurons_match_batched_evidence(learning_env, scalar_
     grad_partitioned = jax.grad(loss)(drift, (True, False, True))
     np.testing.assert_allclose(grad_partitioned[1], grad_batched[1], rtol=1e-10)
     np.testing.assert_array_equal(np.asarray(grad_partitioned)[[0, 2]], 0.0)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("inference_method", ["joint", "sequential"])
+def test_drift_profile_losses_equal_pointwise_objective(
+    learning_env, scalar_data, inference_method
+):
+    times, positions, counts = scalar_data
+    spikes = np.stack([counts, counts[::-1]], axis=1)
+    model = GraphPlaceFieldModel(
+        learning_env, 0.1, rank=2, inference_method=inference_method
+    )
+    args, _ = model._prepare_sgd_data(times, positions, spikes, warm_start=True)
+    profiles = model._profile_drift(*args, (1e-8, 10.0), 5)
+    base = model._current_params()
+    factor = float(model._field_shape_factor())
+    Z, spk, valid = args
+    for cell, profile in enumerate(profiles):
+        assert np.all(np.isfinite(profile.losses))
+        for q, loss in zip(profile.scales, profile.losses, strict=True):
+            params = dict(
+                base,
+                init_mean=base["init_mean"][cell : cell + 1],
+                drift_scale=jnp.atleast_1d(q / factor),
+            )
+            expected = float(
+                model._forward_loss(params, Z, spk[cell : cell + 1], valid, (q == 0,))
+            )
+            assert loss == pytest.approx(expected, rel=1e-10, abs=1e-9)

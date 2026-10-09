@@ -71,6 +71,7 @@ from state_space_practice.laplace_smoothing import (
 )
 from state_space_practice.likelihood_optimization import (
     ScaleProfile,
+    profile_grid,
     profile_scale,
     warn_if_unconverged,
 )
@@ -1480,19 +1481,7 @@ def _vmap_by_noise_structure(
     )
 
 
-@partial(
-    typed_jit,
-    static_argnames=(
-        "dt",
-        "alpha",
-        "max_log_count",
-        "max_newton_iter",
-        "inference_method",
-        "max_smoother_iter",
-        "static_neurons",
-    ),
-)
-def _graph_forward_loss(
+def _graph_neuron_log_evidence(
     params: SGDParams,
     Z: Array,
     spikes: Array,
@@ -1506,9 +1495,9 @@ def _graph_forward_loss(
     max_newton_iter: int,
     inference_method: Literal["sequential", "joint"],
     max_smoother_iter: int,
-    static_neurons: tuple[bool, ...] | None = None,
+    static_neurons: tuple[bool, ...] | None,
 ) -> Array:
-    """Pure shared objective for gradient optimization and scale profiles.
+    """Per-neuron log evidence, shape ``(n_neurons,)``; traced by its callers.
 
     ``static_neurons`` (joint inference) marks neurons whose drift is exactly
     zero; they are evaluated with zero noise and contribute no drift gradient.
@@ -1544,14 +1533,107 @@ def _graph_forward_loss(
             max_newton_iter=max_newton_iter,
         )[2]
 
-    ll = _vmap_by_noise_structure(
+    return _vmap_by_noise_structure(
         one,
         static_neurons if inference_method == "joint" else None,
         params["init_mean"],
         spikes,
         params["drift_scale"],
     )
-    return -jnp.sum(ll)
+
+
+_GRAPH_LOSS_STATIC_ARGS = (
+    "dt",
+    "alpha",
+    "max_log_count",
+    "max_newton_iter",
+    "inference_method",
+    "max_smoother_iter",
+)
+
+
+@partial(typed_jit, static_argnames=(*_GRAPH_LOSS_STATIC_ARGS, "static_neurons"))
+def _graph_forward_loss(
+    params: SGDParams,
+    Z: Array,
+    spikes: Array,
+    valid: Array,
+    eigvals: Array,
+    transition: Array,
+    *,
+    dt: float,
+    alpha: float,
+    max_log_count: float,
+    max_newton_iter: int,
+    inference_method: Literal["sequential", "joint"],
+    max_smoother_iter: int,
+    static_neurons: tuple[bool, ...] | None = None,
+) -> Array:
+    """Pure shared objective (negative log evidence summed over neurons)."""
+    return -jnp.sum(
+        _graph_neuron_log_evidence(
+            params,
+            Z,
+            spikes,
+            valid,
+            eigvals,
+            transition,
+            dt=dt,
+            alpha=alpha,
+            max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
+            inference_method=inference_method,
+            max_smoother_iter=max_smoother_iter,
+            static_neurons=static_neurons,
+        )
+    )
+
+
+@partial(typed_jit, static_argnames=(*_GRAPH_LOSS_STATIC_ARGS, "static"))
+def _graph_profile_losses(
+    params: SGDParams,
+    Z: Array,
+    spikes: Array,
+    valid: Array,
+    eigvals: Array,
+    transition: Array,
+    drift_values: Array,
+    *,
+    dt: float,
+    alpha: float,
+    max_log_count: float,
+    max_newton_iter: int,
+    inference_method: Literal["sequential", "joint"],
+    max_smoother_iter: int,
+    static: bool,
+) -> Array:
+    """Per-neuron negative log evidence at shared drift values.
+
+    Every neuron takes each value of ``drift_values`` (shape ``(n_values,)``,
+    coefficient units; all zero when ``static``) in turn. One compiled call
+    replaces ``n_values * n_neurons`` host round trips. Returns shape
+    ``(n_values, n_neurons)``.
+    """
+    n_neurons = spikes.shape[0]
+
+    def at(drift: Array) -> Array:
+        return -_graph_neuron_log_evidence(
+            dict(params, drift_scale=jnp.full(n_neurons, drift)),
+            Z,
+            spikes,
+            valid,
+            eigvals,
+            transition,
+            dt=dt,
+            alpha=alpha,
+            max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
+            inference_method=inference_method,
+            max_smoother_iter=max_smoother_iter,
+            static_neurons=(static,) * n_neurons,
+        )
+
+    return cast(Array, jax.lax.map(at, drift_values))
 
 
 class _GraphNeuronInference(NamedTuple):
@@ -2341,6 +2423,36 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             static_neurons=static_neurons,
         )
 
+    def _profile_losses(
+        self,
+        params: SGDParams,
+        drift_values: Array,
+        Z: Array,
+        spikes: Array,
+        valid: Array,
+        *,
+        static: bool,
+    ) -> NDArray[np.float64]:
+        """Per-neuron losses at shared drift values, ``(n_values, n_neurons)``."""
+        return np.asarray(
+            _graph_profile_losses(
+                params,
+                Z,
+                spikes,
+                valid,
+                jnp.asarray(self.basis.eigvals),
+                self.transition_matrix,
+                drift_values,
+                dt=self.dt,
+                alpha=self.alpha,
+                max_log_count=self._max_log_count,
+                max_newton_iter=self.max_newton_iter,
+                inference_method=self.inference_method,
+                max_smoother_iter=self.max_smoother_iter,
+                static=static,
+            )
+        )
+
     def _static_neurons(self) -> tuple[bool, ...]:
         """Which stored per-neuron drift scales are exactly zero."""
         assert self.drift_scale is not None
@@ -2504,6 +2616,25 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     ) -> tuple[ScaleProfile, ...]:
         base = self._current_params()
         factor = float(self._field_shape_factor())
+        bounds = (
+            drift_bounds[0] * self._mle_reference_factor,
+            drift_bounds[1] * self._mle_reference_factor,
+        )
+        _, points = profile_grid(bounds, profile_points)
+        # (n_grid + 1, n_neurons): exact zero, then the positive grid.
+        grid_losses = np.concatenate(
+            [
+                self._profile_losses(base, jnp.zeros(1), Z, spk, valid, static=True),
+                self._profile_losses(
+                    base,
+                    jnp.asarray(points[1:] / factor),
+                    Z,
+                    spk,
+                    valid,
+                    static=False,
+                ),
+            ]
+        )
         results = []
         for cell in range(self.n_neurons):
 
@@ -2522,11 +2653,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             results.append(
                 profile_scale(
                     objective,
-                    bounds=(
-                        drift_bounds[0] * self._mle_reference_factor,
-                        drift_bounds[1] * self._mle_reference_factor,
-                    ),
+                    bounds=bounds,
                     n_grid=profile_points,
+                    grid_losses=grid_losses[:, cell],
                 )
             )
         return tuple(results)
