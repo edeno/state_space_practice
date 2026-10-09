@@ -12,7 +12,11 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 from state_space_practice.fitted_state import is_set
 from state_space_practice.tests.graph_helpers import legacy_graph_model
 from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
@@ -492,6 +496,14 @@ def test_static_glm_recovers_smooth_field(small_grid_env):
     assert np.all(np.linalg.eigvalsh(np.asarray(cov)) > -1e-8)
 
 
+def test_static_glm_warns_when_newton_budget_is_exhausted(small_grid_env):
+    basis = build_graph_basis(small_grid_env, rank=10)
+    counts = np.random.default_rng(5).poisson(5.0, small_grid_env.n_bins)
+    occ = np.full(small_grid_env.n_bins, 4.0)
+    with pytest.warns(StateSpaceWarning, match="did not reach"):
+        fit_static_graph_glm(counts, occ, basis.eigvecs, np.ones(10), max_iter=1)
+
+
 def test_static_glm_ignores_unvisited_bins(small_grid_env):
     from state_space_practice.graph_place_field import build_graph_basis
 
@@ -690,9 +702,10 @@ def test_evidence_selection_compares_separate_local_maxima(isolated_bins_env):
 )
 def test_evidence_selection_includes_bounds(isolated_bins_env, count, bounds, expected):
     basis = build_graph_basis(isolated_bins_env, rank=2)
-    selected = select_tau2_by_evidence(
-        np.full(2, count), np.ones(2), basis, kappa2=1.0, bounds=bounds
-    )
+    with pytest.warns(StateSpaceWarning, match="tau2 search bound"):
+        selected = select_tau2_by_evidence(
+            np.full(2, count), np.ones(2), basis, kappa2=1.0, bounds=bounds
+        )
     assert selected == expected
 
 

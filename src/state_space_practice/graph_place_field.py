@@ -987,14 +987,13 @@ def fit_static_graph_glm(
         # A non-converged solve returns a MAP far from the optimum and a Laplace
         # covariance evaluated off the stationary point; surface it rather than let
         # it silently poison tau2 selection or the EM warm-start.
-        logger.warning(
-            "fit_static_graph_glm: %d/%d neuron(s) did not reach the gradient "
-            "tolerance %.1e within max_iter=%d; raise max_iter or check the "
+        warnings.warn(
+            f"fit_static_graph_glm: {n_unconverged}/{counts_2d.shape[1]} "
+            f"neuron(s) did not reach the gradient tolerance {float(tol_arr):.1e} "
+            f"within max_iter={max_iter}; raise max_iter or check the "
             "conditioning of penalty_diag / counts.",
-            n_unconverged,
-            counts_2d.shape[1],
-            float(tol_arr),
-            max_iter,
+            StateSpaceWarning,
+            stacklevel=2,
         )
     if single:
         return weights[0], cov[0]
@@ -1105,7 +1104,8 @@ def select_tau2_by_evidence(
     Returns
     -------
     float
-        The evidence-maximizing ``tau2``.
+        The evidence-maximizing ``tau2``. A ``StateSpaceWarning`` is emitted
+        when it is a search bound.
     """
     bounds_arr = np.asarray(bounds, dtype=float)
     if (
@@ -1176,10 +1176,14 @@ def select_tau2_by_evidence(
                 best_x, best_loss = float(result.x), float(result.fun)
 
     # Preserve the exact supplied endpoints instead of exp(log(bound)) rounding.
-    if best_x == lo:
-        return float(bounds_arr[0])
-    if best_x == hi:
-        return float(bounds_arr[1])
+    if best_x in (lo, hi):
+        warnings.warn(
+            "tau2 evidence is maximized at the tau2 search bound "
+            f"{float(np.exp(best_x)):.3g}; widen bounds.",
+            StateSpaceWarning,
+            stacklevel=2,
+        )
+        return float(bounds_arr[0] if best_x == lo else bounds_arr[1])
     return float(np.exp(best_x))
 
 
