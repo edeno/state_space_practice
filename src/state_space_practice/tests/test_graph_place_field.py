@@ -285,6 +285,26 @@ def test_basis_cache_invalidates_on_laplacian_change(monkeypatch):
     assert not np.allclose(basis0.eigvals, basis1.eigvals)
 
 
+def test_graph_basis_keeps_its_released_field_layout(small_grid_env):
+    """GraphBasis is public: existing fields keep their positions and env_key keeps
+    its ``(n_bins, nnz, digest)`` layout; the convention is a trailing field."""
+    basis = build_graph_basis(small_grid_env)
+    assert GraphBasis._fields[:6] == (
+        "eigvecs",
+        "eigvals",
+        "component_labels",
+        "bin_sizes",
+        "n_components",
+        "env_key",
+    )
+    laplacian = build_graph_laplacian(small_grid_env)
+    laplacian.eliminate_zeros()
+    n_bins, nnz, digest = basis.env_key
+    assert (n_bins, nnz) == (small_grid_env.n_bins, laplacian.nnz)
+    assert isinstance(digest, str)
+    assert GraphBasis(*basis[:6]).laplacian_convention == "distance"
+
+
 def test_basis_fingerprint_distinguishes_equal_aggregate_graphs():
     """Different topologies must not collide merely because n/nnz/sum(abs(L)) match."""
 

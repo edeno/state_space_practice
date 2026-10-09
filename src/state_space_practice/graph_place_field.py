@@ -138,12 +138,12 @@ class GraphBasis(NamedTuple):
         Per-bin volume (``env.bin_sizes``) for integration/density. **Not** exposure.
     n_components : int
         Number of connected components (= number of retained null modes).
+    env_key : tuple
+        Identity fingerprint ``(n_bins, nnz, sha256 hex digest)`` of the
+        environment's canonical CSR Laplacian and its convention. Consumers
+        refuse a basis built for a different environment or convention.
     laplacian_convention : {"distance", "inverse_distance"}
         Edge-weight convention used to construct the Laplacian and eigenbasis.
-    env_key : tuple
-        Identity fingerprint ``(convention, n_rows, n_cols, sha256)`` of the
-        environment's canonical CSR Laplacian. Consumers refuse a basis built
-        for a different environment or convention.
     """
 
     eigvecs: NDArray[np.float64]
@@ -151,8 +151,8 @@ class GraphBasis(NamedTuple):
     component_labels: NDArray[np.int_]
     bin_sizes: NDArray[np.float64]
     n_components: int
-    laplacian_convention: LaplacianConvention
-    env_key: tuple[str, int, int, str]
+    env_key: tuple[int, int, str]
+    laplacian_convention: LaplacianConvention = "distance"
 
 
 def _validate_laplacian_convention(convention: str) -> LaplacianConvention:
@@ -273,7 +273,7 @@ def build_graph_laplacian(
 
 def _laplacian_key(
     laplacian: sp.spmatrix, convention: LaplacianConvention
-) -> tuple[str, int, int, str]:
+) -> tuple[int, int, str]:
     """Collision-resistant identity of the canonical CSR matrix and convention."""
     matrix = sp.csr_matrix(laplacian, dtype=np.float64, copy=True)
     matrix.sum_duplicates()
@@ -288,21 +288,16 @@ def _laplacian_key(
     data = np.asarray(matrix.data, dtype="<f8").copy()
     data[data == 0.0] = 0.0
 
-    digest = hashlib.sha256()
+    digest = hashlib.sha256(convention.encode())
     for buffer in (shape, indptr, indices, data):
         digest.update(np.asarray(buffer.size, dtype="<i8").tobytes())
         digest.update(buffer.tobytes(order="C"))
-    return (
-        convention,
-        int(matrix.shape[0]),
-        int(matrix.shape[1]),
-        digest.hexdigest(),
-    )
+    return int(matrix.shape[0]), int(matrix.nnz), digest.hexdigest()
 
 
 def _env_key(
     env: Environment, convention: LaplacianConvention
-) -> tuple[str, int, int, str]:
+) -> tuple[int, int, str]:
     """Fingerprint of ``env`` under the requested Laplacian convention."""
     return _laplacian_key(build_graph_laplacian(env, convention), convention)
 
