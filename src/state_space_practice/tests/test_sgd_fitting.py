@@ -7,7 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
+from state_space_practice.fitted_state import is_set
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     STOCHASTIC_ROW,
@@ -159,6 +164,29 @@ def test_lbfgs_warns_when_budget_is_exhausted():
     with pytest.warns(StateSpaceWarning, match="did not converge"):
         model.fit_lbfgs(jnp.array(3.0), max_iter=1)
     assert not model.converged_
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("bad_target", [np.nan, np.inf])
+def test_lbfgs_rejects_nonfinite_initial_objective_and_clears_fit(bad_target):
+    model = _ToyModel(scale=0.1)
+    model.fit_lbfgs(jnp.array(3.0))
+    assert is_set(model, "optimizer_result_")  # guard: a previous fit exists
+    fitted_scale = model.scale
+
+    with pytest.raises(NonFiniteLikelihoodError, match="initial objective"):
+        model.fit_lbfgs(jnp.array(bad_target))
+
+    assert model.scale == fitted_scale  # no step was taken or stored
+    for name in (
+        "optimizer_result_",
+        "log_likelihood_",
+        "log_likelihood_history_",
+        "converged_",
+    ):
+        assert not is_set(model, name)
+    with pytest.raises(NotFittedError):
+        _ = model.optimizer_result_
 
 
 class _UnconstrainedToyModel(_ToyModel):

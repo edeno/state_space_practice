@@ -589,6 +589,80 @@ def test_static_glm_rejects_dependent_observed_unpenalized_columns():
         )
 
 
+@pytest.fixture
+def static_glm_inputs():
+    """Valid inputs; each validation case below perturbs exactly one of them."""
+    eigvecs, _ = np.linalg.qr(np.array([[1.0, 0.3], [1.0, -0.5], [1.0, 0.9]]))
+    return dict(
+        counts=np.array([1.0, 2.0, 0.0]),
+        occupancy=np.array([1.0, 2.0, 0.5]),
+        eigvecs=eigvecs,
+        penalty_diag=np.array([0.5, 2.0]),
+    )
+
+
+def test_static_glm_validation_baseline_is_accepted(static_glm_inputs):
+    weights, covariance = fit_static_graph_glm(**static_glm_inputs)
+    assert np.all(np.isfinite(np.asarray(weights)))
+    assert np.all(np.linalg.eigvalsh(np.asarray(covariance)) > 0)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        (dict(counts=np.array([1.0, -2.0, 0.0])), "non-negative counts"),
+        (dict(counts=np.array([1.0, 2.5, 0.0])), "integer-valued"),
+        (dict(counts=np.array([1.0, np.nan, 0.0])), "finite counts"),
+        (dict(counts=np.zeros((3, 1, 1))), "counts must have shape"),
+        (dict(counts=np.array([1.0, 2.0])), "same n_bins"),
+        (dict(eigvecs=np.ones(3)), "eigvecs must be a non-empty"),
+        (dict(eigvecs=np.ones((3, 0))), "eigvecs must be a non-empty"),
+        (
+            dict(eigvecs=np.array([[1.0, 0.0], [0.0, np.nan], [0.0, 0.0]])),
+            "eigvecs must contain only finite",
+        ),
+        (
+            dict(eigvecs=np.array([[1.0, 0.0], [0.0, np.inf], [0.0, 0.0]])),
+            "eigvecs must contain only finite",
+        ),
+        (dict(occupancy=np.ones(2)), "occupancy must have shape"),
+        (dict(occupancy=np.ones((3, 1))), "occupancy must have shape"),
+        (dict(occupancy=np.array([1.0, -2.0, 0.5])), "occupancy must contain only"),
+        (dict(occupancy=np.array([1.0, np.nan, 0.5])), "occupancy must contain only"),
+        (dict(occupancy=np.array([1.0, np.inf, 0.5])), "occupancy must contain only"),
+        (dict(occupancy=np.array([1.0, 0.0, 0.5])), "zero in bins with zero"),
+        (dict(penalty_diag=np.ones(3)), "penalty_diag must have shape"),
+        (dict(penalty_diag=np.array([0.5, -2.0])), "penalty_diag must contain only"),
+        (dict(penalty_diag=np.array([0.5, np.nan])), "penalty_diag must contain only"),
+        (dict(max_iter=0), "max_iter must be a positive integer"),
+        (dict(max_iter=-3), "max_iter must be a positive integer"),
+        (dict(max_iter=True), "max_iter must be a positive integer"),
+        (dict(max_iter=5.0), "max_iter must be a positive integer"),
+        (dict(tol=0.0), "tol must be a finite positive scalar"),
+        (dict(tol=-1e-8), "tol must be a finite positive scalar"),
+        (dict(tol=np.nan), "tol must be a finite positive scalar"),
+        (dict(tol=np.array([1e-8, 1e-8])), "tol must be a finite positive scalar"),
+    ],
+)
+def test_static_glm_rejects_invalid_inputs(static_glm_inputs, overrides, match):
+    with pytest.raises(ValueError, match=match):
+        fit_static_graph_glm(**{**static_glm_inputs, **overrides})
+
+
+def test_static_glm_rejects_spikes_in_unvisited_bin_for_any_neuron(static_glm_inputs):
+    occupancy = np.array([1.0, 2.0, 0.0])  # third bin never visited
+    counts = np.array([[1.0, 1.0], [2.0, 2.0], [0.0, 0.0]])
+    # Guard: zero counts in the unvisited bin are a valid fit.
+    fit_static_graph_glm(
+        **{**static_glm_inputs, "counts": counts, "occupancy": occupancy}
+    )
+    counts[2, 1] = 1.0  # only the second neuron fires where the animal never was
+    with pytest.raises(ValueError, match="zero in bins with zero occupancy"):
+        fit_static_graph_glm(
+            **{**static_glm_inputs, "counts": counts, "occupancy": occupancy}
+        )
+
+
 def test_static_glm_multineuron_matches_per_neuron(small_grid_env):
     from state_space_practice.graph_place_field import build_graph_basis
 
@@ -707,6 +781,26 @@ def test_evidence_selection_includes_bounds(isolated_bins_env, count, bounds, ex
             np.full(2, count), np.ones(2), basis, kappa2=1.0, bounds=bounds
         )
     assert selected == expected
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        (np.nan, 10.0),
+        (1e-4, np.inf),
+        (10.0, 1e-4),
+        (1.0, 1.0),
+        (0.0, 10.0),
+        (-1.0, 10.0),
+        (1e-4, 1.0, 10.0),
+    ],
+)
+def test_evidence_selection_rejects_invalid_bounds(isolated_bins_env, bounds):
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    with pytest.raises(ValueError, match="bounds must be two finite positive"):
+        select_tau2_by_evidence(
+            np.full(2, 3.0), np.ones(2), basis, kappa2=1.0, bounds=bounds
+        )
 
 
 # ------------------------------------------------- static parity + W-maze recovery
@@ -1706,6 +1800,71 @@ def test_fit_preserves_learned_drift_scale_on_repeat(small_grid_env):
 def test_constructor_rejects_bad_max_newton_iter(small_grid_env, bad):
     with pytest.raises(ValueError, match="max_newton_iter"):
         legacy_graph_model(small_grid_env, dt=0.02, rank=3, max_newton_iter=bad)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        (
+            dict(inference_method="bogus"),
+            "inference_method must be sequential or joint",
+        ),
+        (
+            dict(inference_method="Joint"),
+            "inference_method must be sequential or joint",
+        ),
+        (dict(init_drift_scale=-1.0), "init_drift_scale must be non-negative"),
+        (dict(max_smoother_iter=0), "max_smoother_iter must be a positive integer"),
+    ],
+)
+def test_constructor_rejects_bad_inference_settings(small_grid_env, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        legacy_graph_model(small_grid_env, dt=0.02, rank=3, **kwargs)
+
+
+@pytest.fixture
+def fitted_fixed_graph_model(small_grid_env):
+    """A cheaply fitted model (fixed hyperparameters: one inference pass)."""
+    times, traj = _toy_trajectory(small_grid_env, 20, seed=6)
+    spikes = np.random.default_rng(7).poisson(0.2, size=20).astype(float)
+    model = legacy_graph_model(
+        small_grid_env,
+        dt=0.02,
+        rank=3,
+        update_amplitude=False,
+        update_init_mean=False,
+        update_kappa2=False,
+    )
+    model.fit(times, traj, spikes)
+    assert model._is_fitted and is_set(model, "smoother_mean")
+    return model, (times, traj, spikes)
+
+
+@pytest.mark.slow
+def test_fit_rejects_unknown_method_and_clears_previous_fit(fitted_fixed_graph_model):
+    model, data = fitted_fixed_graph_model
+    with pytest.raises(ValueError, match="method must be mle or em"):
+        model.fit(*data, method="bogus")
+    assert not model._is_fitted
+    assert not is_set(model, "smoother_mean")
+    assert not is_set(model, "log_likelihood_")
+    with pytest.raises(NotFittedError):
+        model.predict_log_rate_trajectory()
+
+
+@pytest.mark.slow
+def test_fit_mle_rejects_unknown_mean_mode_and_restores_state(
+    fitted_fixed_graph_model,
+):
+    model, data = fitted_fixed_graph_model
+    start = (model.kappa2, model.tau2, model.init_mean, model.drift_scale)
+    with pytest.raises(ValueError, match="initial_mean_mode must be baseline or full"):
+        model.fit_mle(*data, initial_mean_mode="bogus")
+    assert (model.kappa2, model.tau2, model.init_mean, model.drift_scale) == start
+    assert not model._is_fitted
+    assert not is_set(model, "smoother_mean")
+    with pytest.raises(NotFittedError):
+        model.predict_log_rate_trajectory()
 
 
 def test_predict_and_score_require_fit(small_grid_env):

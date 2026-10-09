@@ -151,3 +151,70 @@ def test_optimizer_history_records_accepted_iterates_only():
     assert len(history) == result.n_iter + 1
     assert history[0] == 9.0
     assert history[-1] == result.loss
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        (dict(bounds=(1.0, 1.0)), "increasing"),
+        (dict(bounds=(10.0, 1.0)), "increasing"),
+        (dict(bounds=(0.0, 1.0)), "lower scale bound must be positive"),
+        (dict(bounds=(-1.0, 1.0)), "lower scale bound must be positive"),
+        (dict(bounds=(np.nan, 1.0)), "lower scale bound must be finite"),
+        (dict(bounds=(1e-3, np.inf)), "upper scale bound must be finite"),
+        (dict(n_grid=2), "at least three"),
+        (dict(n_grid=0), "n_grid must be a positive integer"),
+        (dict(n_grid=5.0), "n_grid must be a positive integer"),
+        (dict(objective_tolerance=-1.0), "objective_tolerance must be non-negative"),
+        (dict(objective_tolerance=np.nan), "objective_tolerance must be finite"),
+    ],
+)
+def test_profile_rejects_invalid_search_settings(kwargs, match):
+    calls = []
+
+    def objective(q):
+        calls.append(q)
+        return (q - 1.0) ** 2
+
+    with pytest.raises(ValueError, match=match):
+        profile_scale(objective, **kwargs)
+    assert calls == []  # rejected before any likelihood evaluation
+
+
+@pytest.mark.parametrize(
+    ("initial", "kwargs", "match"),
+    [
+        (np.array([np.nan]), {}, "finite nonempty vector"),
+        (np.array([np.inf, 0.0]), {}, "finite nonempty vector"),
+        (np.array([]), {}, "finite nonempty vector"),
+        (np.zeros((1, 1)), {}, "finite nonempty vector"),
+        (np.zeros(1), dict(max_iter=0), "max_iter must be a positive integer"),
+        (np.zeros(1), dict(max_iter=2.0), "max_iter must be a positive integer"),
+        (np.zeros(1), dict(gradient_tolerance=0.0), "gradient_tolerance must be"),
+        (np.zeros(1), dict(gradient_tolerance=np.nan), "gradient_tolerance must be"),
+    ],
+)
+def test_optimizer_rejects_invalid_start_and_settings(initial, kwargs, match):
+    calls = []
+
+    def objective(x):
+        calls.append(x)
+        return float(np.sum(x**2)), 2 * np.asarray(x, dtype=float)
+
+    with pytest.raises(ValueError, match=match):
+        minimize_likelihood(objective, initial, **kwargs)
+    assert calls == []
+
+
+def test_bounded_optimizer_projects_gradient_at_lower_bound():
+    # The unconstrained minimum (-2) lies below the box, so the solution is the
+    # lower bound with a strictly positive raw gradient pushing outward.
+    result = minimize_likelihood(
+        lambda x: (float((x[0] + 2) ** 2), np.array([2 * (x[0] + 2)])),
+        np.array([0.5]),
+        bounds=[(0, 1)],
+    )
+    assert result.parameters[0] == 0
+    assert result.loss == 4
+    assert result.converged
+    assert result.gradient_norm == 0  # the raw gradient (4) is projected away
