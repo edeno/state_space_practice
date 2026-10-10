@@ -1925,16 +1925,16 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Run the joint smoother's linear passes by associative scans
             (``poisson_laplace_smoother(parallel=...)``). ``None`` (default)
             selects them on GPU/TPU and the sequential pass on CPU, where the
-            parallel pass is 2-4x slower. Both give the same fit. Ignored by
+            parallel pass is 2-5x slower. Both give the same fit. Ignored by
             ``inference_method="sequential"``.
         neuron_batch_size : int or None, optional
             Infer at most this many neurons at once (``lax.map`` over chunks)
             to bound device memory; ``None`` (default) batches every neuron.
             Gradients recompute each chunk (``jax.checkpoint``) rather than
             storing every chunk's intermediates.
-            With gradients, the parallel pass needs about 11.6 GiB per neuron
-            at ``n_time`` = 70,930 and rank 20 (sequential: 3.6 GiB), scaling
-            with ``n_time * rank**2``.
+            With gradients, the parallel pass needs about 12-17 GiB per neuron
+            at ``n_time`` = 70,930 and rank 20 (sequential: about 4 GiB),
+            scaling with ``n_time * rank**2``.
         """
         # The compiled filter treats dt as static; normalize concrete scalar
         # array inputs to a finite, hashable Python float before caching it.

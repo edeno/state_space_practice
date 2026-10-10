@@ -318,10 +318,11 @@ def poisson_laplace_smoother(
         associative scans, with O(log n_time) sequential depth instead of
         O(n_time). ``None`` (default) selects them on GPU/TPU and the sequential
         pass on CPU (:func:`resolve_parallel`). Both converge to the same mode
-        and evidence. On an A100 the parallel pass was 18-69x faster for one
-        trajectory (n_time 750-70,930, rank 20); on CPU it was 2-4x slower.
-        With gradients it needs about 3x the device memory of the sequential
-        pass (11.6 GiB vs 3.6 GiB at n_time = 70,930, rank 20), scaling with
+        and evidence. On an A100 the parallel pass was 18-129x faster for one
+        trajectory (n_time 750-70,930, rank 20) and 5-20x for 8-32 batched
+        trajectories; on CPU it was 2-5x slower. With gradients it needs about
+        3-4x the device memory of the sequential pass (12-17 GiB vs about
+        4 GiB per trajectory at n_time = 70,930, rank 20), scaling with
         ``n_time * rank**2``. See Särkkä & García-Fernández (2021), IEEE TAC
         66(1), 299-306.
 
