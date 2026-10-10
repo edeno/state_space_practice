@@ -1,6 +1,6 @@
 # Iterated and Parallel Laplace Smoother Implementation Plan
 
-**Status:** Not started.
+**Status:** Phase 2a implemented on branch `feat/joint-laplace-parallel` (not merged; results in its phase file). Phases 1, 2b, 3 and 4 not started (gated on overview.md Open Question 6).
 
 Adds an *iterated* Laplace smoother for point-process (Poisson GLM) observations to
 `stochastic_point_process_smoother` and the models built on it (`PointProcessModel`,
