@@ -20,8 +20,8 @@ from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.kalman import (
     InitialStatePrior,
     _gain_solve,
-    _parallel_information_filter,
     _kalman_smoother_update,
+    _parallel_information_filter,
     _scan_with_boundary,
     joseph_form_update,
     kalman_filter,

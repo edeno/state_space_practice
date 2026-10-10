@@ -1405,10 +1405,10 @@ def _combine_filter_elements(
     lu = jax.scipy.linalg.lu_factor(identity + earlier.C @ later.J)
 
     def solve(rhs: jax.Array) -> jax.Array:
-        return jax.scipy.linalg.lu_solve(lu, rhs)
+        return cast(jax.Array, jax.scipy.linalg.lu_solve(lu, rhs))
 
     def solve_transposed(rhs: jax.Array) -> jax.Array:
-        return jax.scipy.linalg.lu_solve(lu, rhs, trans=1)
+        return cast(jax.Array, jax.scipy.linalg.lu_solve(lu, rhs, trans=1))
 
     return _FilterElement(
         A=later.A @ solve(earlier.A),
