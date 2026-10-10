@@ -18,7 +18,10 @@ from state_space_practice.exceptions import (
     StateSpaceWarning,
 )
 from state_space_practice.fitted_state import is_set
-from state_space_practice.tests.graph_helpers import legacy_graph_model
+from state_space_practice.tests.graph_helpers import (
+    legacy_graph_model,
+    set_smoothed_posterior,
+)
 from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 from state_space_practice.tests.model_state import (
     assert_model_state_unchanged,
@@ -919,6 +922,7 @@ def test_model_rejects_nonfinite_hyperparameters(small_grid_env, name):
         {"neuron_batch_size": -1},
         {"neuron_batch_size": 1.5},
         {"neuron_batch_size": True},
+        {"store_covariances": "no"},
     ],
 )
 def test_model_rejects_bad_parallel_settings(small_grid_env, setting):
@@ -1150,9 +1154,7 @@ def test_tau_mstep_includes_fixed_prior_mean_residual(small_grid_env):
     )
     model.init_mean = jnp.zeros((1, 1))
     model.drift_scale = jnp.array([1e-3])
-    model.smoother_mean = jnp.array([[[10.0]]])
-    model.smoother_cov = jnp.array([[[[1.0]]]])
-    model.smoother_cross_cov = jnp.zeros((1, 0, 1, 1))
+    set_smoothed_posterior(model, [[[10.0]]], [[[[1.0]]]], jnp.zeros((1, 0, 1, 1)))
 
     shape = float(model._spectral_shape_current()[0])
     model._m_step()
@@ -1735,9 +1737,12 @@ def test_drift_scale_mstep_matches_closed_form(small_grid_env):
     )
     model.init_mean = jnp.zeros((1, 1))
     # a=Var_0=1, b=Var_1=3, d=mean_1=2 (mean_0=0), c=cross-cov=0.5.
-    model.smoother_mean = jnp.array([[[0.0], [2.0]]])  # (n_neurons=1, T=2, rank=1)
-    model.smoother_cov = jnp.array([[[[1.0]], [[3.0]]]])  # (1, 2, 1, 1)
-    model.smoother_cross_cov = jnp.array([[[[0.5]]]])  # (1, T-1=1, 1, 1)
+    set_smoothed_posterior(
+        model,
+        [[[0.0], [2.0]]],  # (n_neurons=1, T=2, rank=1)
+        [[[[1.0]], [[3.0]]]],  # (1, 2, 1, 1)
+        [[[[0.5]]]],  # (1, T-1=1, 1, 1)
+    )
     model.drift_scale = jnp.array([1e-3])
     shape = float(model._spectral_shape_current()[0])
     model._m_step()

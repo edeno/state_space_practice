@@ -565,3 +565,61 @@ def test_neuron_chunks_do_not_recompute_the_newton_iteration(learning_env, scala
 
     assert newton_loops(None) >= 1  # guard: the joint iteration is present
     assert newton_loops(2) == newton_loops(None)
+
+
+@pytest.mark.slow
+def test_compact_posterior_fit_matches_full(learning_env, scalar_data):
+    """Without stored covariances the fit, means and rate maps are unchanged."""
+    times, positions, counts = scalar_data
+    spikes = np.stack([counts, counts[::-1]], axis=1)
+    fitted = {}
+    for store in (True, False):
+        model = GraphPlaceFieldModel(learning_env, 0.1, rank=2, store_covariances=store)
+        model.fit(times, positions, spikes, profile_points=9, profile_rounds=1)
+        fitted[store] = model
+    full, compact = fitted[True], fitted[False]
+    assert compact.log_likelihood_ == pytest.approx(full.log_likelihood_, rel=1e-12)
+    np.testing.assert_allclose(compact.drift_scale, full.drift_scale, rtol=1e-10)
+    for name in ("smoother_mean", "filtered_mean"):
+        np.testing.assert_allclose(
+            getattr(compact, name), getattr(full, name), rtol=1e-10, atol=1e-12
+        )
+    for name in ("smoother_cov", "smoother_cross_cov", "filtered_cov"):
+        assert is_set(full, name) and not is_set(compact, name), name
+    for neuron in (0, 1):
+        np.testing.assert_allclose(
+            compact.predict_rate_map(neuron), full.predict_rate_map(neuron), rtol=1e-10
+        )
+    for model in (full, compact):
+        diagnostics = model.smoother_diagnostics_
+        assert not hasattr(diagnostics, "covariance")
+        for field in diagnostics._fields:
+            assert np.shape(getattr(diagnostics, field)) == (2,), field
+        assert bool(np.all(diagnostics.converged))
+
+
+@pytest.mark.slow
+def test_compact_posterior_em_matches_full(learning_env, scalar_data):
+    """EM's M-step needs only per-neuron summaries, so both storage modes agree."""
+    fitted = {}
+    for store in (True, False):
+        model = GraphPlaceFieldModel(learning_env, 0.1, rank=2, store_covariances=store)
+        model.fit(*scalar_data, method="em", max_iter=3)
+        fitted[store] = model
+    full, compact = fitted[True], fitted[False]
+    assert compact.tau2 == pytest.approx(full.tau2, rel=1e-10)
+    np.testing.assert_allclose(compact.drift_scale, full.drift_scale, rtol=1e-10)
+    np.testing.assert_allclose(
+        compact.init_mean, full.init_mean, rtol=1e-10, atol=1e-12
+    )
+
+
+def test_compact_posterior_storage_scales_with_rank(learning_env, scalar_data):
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=3, store_covariances=False)
+    args, _ = model._prepare_sgd_data(*scalar_data, warm_start=True)
+    model._e_step(*args)
+    n_time = args[0].shape[0]
+    for name in ("smoother_mean", "filtered_mean"):
+        assert np.shape(getattr(model, name)) == (1, n_time, 3), name
+    for name in ("smoother_cov", "smoother_cross_cov", "filtered_cov"):
+        assert not is_set(model, name), name

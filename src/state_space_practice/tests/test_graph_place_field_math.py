@@ -28,7 +28,11 @@ from state_space_practice.parameter_transforms import (
     transform_to_constrained,
     transform_to_unconstrained,
 )
-from state_space_practice.tests.graph_helpers import legacy_graph_model, line_env
+from state_space_practice.tests.graph_helpers import (
+    legacy_graph_model,
+    line_env,
+    set_smoothed_posterior,
+)
 from state_space_practice.tests.graph_math_reference import (
     expected_gaussian_prior_nll,
     gaussian_filtered_moments,
@@ -594,10 +598,11 @@ def test_em_updates_maximize_independent_expected_complete_density(
     ]
     model.init_mean = jnp.asarray(means)
     model.drift_scale = jnp.asarray(q_initial)
-    model.smoother_mean = jnp.asarray(np.array([p.mean for p in posteriors]))
-    model.smoother_cov = jnp.asarray(np.array([p.covariance for p in posteriors]))
-    model.smoother_cross_cov = jnp.asarray(
-        np.array([p.lag_covariance for p in posteriors])
+    set_smoothed_posterior(
+        model,
+        np.array([p.mean for p in posteriors]),
+        np.array([p.covariance for p in posteriors]),
+        np.array([p.lag_covariance for p in posteriors]),
     )
     start = (
         np.r_[np.log(q_initial), np.log(1.3), means.ravel()]

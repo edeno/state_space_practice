@@ -63,11 +63,10 @@ from state_space_practice.exceptions import (
     NotFittedError,
     StateSpaceWarning,
 )
-from state_space_practice.fitted_state import FittedAttribute
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import process_cov_residual_form, rts_backward_scan
 from state_space_practice.laplace_smoothing import (
     LAPLACE_MODE_CHECKPOINT,
-    LaplaceTrajectoryResult,
     poisson_laplace_smoother,
     resolve_parallel,
 )
@@ -117,6 +116,7 @@ __all__ = [
     "static_log_evidence",
     "select_tau2_by_evidence",
     "GraphPlaceFieldModel",
+    "SmootherDiagnostics",
 ]
 
 # Attribute used to cache the full eigensystem on an Environment instance (keyed by the
@@ -1673,14 +1673,67 @@ def _graph_profile_losses(
     return cast(Array, jax.lax.map(at, drift_values))
 
 
+class SmootherDiagnostics(NamedTuple):
+    """Joint smoother convergence diagnostics, one entry per neuron.
+
+    Attributes
+    ----------
+    relative_newton_step : Array, shape (n_neurons,)
+        ``max|Δ| / (1 + max|path|)`` of the last proposed Newton step.
+    n_iterations : Array, shape (n_neurons,)
+    n_rejected_steps : Array, shape (n_neurons,)
+    converged : Array of bool, shape (n_neurons,)
+    """
+
+    relative_newton_step: Array
+    n_iterations: Array
+    n_rejected_steps: Array
+    converged: Array
+
+
+class _PosteriorSummary(NamedTuple):
+    """What the EM M-step needs from one neuron's smoothed posterior.
+
+    ``initial_mean`` ``(rank,)`` and ``initial_cov`` ``(rank, rank)`` are the
+    first state's moments; ``increment_cov`` ``(rank, rank)`` is the expected
+    increment covariance ``E[(w_{t+1} - A w_t)(·)ᵀ]`` averaged over transitions.
+    """
+
+    initial_mean: Array
+    initial_cov: Array
+    increment_cov: Array
+
+
+def _summarize_posterior(
+    mean: Array, covariance: Array, cross_covariance: Array, transition: Array
+) -> _PosteriorSummary:
+    """Reduce one neuron's smoothed moments to the M-step's sufficient summaries.
+
+    ``mean`` ``(n_time, rank)``, ``covariance`` ``(n_time, rank, rank)``,
+    ``cross_covariance`` ``Cov(w_t, w_{t+1})`` ``(n_time - 1, rank, rank)``.
+    """
+    if mean.shape[0] < 2:
+        increment_cov = jnp.zeros_like(covariance[0])
+    else:
+        increment_cov = process_cov_residual_form(
+            mean,
+            covariance[1:].sum(0),
+            covariance[:-1].sum(0),
+            cross_covariance.sum(0),
+            transition,
+        )
+    return _PosteriorSummary(mean[0], covariance[0], increment_cov)
+
+
 class _GraphNeuronInference(NamedTuple):
     mean: Array
-    covariance: Array
-    cross_covariance: Array
+    covariance: Array | None
+    cross_covariance: Array | None
     log_evidence: Array
     filtered_mean: Array
-    filtered_covariance: Array
-    diagnostics: LaplaceTrajectoryResult | None
+    filtered_covariance: Array | None
+    summary: _PosteriorSummary
+    diagnostics: SmootherDiagnostics | None
 
 
 @partial(
@@ -1694,6 +1747,7 @@ class _GraphNeuronInference(NamedTuple):
         "static_neurons",
         "parallel",
         "neuron_batch_size",
+        "store_covariances",
     ),
 )
 def _graph_posterior(
@@ -1714,13 +1768,16 @@ def _graph_posterior(
     static_neurons: tuple[bool, ...] | None,
     parallel: bool = False,
     neuron_batch_size: int | None = None,
+    store_covariances: bool = True,
 ) -> _GraphNeuronInference:
     """Per-neuron posterior inference as one compiled program.
 
     Shapes: ``init_mean`` ``(n_neurons, rank)``, ``spikes`` ``(n_neurons,
     n_time)``, ``drift_scale`` ``(n_neurons,)``; outputs carry a leading
     ``n_neurons`` axis. Compiling the whole batch keeps the filter's host
-    callbacks inside a single dispatch.
+    callbacks inside a single dispatch. Without ``store_covariances`` the
+    ``(n_time, rank, rank)`` outputs are ``None``; the means, evidence and
+    M-step summaries are always returned.
     """
 
     def one(
@@ -1744,7 +1801,7 @@ def _graph_posterior(
                 else "the posterior and evidence are"
             ),
         )
-        result: LaplaceTrajectoryResult | None = None
+        diagnostics: SmootherDiagnostics | None = None
         if inference_method == "joint":
             result = poisson_laplace_smoother(
                 m0,
@@ -1765,18 +1822,27 @@ def _graph_posterior(
                 result.cross_covariance,
             )
             marginal_ll = jnp.where(result.converged, result.log_evidence, -jnp.inf)
+            diagnostics = SmootherDiagnostics(
+                result.relative_newton_step,
+                result.n_iterations,
+                result.n_rejected_steps,
+                result.converged,
+            )
         else:
             smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
                 filtered_mean, filtered_cov, transition, Q
             )
         return _GraphNeuronInference(
             smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
+            smoother_cov if store_covariances else None,
+            smoother_cross_cov if store_covariances else None,
             marginal_ll,
             filtered_mean,
-            filtered_cov,
-            result,
+            filtered_cov if store_covariances else None,
+            _summarize_posterior(
+                smoother_mean, smoother_cov, smoother_cross_cov, transition
+            ),
+            diagnostics,
         )
 
     return _vmap_by_noise_structure(
@@ -1815,9 +1881,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     the package; joint Newton convergence (relative step 1e-8) is not
     reachable in float32.
 
-    ``smoother_diagnostics_`` (joint inference only) holds the per-neuron
-    :class:`LaplaceTrajectoryResult`, each field with a leading ``n_neurons``
-    axis; it is unset after a sequential-inference fit.
+    ``smoother_diagnostics_`` (joint inference only) holds per-neuron
+    :class:`SmootherDiagnostics`; it is unset after a sequential-inference fit.
+    With ``store_covariances=False`` the per-time covariance attributes
+    (``smoother_cov``, ``smoother_cross_cov``, ``filtered_cov``) are not kept.
     """
 
     smoother_mean: FittedAttribute[Array] = FittedAttribute()
@@ -1826,8 +1893,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     filtered_mean: FittedAttribute[Array] = FittedAttribute()
     filtered_cov: FittedAttribute[Array] = FittedAttribute()
     drift_profiles_: FittedAttribute[tuple[ScaleProfile, ...]] = FittedAttribute()
-    smoother_diagnostics_: FittedAttribute[LaplaceTrajectoryResult] = FittedAttribute()
+    smoother_diagnostics_: FittedAttribute[SmootherDiagnostics] = FittedAttribute()
     parameter_bound_hits_: FittedAttribute[tuple[str, ...]] = FittedAttribute()
+    # Per-neuron M-step summaries and the data the posterior was inferred from
+    # (recomputes covariances on demand when they are not stored).
+    _posterior_summary: FittedAttribute[_PosteriorSummary] = FittedAttribute()
+    _inference_data: FittedAttribute[tuple[Array, Array, Array]] = FittedAttribute()
     _fit_output_attrs = (
         "smoother_mean",
         "smoother_cov",
@@ -1837,6 +1908,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         "drift_profiles_",
         "smoother_diagnostics_",
         "parameter_bound_hits_",
+        "_posterior_summary",
+        "_inference_data",
     )
 
     def __init__(
@@ -1862,6 +1935,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_smoother_iter: int = 50,
         parallel: bool | None = None,
         neuron_batch_size: int | None = None,
+        store_covariances: bool = True,
     ) -> None:
         """Build the graph basis and initialize model hyperparameters.
 
@@ -1948,7 +2022,16 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             replays each chunk's Newton iteration too (about 2x).
             With gradients, the parallel pass needs about 12-17 GiB per neuron
             at ``n_time`` = 70,930 and rank 20 (sequential: about 4 GiB),
-            scaling with ``n_time * rank**2``.
+            scaling with ``n_time * rank**2``. The final inference also runs in
+            blocks of this size and moves each block's results to host memory.
+        store_covariances : bool, optional
+            Keep the per-time posterior covariances ``smoother_cov``,
+            ``smoother_cross_cov`` and ``filtered_cov`` (default). Each is
+            ``(n_neurons, n_time, rank, rank)``: about 0.6 GB per neuron for an
+            hour of 20 ms bins at rank 20. With ``False`` only the means and
+            per-neuron summaries are kept (``O(n_time * rank)`` per neuron);
+            fitting and EM are unchanged and :meth:`predict_rate_map`
+            recomputes the requested neuron's covariances.
         """
         # The compiled filter treats dt as static; normalize concrete scalar
         # array inputs to a finite, hashable Python float before caching it.
@@ -1960,6 +2043,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         )
         if parallel is not None and not isinstance(parallel, bool):
             raise ValueError(f"parallel must be None, True or False; got {parallel!r}.")
+        if not isinstance(store_covariances, bool):
+            raise ValueError(
+                f"store_covariances must be True or False; got {store_covariances!r}."
+            )
         if neuron_batch_size is not None:
             if isinstance(neuron_batch_size, (bool, np.bool_)):
                 raise ValueError(
@@ -2006,6 +2093,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.max_smoother_iter = max_smoother_iter
         self.parallel = parallel
         self.neuron_batch_size = neuron_batch_size
+        self.store_covariances = store_covariances
         self.update_drift_scale = update_drift_scale
         self.update_amplitude = update_amplitude
         self.update_init_mean = update_init_mean
@@ -2100,23 +2188,59 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         assert self.drift_scale is not None
         if valid is None:
             valid = jnp.ones((Z.shape[0],), dtype=bool)
+        static = self._static_neurons() if self.inference_method == "joint" else None
+        n_neurons = int(spikes.shape[0])
+        block = self.neuron_batch_size or n_neurons
+        parts = []
+        for start in range(0, n_neurons, block):
+            neurons = slice(start, start + block)
+            result = self._posterior(
+                Z,
+                spikes[neurons],
+                valid,
+                self.init_mean[neurons],
+                self.drift_scale[neurons],
+                None if static is None else static[neurons],
+                self.store_covariances,
+            )
+            # Bounded device memory: finished blocks wait on the host.
+            parts.append(jax.device_get(result) if block < n_neurons else result)
+        inference = parts[0]
+        if len(parts) > 1:
+            inference = jax.tree.map(lambda *xs: np.concatenate(xs), *parts)
+        self.smoother_mean = inference.mean
+        self.filtered_mean = inference.filtered_mean
+        if inference.covariance is not None:
+            assert inference.cross_covariance is not None
+            assert inference.filtered_covariance is not None
+            self.smoother_cov = inference.covariance
+            self.smoother_cross_cov = inference.cross_covariance
+            self.filtered_cov = inference.filtered_covariance
+        self._posterior_summary = inference.summary
+        self._inference_data = (Z, spikes, valid)
+        if inference.diagnostics is not None:
+            self.smoother_diagnostics_ = inference.diagnostics
+        return float(np.sum(np.asarray(inference.log_evidence)))
+
+    def _posterior(
+        self,
+        Z: Array,
+        spikes: Array,
+        valid: Array,
+        init_mean: Array,
+        drift_scale: Array,
+        static_neurons: tuple[bool, ...] | None,
+        store_covariances: bool,
+    ) -> _GraphNeuronInference:
+        """Posterior of the given neurons at the current hyperparameters."""
         S = self._spectral_shape_current()
-        P0 = jnp.diag(self.tau2 * S)
-        (
-            self.smoother_mean,
-            self.smoother_cov,
-            self.smoother_cross_cov,
-            marginal_ll,
-            self.filtered_mean,
-            self.filtered_cov,
-            diagnostics,
-        ) = _graph_posterior(
-            self.init_mean,
+        return _graph_posterior(
+            init_mean,
             spikes,
-            self.drift_scale,
+            drift_scale,
             Z,
             valid,
-            P0,
+            jnp.diag(self.tau2 * S),
             S,
             self.transition_matrix,
             dt=self.dt,
@@ -2125,14 +2249,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             inference_method=self.inference_method,
             max_smoother_iter=self.max_smoother_iter,
             parallel=self._parallel,
-            neuron_batch_size=self.neuron_batch_size,
-            static_neurons=(
-                self._static_neurons() if self.inference_method == "joint" else None
-            ),
+            static_neurons=static_neurons,
+            store_covariances=store_covariances,
         )
-        if diagnostics is not None:
-            self.smoother_diagnostics_ = diagnostics
-        return float(jnp.sum(marginal_ll))
 
     def _warm_start(
         self,
@@ -2159,35 +2278,17 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         positive definite; EM therefore cannot reach exactly zero drift (the
         default ``fit`` profiles q=0 explicitly).
         """
-        assert self.smoother_mean is not None
-        assert self.smoother_cov is not None
-        assert self.smoother_cross_cov is not None
-        assert self.init_mean is not None
+        assert self.init_mean is not None and self.smoother_mean is not None
+        summary = self._posterior_summary
         S = self._spectral_shape_current()
 
         if self.update_drift_scale:
-            n_time = int(self.smoother_mean.shape[1])
-            if n_time < 2:
+            if np.shape(self.smoother_mean)[1] < 2:
                 raise ValueError(
                     "at least two time rows are required to update drift_scale."
                 )
-
-            def _increment_stats(sm: Array, sc: Array, scc: Array) -> Array:
-                # sm (T, rank), sc (T, rank, rank), scc (T-1, rank, rank)
-                return jnp.diag(
-                    process_cov_residual_form(
-                        sm,
-                        sc[1:].sum(0),
-                        sc[:-1].sum(0),
-                        scc.sum(0),
-                        self.transition_matrix,
-                    )
-                )
-
-            diag_q_inc = jax.vmap(_increment_stats)(
-                self.smoother_mean,
-                self.smoother_cov,
-                self.smoother_cross_cov,
+            diag_q_inc = jnp.diagonal(
+                jnp.asarray(summary.increment_cov), axis1=-2, axis2=-1
             )
             # q_c* = mean_j( diag(E[dw dw^T])_j / S_j )
             self.drift_scale = jnp.maximum(
@@ -2195,10 +2296,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             )
         if self.update_amplitude:
             diag_initial_second_moment = jnp.diagonal(
-                self.smoother_cov[:, 0], axis1=-2, axis2=-1
+                jnp.asarray(summary.initial_cov), axis1=-2, axis2=-1
             )
             if not self.update_init_mean:
-                mean_residual = self.smoother_mean[:, 0, :] - self.init_mean
+                mean_residual = jnp.asarray(summary.initial_mean) - self.init_mean
                 diag_initial_second_moment = (
                     diag_initial_second_moment + mean_residual**2
                 )
@@ -2210,7 +2311,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 )
             )
         if self.update_init_mean:
-            self.init_mean = self.smoother_mean[:, 0, :]
+            self.init_mean = jnp.asarray(summary.initial_mean)
 
     def fit(
         self,
@@ -3145,7 +3246,6 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         """
         self._check_fitted("predict_rate_map")
         assert self.smoother_mean is not None
-        assert self.smoother_cov is not None
         if neuron_idx < 0 or neuron_idx >= self.n_neurons:
             raise ValueError(
                 f"neuron_idx={neuron_idx} out of range for n_neurons={self.n_neurons}."
@@ -3154,13 +3254,35 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             time_slice = slice(None)
         Phi = np.asarray(self.basis.eigvecs)  # (n_bins, rank)
         means = np.asarray(self.smoother_mean[neuron_idx][time_slice])  # (T, rank)
-        covs = np.asarray(self.smoother_cov[neuron_idx][time_slice])  # (T, rank, rank)
+        if is_set(self, "smoother_cov"):
+            covariance = self.smoother_cov[neuron_idx]
+        else:
+            covariance = self._recompute_covariance(neuron_idx)
+        covs = np.asarray(covariance[time_slice])  # (T, rank, rank)
         if means.shape[0] == 0:
             raise ValueError("time_slice selects no time bins.")
         log_rate = means @ Phi.T  # (T, n_bins)
         var = np.einsum("br,trs,bs->tb", Phi, covs, Phi)  # (T, n_bins)
         rate = np.exp(log_rate + 0.5 * np.maximum(var, 0.0))
         return cast(NDArray[np.float64], rate.mean(axis=0))
+
+    def _recompute_covariance(self, neuron_idx: int) -> Array:
+        """One neuron's smoothed covariances ``(n_time, rank, rank)`` on demand."""
+        assert self.init_mean is not None and self.drift_scale is not None
+        Z, spikes, valid = self._inference_data
+        neurons = slice(neuron_idx, neuron_idx + 1)
+        static = self._static_neurons() if self.inference_method == "joint" else None
+        result = self._posterior(
+            Z,
+            spikes[neurons],
+            valid,
+            self.init_mean[neurons],
+            self.drift_scale[neurons],
+            None if static is None else static[neurons],
+            True,
+        )
+        assert result.covariance is not None
+        return result.covariance[0]
 
     def score(
         self,
