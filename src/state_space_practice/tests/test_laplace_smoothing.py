@@ -378,7 +378,10 @@ def test_parallel_smoother_matches_sequential_with_gradients(joint_problem, q):
     )
     for field in ("n_iterations", "n_rejected_steps", "converged"):
         assert getattr(parallel, field) == getattr(sequential, field)
-    for argnum, name in ((1, "scale"), (2, "shift")):
+    # At q = 0 the noise is scale * 0, so d/dscale is identically zero on both
+    # paths; only the mean0 shift gradient carries information there.
+    checks = ((1, "scale"), (2, "shift")) if q else ((2, "shift"),)
+    for argnum, name in checks:
         gradients = [
             jax.grad(lambda *a, p=p: run(p, *a).log_evidence, argnums=argnum - 1)(
                 1.0, 0.0

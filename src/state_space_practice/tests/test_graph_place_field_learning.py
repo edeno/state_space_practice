@@ -539,3 +539,29 @@ def test_neuron_chunks_rematerialise_under_differentiation(learning_env, scalar_
 
     assert "remat" not in primitives(None)  # jax.checkpoint prints as remat
     assert "remat" in primitives(2)
+
+
+def test_neuron_chunks_do_not_recompute_the_newton_iteration(learning_env, scalar_data):
+    """With the static/drifting pattern known (the L-BFGS fit path), chunk
+    checkpoints save the converged mode, so the backward pass replays only the
+    exact Newton map and final linear pass, not the adaptive iteration."""
+    times, positions, counts = scalar_data
+    spikes = np.stack([counts, counts[::-1], counts], axis=1)
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+    args, _ = model._prepare_sgd_data(times, positions, spikes, warm_start=True)
+    params = model._current_params()
+    static = (False, True, False)
+
+    def newton_loops(batch):
+        model.neuron_batch_size = batch
+        jaxpr = jax.make_jaxpr(
+            jax.grad(
+                lambda q: model._forward_loss(
+                    dict(params, drift_scale=q), *args, static
+                )
+            )
+        )(params["drift_scale"])
+        return str(jaxpr).count("while[")
+
+    assert newton_loops(None) >= 1  # guard: the joint iteration is present
+    assert newton_loops(2) == newton_loops(None)

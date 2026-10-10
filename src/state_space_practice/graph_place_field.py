@@ -66,6 +66,7 @@ from state_space_practice.exceptions import (
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.kalman import process_cov_residual_form, rts_backward_scan
 from state_space_practice.laplace_smoothing import (
+    LAPLACE_MODE_CHECKPOINT,
     LaplaceTrajectoryResult,
     poisson_laplace_smoother,
     resolve_parallel,
@@ -1466,14 +1467,24 @@ def _vmap_by_noise_structure(
     ``None`` vmaps every neuron with the automatic branch choice. ``batch_size``
     vmaps at most that many neurons at once (``lax.map`` over chunks), bounding
     device memory. Each chunk is ``jax.checkpoint``-ed: reverse mode through the
-    map would otherwise keep every chunk's intermediates, so gradients recompute
-    one chunk at a time instead.
+    map would otherwise keep every chunk's intermediates. The checkpoint saves
+    the joint smoother's converged mode (``LAPLACE_MODE_CHECKPOINT``), so with
+    ``static_neurons`` known the backward pass recomputes one chunk's exact
+    Newton map and final linear pass, not its adaptive iteration. With
+    ``static_neurons=None`` the iteration sits inside a batched ``lax.cond``,
+    whose internal names the policy cannot save, and is replayed.
     """
 
     def over_neurons(flag: bool | None, *args: Array) -> _Out:
         if batch_size is None:
             return jax.vmap(partial(fn, flag))(*args)
-        chunk = jax.checkpoint(lambda xs: fn(flag, *xs))
+        chunk = jax.checkpoint(
+            lambda xs: fn(flag, *xs),
+            prevent_cse=False,
+            policy=jax.checkpoint_policies.save_only_these_names(
+                LAPLACE_MODE_CHECKPOINT
+            ),
+        )
         return cast(_Out, jax.lax.map(chunk, tuple(args), batch_size=batch_size))
 
     if static_neurons is None:

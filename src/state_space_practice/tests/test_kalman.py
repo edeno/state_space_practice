@@ -3009,11 +3009,17 @@ def _information_sites(
 
 @pytest.mark.parametrize("n_time", [1, 2, 7, 64])
 @pytest.mark.parametrize("kind", ["full", "rank_one"])
-def test_parallel_information_filter_matches_sequential_recursion(n_time, kind):
+@pytest.mark.parametrize("noise", ["positive_definite", "rank_deficient", "zero"])
+def test_parallel_information_filter_matches_sequential_recursion(n_time, kind, noise):
     rng = np.random.default_rng(n_time)
     d = 3
     A = random_stable_matrix(rng, d)
     Q = random_spd_matrix(rng, d, scale=0.1)
+    if noise == "rank_deficient":
+        direction = rng.normal(size=d)
+        Q = 0.1 * np.outer(direction, direction)  # singular: rank one
+    elif noise == "zero":
+        Q = np.zeros((d, d))
     m0, P0 = rng.normal(size=d), random_spd_matrix(rng, d)
     G, g = _information_sites(rng, n_time, d, kind)
     expected_mean, expected_cov = _information_filter_reference(m0, P0, A, Q, G, g)

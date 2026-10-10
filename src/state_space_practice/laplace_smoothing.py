@@ -14,6 +14,7 @@ from typing import NamedTuple, cast
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.ad_checkpoint import checkpoint_name
 from jax.scipy.linalg import cho_solve, solve_triangular
 from jax.scipy.special import gammaln
 from jax.typing import ArrayLike
@@ -24,6 +25,11 @@ from state_space_practice.kalman import (
     rts_backward_scan,
 )
 from state_space_practice.utils import symmetrize, typed_jit
+
+# Checkpoint name of the adaptive iteration's outputs. A ``jax.checkpoint``
+# policy that saves it lets the backward pass replay only the exact Newton map
+# and final linear pass instead of the whole iteration.
+LAPLACE_MODE_CHECKPOINT = "laplace_mode"
 
 # Log-rate ceiling keeping exp finite in float64.
 _MAX_LOG_RATE = 600.0
@@ -419,7 +425,10 @@ def poisson_laplace_smoother(
             max_iter,
             tolerance,
         )
-        stopped_path = jax.lax.stop_gradient(stopped_path)
+        stopped_path, residual, n, rejected = (
+            checkpoint_name(jax.lax.stop_gradient(value), LAPLACE_MODE_CHECKPOINT)
+            for value in (stopped_path, residual, n, rejected)
+        )
         exact_target = newton_target(
             mean0, covariance0, transition, safe_noise, design, y
         )(stopped_path)
@@ -500,7 +509,10 @@ def poisson_laplace_smoother(
             max_iter,
             tolerance,
         )
-        u = jax.lax.stop_gradient(u)
+        u, residual, n, rejected = (
+            checkpoint_name(jax.lax.stop_gradient(value), LAPLACE_MODE_CHECKPOINT)
+            for value in (u, residual, n, rejected)
+        )
         exact_target = target(u)
         mode_u = u + (exact_target - jax.lax.stop_gradient(exact_target))
         h = hessian(mode_u)

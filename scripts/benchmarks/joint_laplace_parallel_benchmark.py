@@ -35,7 +35,10 @@ import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 from neurospatial import Environment  # noqa: E402
 
-from state_space_practice.graph_place_field import GraphPlaceFieldModel  # noqa: E402
+from state_space_practice.graph_place_field import (  # noqa: E402
+    GraphPlaceFieldModel,
+    _vmap_by_noise_structure,
+)
 from state_space_practice.laplace_smoothing import poisson_laplace_smoother  # noqa: E402
 
 DT = 0.05
@@ -124,12 +127,12 @@ def main() -> None:
         )
 
     def per_neuron(q: jax.Array):  # type: ignore[no-untyped-def]
-        if args.neuron_batch_size is None:
-            return jax.vmap(lambda mean, y: one(mean, y, q))(m0, spikes)
-        # Checkpoint each chunk so gradients recompute it instead of storing it.
-        return jax.lax.map(
-            jax.checkpoint(lambda xs: one(*xs, q)),
-            (m0, spikes),
+        # The library's own neuron batching, including its checkpointed chunks.
+        return _vmap_by_noise_structure(
+            lambda _flag, mean, y: one(mean, y, q),
+            (False,) * args.n_neurons,
+            m0,
+            spikes,
             batch_size=args.neuron_batch_size,
         )
 
