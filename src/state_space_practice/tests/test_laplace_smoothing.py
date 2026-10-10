@@ -8,9 +8,14 @@ import pytest
 from state_space_practice import laplace_smoothing
 from state_space_practice.laplace_smoothing import (
     _iterate_mode,
+    _linear_sites,
+    _linear_sites_parallel,
+    _transition_powers,
     poisson_laplace_smoother,
+    resolve_parallel,
 )
 from state_space_practice.tests.graph_math_reference import joint_poisson_laplace
+from state_space_practice.tests.oracles import random_spd_matrix, random_stable_matrix
 
 
 @pytest.fixture
@@ -300,3 +305,49 @@ def test_noise_structure_hint_matches_automatic_branch(joint_problem, q, static_
         rtol=1e-10,
         atol=1e-12,
     )
+
+
+def test_parallel_linear_pass_matches_sequential():
+    rng = np.random.default_rng(4)
+    n_time, d = 40, 3
+    weight = np.where(np.arange(n_time) % 4 == 1, 0.0, rng.uniform(0.1, 3.0, n_time))
+    args = (
+        jnp.asarray(rng.normal(size=d)),
+        jnp.asarray(random_spd_matrix(rng, d)),
+        jnp.asarray(random_stable_matrix(rng, d)),
+        jnp.asarray(random_spd_matrix(rng, d, scale=0.1)),
+        jnp.asarray(rng.normal(size=(n_time, d)) * 0.5),
+        jnp.asarray(weight),
+        jnp.asarray(rng.normal(size=n_time)),
+    )
+    assert np.any(weight == 0)  # masked rows are exercised
+    sequential, parallel = _linear_sites(*args), _linear_sites_parallel(*args)
+    for field, expected, actual in zip(
+        sequential._fields, sequential, parallel, strict=True
+    ):
+        np.testing.assert_allclose(
+            actual, expected, rtol=1e-10, atol=1e-12, err_msg=field
+        )
+
+
+@pytest.mark.parametrize("n_time", [1, 2, 9])
+def test_transition_powers_match_sequential_scan(n_time):
+    A = random_stable_matrix(np.random.default_rng(n_time), 3)
+    expected = [np.eye(3)]
+    for _ in range(n_time - 1):
+        expected.append(A @ expected[-1])
+    np.testing.assert_allclose(
+        _transition_powers(jnp.asarray(A), n_time),
+        np.asarray(expected),
+        rtol=1e-12,
+        atol=1e-14,
+    )
+
+
+def test_parallel_default_resolves_by_backend(monkeypatch):
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    assert resolve_parallel(None) is True
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    assert resolve_parallel(None) is False
+    assert resolve_parallel(True) is True
+    assert resolve_parallel(False) is False

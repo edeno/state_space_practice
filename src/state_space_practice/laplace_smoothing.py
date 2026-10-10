@@ -18,7 +18,11 @@ from jax.scipy.linalg import cho_solve, solve_triangular
 from jax.scipy.special import gammaln
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import rts_backward_scan
+from state_space_practice.kalman import (
+    _parallel_information_filter,
+    parallel_kalman_smoother,
+    rts_backward_scan,
+)
 from state_space_practice.utils import symmetrize, typed_jit
 
 # Log-rate ceiling keeping exp finite in float64.
@@ -61,6 +65,26 @@ class LaplaceTrajectoryResult(NamedTuple):
     converged: Array
 
 
+def resolve_parallel(parallel: bool | None) -> bool:
+    """Whether to run the associative-scan linear pass.
+
+    ``None`` selects it on accelerators (GPU/TPU), where it is much faster, and
+    the sequential pass on CPU, where it is slower. ``True``/``False`` are kept.
+    """
+    if parallel is None:
+        return jax.default_backend() != "cpu"
+    return bool(parallel)
+
+
+def _site_log_normalizer(v: Array, a: Array, w: Array, u: Array) -> Array:
+    """``log ∫ N(x; m, P) exp(u z·x − ½ w (z·x)²) dx`` with ``v = zᵀPz``, ``a = z·m``."""
+    denominator = 1 + w * v
+    return (
+        -0.5 * jnp.log1p(w * v)
+        + 0.5 * (2 * u * a - w * a * a + v * u * u) / denominator
+    )
+
+
 def _linear_sites(
     mean0: Array,
     covariance0: Array,
@@ -85,10 +109,7 @@ def _linear_sites(
         posterior_covariance = symmetrize(
             matrix @ covariance @ matrix.T + w / denominator**2 * jnp.outer(pz, pz)
         )
-        log_z = (
-            -0.5 * jnp.log1p(w * v)
-            + 0.5 * (2 * u * a - w * a * a + v * u * u) / denominator
-        )
+        log_z = _site_log_normalizer(v, a, w, u)
         return posterior_mean, posterior_covariance, log_z
 
     first_mean, first_covariance, first_ll = update(
@@ -121,6 +142,61 @@ def _linear_sites(
         filtered_mean, filtered_covariance, transition, noise
     )
     return LinearSiteResult(mean, covariance, cross, ll)
+
+
+def _linear_sites_parallel(
+    mean0: Array,
+    covariance0: Array,
+    transition: Array,
+    noise: Array,
+    design: Array,
+    weight: Array,
+    information: Array,
+) -> LinearSiteResult:
+    """:func:`_linear_sites` by associative scans (O(log T) span, same outputs).
+
+    Each rank-one site is ``G_t = w_t z_t z_tᵀ``, ``g_t = u_t z_t``; the first site
+    conditions ``N(mean0, covariance0)`` directly, as in the sequential pass.
+    """
+    info_matrices = weight[:, None, None] * design[:, :, None] * design[:, None, :]
+    filtered_mean, filtered_covariance = _parallel_information_filter(
+        mean0,
+        covariance0,
+        transition,
+        noise,
+        info_matrices,
+        information[:, None] * design,
+    )
+    predicted_mean = jnp.concatenate((mean0[None], filtered_mean[:-1] @ transition.T))
+    predicted_covariance = jnp.concatenate(
+        (
+            covariance0[None],
+            symmetrize(
+                jnp.einsum(
+                    "ij,tjk,lk->til", transition, filtered_covariance[:-1], transition
+                )
+                + noise
+            ),
+        )
+    )
+    variance = jnp.einsum("ti,tij,tj->t", design, predicted_covariance, design)
+    log_z = _site_log_normalizer(
+        variance, jnp.sum(design * predicted_mean, axis=1), weight, information
+    )
+    mean, covariance, cross = parallel_kalman_smoother(
+        filtered_mean, filtered_covariance, transition, noise
+    )
+    return LinearSiteResult(mean, covariance, cross, jnp.sum(log_z))
+
+
+def _transition_powers(transition: Array, n_time: int) -> Array:
+    """``A^0 .. A^(n_time-1)``, shape ``(n_time, D, D)``, by associative scan."""
+    identity = jnp.eye(transition.shape[0], dtype=transition.dtype)
+    if n_time == 1:
+        return identity[None]
+    stacked = jnp.broadcast_to(transition, (n_time - 1, *transition.shape))
+    powers = jax.lax.associative_scan(lambda earlier, later: later @ earlier, stacked)
+    return jnp.concatenate((identity[None], powers))
 
 
 def _iterate_mode(
