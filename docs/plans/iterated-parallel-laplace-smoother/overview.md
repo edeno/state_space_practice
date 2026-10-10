@@ -15,22 +15,36 @@ adaptive stopped primal iteration with an exact implicit derivative. Reconcile
 these interfaces and current master before implementing this plan's remaining
 phases; its older fixed-pass/derivative assumptions are not completed contracts.
 
+**Reconciliation (2026-10-09):** GPU measurements on real data
+([#prototype-evidence](#prototype-evidence)) show the parallel-in-time pass pays off on
+the joint core that already exists, independently of phase 1. A new
+[phase 2a](phase-2a-joint-laplace-parallel.md) adds `parallel` to
+`laplace_smoothing.poisson_laplace_smoother` and `GraphPlaceFieldModel`. It also delivers
+`kalman._parallel_information_filter`, which the former phase 2, now
+[phase 2b](phase-2b-point-process-parallel.md), reuses on the point-process smoother.
+Phases 1, 2b, 3 and 4 are otherwise unchanged pending Open Question 6.
+
 ## Current codebase integration points
 
-Paths are relative to `src/state_space_practice/`. Line numbers were verified against
-`master` at `4b74f03`.
+Paths are relative to `src/state_space_practice/`. The `kalman.py`, `laplace_smoothing.py`
+and `graph_place_field.py` references were verified on 2026-10-09 against
+`feat/graph-place-field` at `7a9c498`. The `point_process_kalman.py`, `place_field_model.py`,
+`position_decoder.py` and `temporal_rate_gp.py` references date from `master` at `4b74f03`.
+Re-verify them when Open Question 6 is settled, before executing phases 1, 2b, 3 or 4.
 
-- `point_process_kalman.py:2392-2410` — `stochastic_point_process_smoother` signature: gains keyword-only `n_iterations`, `convergence_tol`, `return_diagnostics` (phase 1) and `parallel` (phase 2). The positional/keyword parameters that exist today are untouched. `:2495-2518` (validation), `:2526-2569` (block dispatch) and `:2571-2602` (dense filter + backward pass) remain the `n_iterations=1, parallel=False` path and are executed unchanged in that case.
+- `point_process_kalman.py:2392-2410` — `stochastic_point_process_smoother` signature: gains keyword-only `n_iterations`, `convergence_tol`, `return_diagnostics` (phase 1) and `parallel` (phase 2b). The positional/keyword parameters that exist today are untouched. `:2495-2518` (validation), `:2526-2569` (block dispatch) and `:2571-2602` (dense filter + backward pass) remain the `n_iterations=1, parallel=False` path and are executed unchanged in that case.
 - `point_process_kalman.py:927-1212` — `_point_process_laplace_update`: the per-bin information-form Laplace update. Its structure (`psd_cholesky` of the predicted covariance at `:1090-1091`, `prior_precision + J' diag(w) J` at `:1138-1139`, the Laplace normaliser at `:1192-1208`) is the template for the new linearised measurement update; the function itself is untouched.
 - `point_process_kalman.py:1215-1265` — `GLMFamily` / `poisson_family`: the family abstraction the new pseudo-observation sites are built on (`fisher_weight`, `mean`, `loglik_*`). Untouched; the sequential and parallel Gauss–Newton passes take a `GLMFamily`, which is also the hook the negative-binomial plan needs.
 - `point_process_kalman.py:727-730` — `_ARMIJO_C`, `_LINE_SEARCH_MAX_BACKTRACKS`: the Armijo convention reused by the trajectory-level line search (constant `1e-4`, halving steps).
 - `point_process_kalman.py:1745-1866` — `_stochastic_point_process_filter_impl`: iteration-0 forward pass (dense). Untouched; its scan (`:1855-1864`) shows the carry/prediction convention (`x_0 ~ N(m_0, P_0)`, predict before the first update) the linear passes must match.
 - `point_process_kalman.py:1873-1979`, `:2037-2122`, `:2269-2389` — block-diagonal forward core, smoother core and block smoother wrapper: iteration 0 on the block path. Untouched; the Gauss–Newton passes on the block path `vmap` the single-neuron core over the per-neuron problems in the same `(n_neurons, n_time, block_size)` layout and reuse `_concatenate_neuron_means` / `_package_block_covs` (`:2137-2149`).
 - `point_process_kalman.py:2605-2641` — `_stochastic_point_process_smoother_backward`: sequential RTS pass (duplicate of `kalman.rts_backward_scan`). Untouched; the sequential linear passes call `kalman.rts_backward_scan` directly.
-- `point_process_kalman.py:2993-3010`, `:3065-3105`, `:3314-3336`, `:3348-3371` — `PointProcessModel.__init__`, `_e_step`, `_sgd_loss_fn`, `_finalize_sgd`: gain `n_iterations` (phase 1) and `parallel` (phase 2) pass-through; `_sgd_loss_fn` switches from the filter's LL to the iterated smoother's evidence only when `n_iterations > 1 or parallel`.
+- `point_process_kalman.py:2993-3010`, `:3065-3105`, `:3314-3336`, `:3348-3371` — `PointProcessModel.__init__`, `_e_step`, `_sgd_loss_fn`, `_finalize_sgd`: gain `n_iterations` (phase 1) and `parallel` (phase 2b) pass-through; `_sgd_loss_fn` switches from the filter's LL to the iterated smoother's evidence only when `n_iterations > 1 or parallel`.
 - `place_field_model.py:361-374`, `:983-1024`, `:1335-1348`, `:1574-1609`, `:1623-1658` — `PlaceFieldModel.__init__`, `_e_step`, `_capture_state`, `_sgd_loss_fn`, `_finalize_sgd`: same pass-through; `score` (`:1886`, filter call at `:1961-1978`) is untouched (see Open Questions 3).
 - `position_decoder.py:958-1178` — `_run_filter_scan`: iteration-0 filter for the decoder (track-penalty rank-1 downdate at `:1096-1107`, adaptive inflation at `:1109-1131`, Laplace update at `:1133-1144`). Untouched. `position_decoder_smoother` (`:1539-1612`) gains `n_iterations` / `parallel` / `convergence_tol` / `return_diagnostics`; its RTS call at `:1599-1606` is the `n_iterations=1, parallel=False` path. `PositionDecoder.__init__` (`:1665-1707`) and `decode` (`:1774-1841`) pass the options through.
-- `kalman.py:1072-1216` — `parallel_kalman_smoother`: the associative-scan RTS pass reused as the backward half of every parallel pass. Untouched. A new `parallel_kalman_filter` (information-form elements, time-varying `H_t` / `R_t`) is added next to it (phase 2); `kalman_filter` / `_validate_kalman_public_inputs` (`:270-423`, constant `H` at `:315`) are not extended — the sequential linear passes use the information-form update instead (see designs.md, *Alternatives considered*).
+- `kalman.py:1217-1386` — `parallel_kalman_smoother` (`:1217`) and its jitted impl (`:1315`): the associative-scan RTS pass reused as the backward half of every parallel pass. Untouched. `_parallel_information_filter` (phase 2a) is added after it, and the public `parallel_kalman_filter` wrapper (information form, time-varying `H_t` / `R_t`) follows in phase 2b. `kalman_filter` / `_prepare_kalman_inputs` (`:280-450`, constant `H` shape at `:341`) are not extended; the sequential linear passes use the information-form update instead (see designs.md, *Alternatives considered*).
+- `laplace_smoothing.py:64-123` — `_linear_sites`, the joint core's sequential linear pass (information-form `lax.scan` with the first site on the prior, then `rts_backward_scan`); phase 2a adds its parallel twin. `:182-432` — `poisson_laplace_smoother`: gains the static `parallel` keyword; the prior-path scan (`:291-296`) and the static loading scan (`:351-359`) become associative scans under `parallel=True`.
+- `graph_place_field.py:1454-1716` — `_vmap_by_noise_structure`, `_graph_neuron_log_evidence`, `_graph_forward_loss`, `_graph_profile_losses`, `_graph_posterior`: thread `parallel` and `neuron_batch_size` (phase 2a). `:1793-1813` — `GraphPlaceFieldModel.__init__` gains both arguments.
 - `kalman.py:778-842` — `rts_backward_scan`: sequential backward pass reused by every sequential linear pass.
 - `kalman.py` (new helpers) — `markov_prior_residuals` / `markov_prior_quadratic_forms`: the prior quadratic form of the line-search merit, generalising `temporal_rate_gp._prior_whitened_residuals` (`temporal_rate_gp.py:89-115`) to a non-zero first mean.
 - `temporal_rate_gp.py:236-395` — `_infer_log_rate_traced` (`_newton_target` `:272-286`, `_newton_step` `:288-349`, evidence `:357-386`): the existing 1-D iterated Laplace / Gauss–Newton smoother. Phase 1 mirrors its algorithm and phase 4 replaces this private loop by a call to the shared core; `poisson_log_rate_site` (`:190-233`), `LaplaceRateResult` (`:118-146`) and `_warn_laplace_diagnostics` (`:149-187`) stay public/behaviour-compatible.
@@ -58,6 +72,7 @@ Paths are relative to `src/state_space_practice/`. Line numbers were verified ag
 ### Dependency policy
 
 - No new Python dependencies. Benchmarks use `time.perf_counter`, `resource.getrusage` and `jax.Device.memory_stats()` only.
+- Phase 2a has no upstream dependency in this plan. Phase 2b depends on phases 1 and 2a.
 - [docs/plans/masks-and-multi-sequence/](../masks-and-multi-sequence/) adds `obs_mask=` to the same entry points. This plan's pseudo-observation sites are information-form pairs `(G_t, g_t)`, so a masked bin is `G_t = 0, g_t = 0` and a zero log-likelihood term; the sequential update (`I + Q·0 = I`) and the parallel elements need no special case. That plan owns the mask keyword and its propagation into iteration 0; this plan only guarantees the composition rule stated in [shared-contracts.md#pseudo-observation-site-contract](shared-contracts.md#pseudo-observation-site-contract).
 - [docs/plans/glm-families-nb-zig/](../glm-families-nb-zig/) adds `GLMFamily` instances. The Gauss–Newton core takes a `GLMFamily`; for a non-canonical family the pass is Fisher scoring (expected Hessian), still a monotone ascent under the line search. That plan owns the families; this plan owns the family-generic core.
 - The deliverable names other plans will use are exactly `n_iterations: int = 1` and `parallel: bool = False` on `stochastic_point_process_smoother`, `PlaceFieldModel`, `PositionDecoder` and `PointProcessModel`.
@@ -71,6 +86,67 @@ Paths are relative to `src/state_space_practice/`. Line numbers were verified ag
 - **Parallel correctness**: `parallel=True` and `parallel=False` agree at convergence to rtol 1e-7 (means, covariances) and 1e-8 (evidence); the parallel information filter matches `kalman_filter` to rtol 1e-10 on random LGSSMs.
 - **Parallel performance**: measured wall-clock per pass on the baseline grid (T ∈ {1e4, 1e5, 1e6}, n_state ∈ {2, 8}, 50 neurons) before and after, CPU always, GPU when present; outputs on the grid agree to rtol 1e-6 at convergence. No speedup claim is made without the table.
 - **Diagnostics**: unconverged runs emit exactly one `StateSpaceWarning` naming the final relative update and `n_iterations`; converged runs emit none (pytest treats warnings as errors).
+
+## Prototype evidence
+
+Measured 2026-10-09 with a scratch prototype of the phase-2a design: an associative-scan
+`_linear_sites` with rank-one Joseph-form elements, plus `parallel_kalman_smoother`. The
+host was `breeze` with NVIDIA A100 80GB PCIe, x64, JAX 0.10.2. The data are real: session
+`j1620210710` epoch `02_r1`, 20 ms bins, head position, sorted HPC units, a 5 cm 2-D
+`neurospatial` environment (386 bins), `GraphPlaceFieldModel(rank=20)`. Timing used the
+jax skill protocol: compile separate, `jax.block_until_ready` on the full pytree, min of
+3–5 steady runs. The harness and logs are in `/cumulus/edeno/ssp-graph-bench/bench/` on
+`breeze` (`bench_parallel.py`, `mem_probe.py`, `trace_parallel.py`, `fit_real.py`).
+
+**Correctness:**
+- The linear pass matches the sequential one to ~1e-15.
+- The full smoother's mode and covariances match to ~3e-15, the evidence to 1e-13, and
+  the implicit d(evidence)/dq to 3e-14, with the same Newton iteration count.
+- On the real data the evidence differs by 3e-12 to 5e-10, ~1e-13 relative.
+
+**Speed, joint-smoother evidence, q = 1e-3:**
+
+| T | Neurons | Device | value seq → par | value+grad seq → par |
+| --- | --- | --- | --- | --- |
+| 750 | 1 | A100 | 692 → 39 ms (18×) | 889 → 49 ms (18×) |
+| 3,000 | 1 | A100 | 3,209 → 108 ms (30×) | 4,000 → 110 ms (36×) |
+| 12,000 | 1 | A100 | 11.2 → 0.29 s (38×) | 14.3 → 0.24 s (60×) |
+| 70,930 | 1 | A100 | 66.2 → 1.12 s (59×) | 84.5 → 1.23 s (69×) |
+| 3,000 | 32 | A100 | 3.9 → 0.56 s (7×) | 4.9 → 0.68 s (7×) |
+| 70,930 | 4 | A100 | — | 109 → 2.6 s (41×) |
+| 750 | 1 | CPU (breeze) | 182 → 352 ms (0.5×) | 325 → 800 ms (0.4×) |
+| 3,000 | 1 | CPU | 1.23 → 2.88 s (0.4×) | 1.75 → 3.56 s (0.5×) |
+| 12,000 | 1 | CPU | 2.49 → 7.10 s (0.4×) | 7.39 → 12.1 s (0.6×) |
+| 3,000 | 8 | CPU | 4.03 → 17.4 s (0.2×) | 8.62 → 19.6 s (0.4×) |
+
+**Compile:** 26–54 s for the parallel pass vs 5–133 s sequential on the A100. At
+T=70,930 the parallel pass compiles faster.
+
+**Kernels** (`xprof`, value+grad, T=3000, one neuron):
+- Sequential: 2,712 ms of kernel time; ~12k tiny `getrf` LU and ~24k triangular-solve
+  launches.
+- Parallel: 51.7 ms; a few dozen batched `getrf`/`trsm` calls.
+- The remaining T-length loop is the prior-path scan (2,999 reduce/add launches, ~11 ms),
+  which phase 2a removes.
+- Peak device memory: 0.25 GB sequential vs 0.5 GB parallel.
+
+**Memory at the full session** (value+grad, T=70,930, peak device bytes):
+
+| Neurons | Sequential | Parallel |
+| --- | --- | --- |
+| 1 | 3.8 GiB | 11.6 GiB |
+| 2 | 7.2 GiB | 23.5 GiB |
+| 4 | 14.4 GiB | 46.6 GiB |
+
+8 neurons in parallel tried to allocate 74 GiB and failed on the 80 GB card.
+
+**Context:**
+- The sequential pass is launch-bound on the GPU: one neuron at T=3000 takes 3.2 s on the
+  A100 vs 0.65 s on breeze's CPU.
+- Batching neurons amortises the launches (128 neurons: 4.5 s A100 vs 146 s CPU), but the
+  drift-profile objective is one neuron per call.
+- A real-data `fit()` (8 neurons, T=3000, `profile_points=9, profile_rounds=2`) took
+  3,422 s on the A100 with the sequential pass.
 
 ## Risks and Mitigations
 
@@ -86,9 +162,13 @@ Paths are relative to `src/state_space_practice/`. Line numbers were verified ag
 | Singular `Q` makes the merit's prior quadratic form ill-defined. | `psd_cholesky`'s scale-relative shift (`utils.py:74-112`) gives constrained directions a huge but finite precision; the Gauss–Newton direction respects the constraint so the whitened innovation is round-off; documented in designs.md#numerical-notes. |
 | Refactoring `temporal_rate_gp` onto the shared core changes its numerics. | Phase 4 keeps `min_weight` semantics through a custom `GLMFamily`, is gated by the dense-GP oracle (`tests/test_oracle_gp.py::test_laplace_rate_gp_equals_dense_gp_laplace`, rtol 1e-8) and the finite-difference gradient test, and records the one intended behaviour change (rejected step keeps the iterate). |
 
+| Phase 2a's backend-dependent default (`parallel=None`) makes results and memory depend on the device. | Both paths converge to the same mode (contract: rtol 1e-9, evidence 1e-10); the model passes the *resolved* bool to compiled functions; the docstring states the CPU slowdown and the GPU memory rule. |
+| Parallel value+grad memory: ~11.6 GiB per neuron at T≈71k, rank 20 (3× sequential); 8 neurons OOM on 80 GB. | `neuron_batch_size` chunks neurons (`lax.map` with `batch_size`); a measured `jax.checkpoint` experiment decides rematerialisation; single-neuron time chunking is a listed follow-up with a trigger. |
+| Parallel compile time (26–54 s per shape on the A100) dominates short GPU runs. | Shapes are stable within a fit; the persistent cache (`SSP_JAX_CACHE_DIR`) applies; reported in the results table. |
+
 ## Rollout Strategy
 
-All additions are keyword-only with defaults that select today's code path: `n_iterations=1`, `parallel=False`, `convergence_tol=1e-6`, `return_diagnostics=False`. No deprecations, no removals of public behaviour, no changes to positional signatures or to the tuple layout of existing returns (diagnostics are appended only when requested). The existing sequential path is not removed; it is iteration 0 of the new algorithm. Phases ship in order 1 → 2 → 3 → 4; each leaves the suite green. Phase 4 is the only phase that removes code (the private Newton loop in `temporal_rate_gp.py`) and it is behaviour-preserving up to the recorded fallback change.
+All additions are keyword-only with defaults that select today's code path: `n_iterations=1`, `parallel=False`, `convergence_tol=1e-6`, `return_diagnostics=False`. No deprecations, no removals of public behaviour, no changes to positional signatures or to the tuple layout of existing returns (diagnostics are appended only when requested). The existing sequential path is not removed; it is iteration 0 of the new algorithm. Phase 2a ships first and independently: it adds `parallel: bool | None = None` to the joint core and `GraphPlaceFieldModel` (both new on the graph branch, so there is no compatibility constraint), resolving to the sequential path on CPU. The remaining phases ship in order 1 → 2b → 3 → 4; each leaves the suite green. Phase 4 is the only phase that removes code (the private Newton loop in `temporal_rate_gp.py`) and it is behaviour-preserving up to the recorded fallback change.
 
 ## Open Questions
 
@@ -96,11 +176,14 @@ All additions are keyword-only with defaults that select today's code path: `n_i
 2. **Warm-starting the nominal trajectory across EM iterations** (previous E-step's smoothed means as `initial_path`). Current answer: internal `initial_path` only (used by the parallel initialisation and by `temporal_rate_gp`); exposing it changes EM's path dependence and deserves its own decision. Trigger: an EM profile showing ≥ 3 Gauss–Newton passes per E-step after the first few iterations.
 3. **`PlaceFieldModel.score` and `PointProcessModel`-style held-out scoring** keep the one-pass filter LL even when the model was fitted with `n_iterations > 1`. Current answer: leave as is (a causal predictive score is a legitimate held-out quantity); document the mismatch in the `score` docstring in phase 1.
 4. **Diagnostics for the `n_iterations=1, parallel=False` path** when `return_diagnostics=True`: current answer is a stub with `n_gauss_newton_passes = 0`, `log_posterior` of length 1 (the joint log posterior of the one-pass path, cheap to evaluate), `max_abs_update = nan`, `converged = False` ("not assessed").
-5. **Parallel initialisation** uses the constant nominal trajectory `x̂_t = init_mean` (the prior mean path for `A = I`, the default of both models). Alternative `x̂_t = A^t m_0` needs an eigendecomposition or an O(T d²) scan; deferred until a stable-`A` user reports slow convergence from the constant start.
+5. **Parallel initialisation (phase 2b)** uses the constant nominal trajectory `x̂_t = init_mean` (the prior mean path for `A = I`, the default of both models). Phase 2a computes `A^t m_0` with an associative scan of matrix powers (`_transition_powers`, designs.md), which phase 2b could adopt instead of the constant start. Deferred until a stable-`A` user reports slow convergence from the constant start.
+6. **Should phase 1 build on the joint Laplace core?** `laplace_smoothing.py` already provides adaptive Armijo iteration (`lax.while_loop`), exact implicit derivatives, masks and a q=0 branch for single-observation rank-one sites. Phase 1 plans a separate fixed-pass, unrolled Gauss–Newton core in `point_process_kalman.py` for multi-neuron (rank-`N`) sites with a Laplace-EKF start. Current answer: undecided. Generalising the joint core to multi-row sites, and deciding the EKF start and the derivative strategy, must be settled, with phases 1/2b/3/4 refreshed, before any of them executes.
+7. **Backend-dependent default for the point-process `parallel`?** Phase 2a uses `parallel=None` (auto by backend). For `stochastic_point_process_smoother`, `parallel=True` also changes the start and the `n_iterations` semantics, so an auto default would break its bit-identical default on GPU. Current answer: keep `parallel: bool = False` there; revisit after phase 2b's results table.
 
 ## Estimated Effort
 
 - Phase 1: ~500 LOC in `point_process_kalman.py` (sites, linearised update, sequential pass, line search, core, diagnostics, wiring), ~40 LOC in `kalman.py` (prior quadratic-form helpers), ~60 LOC of model pass-through, ~700 LOC of tests, ~120 lines of docstrings/CHANGELOG/README.
-- Phase 2: ~250 LOC in `kalman.py` (`parallel_kalman_filter` elements/operator/wrapper), ~120 LOC in `point_process_kalman.py` (parallel branch of the linear pass, `lax.map` block variant), ~150 LOC benchmark script, ~350 LOC tests, docs.
+- Phase 2a: ~120 LOC in `kalman.py` (`_parallel_information_filter`, elements, operator), ~80 LOC in `laplace_smoothing.py` (parallel pass, prior powers, `resolve_parallel`, keyword), ~60 LOC in `graph_place_field.py` (keywords, static-arg threading, chunked `_vmap_by_noise_structure`), ~200 LOC benchmark/compare scripts, ~300 LOC tests, docs.
+- Phase 2b: ~130 LOC in `kalman.py` (public `parallel_kalman_filter` wrapper; the private filter comes from 2a) (`parallel_kalman_filter` elements/operator/wrapper), ~120 LOC in `point_process_kalman.py` (parallel branch of the linear pass, `lax.map` block variant), ~150 LOC benchmark script, ~350 LOC tests, docs.
 - Phase 3: ~250 LOC in `position_decoder.py` (penalty sites, decoder problem, wiring), ~300 LOC tests, docs.
 - Phase 4: −180 / +90 LOC in `temporal_rate_gp.py`, ~30 LOC of test message updates.

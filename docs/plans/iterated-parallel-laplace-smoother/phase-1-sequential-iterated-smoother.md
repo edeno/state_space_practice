@@ -26,7 +26,7 @@
 - [Public keywords and return layout](shared-contracts.md#public-keywords) — `n_iterations`, `convergence_tol`, `return_diagnostics`; evidence and `return_filtered` semantics. Do not weaken the bit-identical guarantee.
 - [`IteratedSmootherDiagnostics`](shared-contracts.md#iterated-smoother-diagnostics) — defined in this phase.
 - [Pseudo-observation site contract](shared-contracts.md#pseudo-observation-site-contract) — information form only; masks compose as `G_t = g_t = 0`.
-- [Gauss–Newton core interface](shared-contracts.md#gauss-newton-core-interface) and [Linear-pass interface](shared-contracts.md#linear-pass-interface) — defined in this phase with `parallel=False`; `parallel=True` must raise `NotImplementedError` inside the private core until phase 2 (the public keyword is not added in this phase).
+- [Gauss–Newton core interface](shared-contracts.md#gauss-newton-core-interface) and [Linear-pass interface](shared-contracts.md#linear-pass-interface) — defined in this phase with `parallel=False`; `parallel=True` must raise `NotImplementedError` inside the private core until phase 2b (the public keyword is not added in this phase).
 - [Warning contract](shared-contracts.md#warning-contract).
 
 **Designs referenced:** [designs.md#pseudo-observation-sites](designs.md#pseudo-observation-sites), [#gauss-newton-step-as-a-linear-smoother-pass](designs.md#gauss-newton-step-as-a-linear-smoother-pass), [#line-search](designs.md#line-search), [#laplace-evidence](designs.md#laplace-evidence), [#convergence-and-diagnostics](designs.md#convergence-and-diagnostics), [#block-diagonal-path](designs.md#block-diagonal-path), [#gradients](designs.md#gradients), [#numerical-notes](designs.md#numerical-notes).
@@ -57,10 +57,10 @@
 
 ## Deliberately not in this phase
 
-- `parallel=True` and `kalman.parallel_kalman_filter` — phase 2 (the private core raises `NotImplementedError` for `parallel=True`; the public keyword does not exist yet).
+- `parallel=True` and `kalman.parallel_kalman_filter` — phase 2b (the private core raises `NotImplementedError` for `parallel=True`; the public keyword does not exist yet).
 - `PositionDecoder` / `position_decoder_smoother` — phase 3 (different filter; needs the penalty sites; `extra_sites` hook is left `None` here).
 - Replacing `temporal_rate_gp`'s Newton loop — phase 4 (this phase only proves agreement with it).
-- Implicit (fixed-point) differentiation of the evidence. Trigger: a `fit_sgd` run with `n_iterations ≥ 4` whose reverse-mode memory exceeds the device, or a measured > 2× slowdown of the SGD step versus `n_iterations=1` on the phase-2 baseline grid.
+- Implicit (fixed-point) differentiation of the evidence. Trigger: a `fit_sgd` run with `n_iterations ≥ 4` whose reverse-mode memory exceeds the device, or a measured > 2× slowdown of the SGD step versus `n_iterations=1` on the phase-2b baseline grid.
 - Early exit via `lax.while_loop`; exposing `initial_path` (EM warm start) — overview.md Open Questions 1–2.
 - Any change to `stochastic_point_process_filter`, `max_newton_iter`, the M-steps or `run_em`.
 

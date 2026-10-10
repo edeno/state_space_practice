@@ -39,7 +39,7 @@
 
 ## Deliberately not in this phase
 
-- Exposing `parallel=True` on `infer_log_rate` / `TemporalRateGP`. The core supports it after phase 2; the batch path `vmap`s over neurons and would need the `lax.map` treatment. Trigger: a user with `n_time > 1e5` single-train inference on GPU.
+- Exposing `parallel=True` on `infer_log_rate` / `TemporalRateGP`. The core supports it after phase 2b; the batch path `vmap`s over neurons and would need the `lax.map` treatment. Trigger: a user with `n_time > 1e5` single-train inference on GPU.
 - Removing or deprecating `poisson_log_rate_site` (public, tested; unused internally after this phase). Trigger: the next public-API review.
 - Any change to `TemporalRateGP`'s hyperparameter parameterisation or to `gp_ssm`.
 

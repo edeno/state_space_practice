@@ -38,7 +38,7 @@
 
 - Changing `_run_filter_scan`'s numerics, the inflation heuristic or the penalty downdate — untouched apart from the closure hoist.
 - A dedicated `DecoderResult` field for diagnostics (would change the object's constructor); diagnostics live on the decoder instance and in the optional second return value.
-- Time-chunked parallel scans (phase-2 follow-up) — the decoder's `d ≤ 4` fits the memory formula up to `T ~ 1e6` on a 24 GB GPU.
+- Time-chunked parallel scans (phase-2b follow-up) — the decoder's `d ≤ 4` fits the memory formula up to `T ~ 1e6` on a 24 GB GPU.
 - Any change to `PlaceFieldRateMaps` or the KDE evaluation.
 
 ## Validation slice
