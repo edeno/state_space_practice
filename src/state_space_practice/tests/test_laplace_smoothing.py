@@ -31,10 +31,13 @@ def joint_problem():
     )
 
 
+@pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("q", [0.0, 0.03, 1e-8])
-def test_joint_mode_curvature_lag_and_evidence_match_dense_reference(joint_problem, q):
+def test_joint_mode_curvature_lag_and_evidence_match_dense_reference(
+    joint_problem, q, parallel
+):
     args = dict(joint_problem, noise=q * jnp.eye(2))
-    result = poisson_laplace_smoother(**args)
+    result = poisson_laplace_smoother(**args, parallel=parallel)
     reference = joint_poisson_laplace(
         np.asarray(args["mean0"]),
         np.asarray(args["covariance0"]),
@@ -351,3 +354,45 @@ def test_parallel_default_resolves_by_backend(monkeypatch):
     assert resolve_parallel(None) is False
     assert resolve_parallel(True) is True
     assert resolve_parallel(False) is False
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("q", [0.0, 0.03])
+def test_parallel_smoother_matches_sequential_with_gradients(joint_problem, q):
+    def run(parallel, scale=1.0, shift=0.0):
+        args = dict(
+            joint_problem,
+            mean0=joint_problem["mean0"] + shift,
+            noise=scale * q * jnp.eye(2),
+        )
+        return poisson_laplace_smoother(**args, parallel=parallel)
+
+    sequential, parallel = run(False), run(True)
+    assert bool(sequential.converged) and bool(parallel.converged)
+    for field in ("mean", "covariance", "cross_covariance"):
+        np.testing.assert_allclose(
+            getattr(parallel, field), getattr(sequential, field), rtol=1e-9, atol=1e-12
+        )
+    np.testing.assert_allclose(
+        parallel.log_evidence, sequential.log_evidence, rtol=1e-10
+    )
+    for field in ("n_iterations", "n_rejected_steps", "converged"):
+        assert getattr(parallel, field) == getattr(sequential, field)
+    for argnum, name in ((1, "scale"), (2, "shift")):
+        gradients = [
+            jax.grad(lambda *a, p=p: run(p, *a).log_evidence, argnums=argnum - 1)(
+                1.0, 0.0
+            )
+            for p in (False, True)
+        ]
+        assert np.isfinite(gradients[0]), name
+        np.testing.assert_allclose(gradients[1], gradients[0], rtol=1e-8, atol=1e-12)
+
+
+@pytest.mark.parametrize(("q", "static_noise"), [(0.0, True), (0.03, False)])
+def test_parallel_and_hint_compose(joint_problem, q, static_noise):
+    args = dict(joint_problem, noise=q * jnp.eye(2), parallel=True)
+    automatic = poisson_laplace_smoother(**args)
+    hinted = poisson_laplace_smoother(**args, static_noise=static_noise)
+    for expected, actual in zip(automatic, hinted, strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)

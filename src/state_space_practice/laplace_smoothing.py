@@ -255,7 +255,10 @@ def _iterate_mode(
     return path, relative(path, proposed), n, rejected
 
 
-@partial(typed_jit, static_argnames=("dt", "max_iter", "tolerance", "static_noise"))
+@partial(
+    typed_jit,
+    static_argnames=("dt", "max_iter", "tolerance", "static_noise", "parallel"),
+)
 def poisson_laplace_smoother(
     mean0: ArrayLike,
     covariance0: ArrayLike,
@@ -269,6 +272,7 @@ def poisson_laplace_smoother(
     max_iter: int = 50,
     tolerance: float = 1e-8,
     static_noise: bool | None = None,
+    parallel: bool | None = None,
 ) -> LaplaceTrajectoryResult:
     """Infer the full trajectory mode and normalized joint Laplace evidence.
 
@@ -309,6 +313,17 @@ def poisson_laplace_smoother(
         that evaluates both solvers. ``True``/``False`` runs only the
         zero-noise/positive-definite solver; the caller guarantees the noise
         matches.
+    parallel : bool or None, optional
+        Run each linear pass (filter and RTS) and the prior powers by
+        associative scans, with O(log n_time) sequential depth instead of
+        O(n_time). ``None`` (default) selects them on GPU/TPU and the sequential
+        pass on CPU (:func:`resolve_parallel`). Both converge to the same mode
+        and evidence. On an A100 the parallel pass was 18-69x faster for one
+        trajectory (n_time 750-70,930, rank 20); on CPU it was 2-4x slower.
+        With gradients it needs about 3x the device memory of the sequential
+        pass (11.6 GiB vs 3.6 GiB at n_time = 70,930, rank 20), scaling with
+        ``n_time * rank**2``. See Särkkä & García-Fernández (2021), IEEE TAC
+        66(1), 299-306.
 
     Returns
     -------
@@ -328,6 +343,8 @@ def poisson_laplace_smoother(
     n_time, rank = design.shape
     identity = jnp.eye(rank, dtype=dtype)
     is_static = jnp.all(noise == 0)
+    use_parallel = resolve_parallel(parallel)
+    linear_sites = _linear_sites_parallel if use_parallel else _linear_sites
     # vmap evaluates both cond branches. Keep the unused dynamic branch finite
     # for static neurons, including its reverse-mode derivatives.
     safe_noise = jnp.where(is_static, identity, noise)
@@ -360,7 +377,7 @@ def poisson_laplace_smoother(
         ) -> Callable[[Array], Array]:
             def target(path: Array) -> Array:
                 _, weight, information = sites(z, yy, path)
-                return _linear_sites(m0, p0, a, q, z, weight, information).mean
+                return linear_sites(m0, p0, a, q, z, weight, information).mean
 
             return target
 
@@ -368,8 +385,11 @@ def poisson_laplace_smoother(
             mean = transition @ previous
             return mean, mean
 
-        _last_mean, rest = jax.lax.scan(prior_step, mean0, None, length=n_time - 1)
-        initial = jnp.concatenate((mean0[None], rest))
+        if use_parallel:
+            initial = _transition_powers(transition, n_time) @ mean0
+        else:
+            _last_mean, rest = jax.lax.scan(prior_step, mean0, None, length=n_time - 1)
+            initial = jnp.concatenate((mean0[None], rest))
 
         pm, pp, pa, pq, pz, py, pchol, pqchol = jax.lax.stop_gradient(
             (
@@ -404,7 +424,7 @@ def poisson_laplace_smoother(
         )(stopped_path)
         mode = stopped_path + (exact_target - jax.lax.stop_gradient(exact_target))
         eta, weight, information = sites(design, y, mode)
-        gaussian = _linear_sites(
+        gaussian = linear_sites(
             mean0, covariance0, transition, safe_noise, design, weight, information
         )
         correction = poisson_log_likelihood(design, y, mode) - jnp.sum(
@@ -428,10 +448,13 @@ def poisson_laplace_smoother(
             matrix = transition @ previous
             return matrix, matrix
 
-        _last_loading, remaining = jax.lax.scan(
-            loading_step, identity, None, length=n_time - 1
-        )
-        loading = jnp.concatenate((identity[None], remaining))
+        if use_parallel:
+            loading = _transition_powers(transition, n_time)
+        else:
+            _last_loading, remaining = jax.lax.scan(
+                loading_step, identity, None, length=n_time - 1
+            )
+            loading = jnp.concatenate((identity[None], remaining))
         prior_path = jnp.einsum("tij,j->ti", loading, mean0)
         white_loading = loading @ chol
         white_design = jnp.einsum("ti,tij->tj", design, white_loading)
