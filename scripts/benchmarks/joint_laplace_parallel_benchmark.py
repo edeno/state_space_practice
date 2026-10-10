@@ -92,6 +92,11 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--save-outputs")
     parser.add_argument("--fit", action="store_true")
+    parser.add_argument(
+        "--neuron-batch-size",
+        type=int,
+        help="Infer at most this many neurons at once (lax.map over chunks).",
+    )
     args = parser.parse_args()
     use_parallel = args.parallel == "true"
     smoother_kwargs = parallel_kwargs(poisson_laplace_smoother, use_parallel)
@@ -104,21 +109,26 @@ def main() -> None:
     A = model.transition_matrix
     m0 = model.init_mean
 
+    def one(mean: jax.Array, y: jax.Array, q: jax.Array):  # type: ignore[no-untyped-def]
+        return poisson_laplace_smoother(
+            mean,
+            P0,
+            A,
+            jnp.diag(q * S),
+            Z,
+            y,
+            valid,
+            dt=DT,
+            static_noise=False,
+            **smoother_kwargs,
+        )
+
     def per_neuron(q: jax.Array):  # type: ignore[no-untyped-def]
-        return jax.vmap(
-            lambda mean, y: poisson_laplace_smoother(
-                mean,
-                P0,
-                A,
-                jnp.diag(q * S),
-                Z,
-                y,
-                valid,
-                dt=DT,
-                static_noise=False,
-                **smoother_kwargs,
-            )
-        )(m0, spikes)
+        if args.neuron_batch_size is None:
+            return jax.vmap(lambda mean, y: one(mean, y, q))(m0, spikes)
+        return jax.lax.map(
+            lambda xs: one(*xs, q), (m0, spikes), batch_size=args.neuron_batch_size
+        )
 
     def evidence(q: jax.Array) -> jax.Array:
         return jnp.sum(per_neuron(q).log_evidence)
@@ -131,6 +141,7 @@ def main() -> None:
         parallel=use_parallel,
         n_time=args.n_time,
         n_neurons=args.n_neurons,
+        neuron_batch_size=args.neuron_batch_size,
         rank=args.rank,
         seed=args.seed,
         backend=jax.default_backend(),
