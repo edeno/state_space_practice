@@ -106,3 +106,57 @@ Before opening the PR for this phase, dispatch `code-reviewer` (or equivalent in
   - With `parallel` resolved to `False`, `poisson_laplace_smoother` runs exactly today's code.
   - The results table reports measured numbers, including CPU slowdowns, with device and JAX version.
   - The remat decision cites its measurements.
+
+## Results
+
+Measured 2026-10-09 on `breeze` (NVIDIA A100 80GB PCIe; CPU rows on the same
+host with `OPENBLAS_NUM_THREADS=32`), JAX 0.10.2, x64, simulated data from
+`joint_laplace_parallel_benchmark.py` (seed 0, rank 20, `dt = 0.05`). The
+sequential baseline ran from a worktree pinned at `22bcb2a` (benchmark script
+only, before any source change); the parallel rows ran from `9dd8bc9`, the
+chunked rows from `9de8d86`. Other users' jobs shared the host for part of the
+run, so the timings carry some extra noise. JSON records are in
+[benchmarks/joint-laplace-2a/](benchmarks/joint-laplace-2a/). The NPZ outputs
+stay on `breeze` under `/cumulus/edeno/ssp-2a-bench/`.
+
+`compare_joint_laplace_outputs.py` passes for every pair: evidence rtol `1e-10`,
+smoothed means rtol `1e-8`, equal convergence, and for the fit a log-likelihood
+within `1e-6` and drift rtol `1e-3`. Timings are value+grad min.
+
+| T | N | device | sequential s | parallel s | speedup | seq peak GiB | par peak GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 3,000 | 1 | A100 | 3.577 | 0.073 | 49.3× | 0.27 | 0.76 |
+| 3,000 | 8 | A100 | 4.647 | 0.269 | 17.3× | 1.42 | 5.68 |
+| 3,000 | 32 | A100 | 4.939 | 0.922 | 5.4× | 5.44 | 22.83 |
+| 12,000 | 1 | A100 | 14.349 | 0.153 | 94.1× | 0.74 | 2.92 |
+| 12,000 | 8 | A100 | 20.733 | 1.018 | 20.4× | 5.46 | 22.98 |
+| 12,000 | 32 | A100 | 21.695 | OOM (71.7 GiB) / 7.108 chunked by 8 | 3.1× chunked | 21.78 | 26.10 chunked |
+| 70,930 | 1 | A100 | 84.189 | 0.653 | 128.9× | 4.29 | 16.60 |
+| 70,930 | 8 | A100 | 134.339 | OOM (114 GiB) / 11.000 chunked by 2 | 12.2× chunked | 32.25 | 38.19 chunked |
+| 3,000 | 1 | CPU | 1.474 | 4.158 | 0.4× | — | — |
+| 3,000 | 8 | CPU | 7.863 | 22.239 | 0.4× | — | — |
+| 12,000 | 1 | CPU | 7.962 | 13.111 | 0.6× | — | — |
+| 12,000 | 8 | CPU | 39.716 | 90.674 | 0.4× | — | — |
+
+**End-to-end `fit()`** (T=3000, N=8, `profile_points=9, profile_rounds=2`, A100):
+2,065 s sequential → 165 s parallel (12.5×). Log-likelihood −7559.009301239684 vs
+−7559.009301239671, both converged.
+
+**Rematerialisation** (T=70,930, value+grad, A100):
+
+| N | variant | peak | time |
+| --- | --- | --- | --- |
+| 1 | plain | 16.13 GiB | 0.653 s |
+| 1 | `jax.checkpoint` on the linear pass | 9.70 GiB | 0.771 s |
+| 4 | plain | OOM (61.4 GiB) | — |
+| 4 | `jax.checkpoint` on the linear pass | 39.71 GiB | 3.60 s |
+
+The memory drop is 1.66× at +18 % time, which fails the keep rule (≥ 2× at
+≤ 30 %), so whole-pass rematerialisation was dropped. Neuron chunking bounds
+memory instead.
+
+**Chunking needed checkpointing.** `lax.map` alone did not bound memory under
+differentiation: a chunked value+grad (T=12,000, N=32, chunks of 8) still tried
+to allocate 101.7 GiB. Reverse mode through the map keeps every chunk's
+intermediates. Each chunk is now `jax.checkpoint`-ed, which produced the
+chunked rows above.

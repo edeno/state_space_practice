@@ -1,0 +1,5 @@
+{"variant": "plain", "n": 1, "first_s": 43.39681757520884, "min_s": 0.6526337843388319, "median_s": 0.6527725839987397, "peak_gib": 16.127339124679565, "value": -22024.527726032917, "grad": -142096.766747254}
+{"variant": "remat", "n": 1, "first_s": 47.10823620855808, "min_s": 0.770881837233901, "median_s": 0.7711904682219028, "peak_gib": 9.695235252380371, "value": -22024.527726032917, "grad": -142096.76674725403}
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 61.42GiB. [executable_name='jit_evidence'] [tf-allocator-allocation-error='']
+{"variant": "remat", "n": 4, "first_s": 62.532520783133805, "min_s": 3.5987554118037224, "median_s": 3.598769098520279, "peak_gib": 39.71477198600769, "value": -88550.53569856535, "grad": -556855.8625752222}
+REMAT_DONE

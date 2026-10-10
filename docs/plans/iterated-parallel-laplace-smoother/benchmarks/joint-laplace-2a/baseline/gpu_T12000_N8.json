@@ -1,0 +1,22 @@
+{
+ "parallel": false,
+ "n_time": 12000,
+ "n_neurons": 8,
+ "rank": 20,
+ "seed": 0,
+ "backend": "gpu",
+ "device_kind": "NVIDIA A100 80GB PCIe",
+ "jax_version": "0.10.2",
+ "host": "breeze.cin.ucsf.edu",
+ "value": {
+  "compile_and_first_s": 20.47436577361077,
+  "min_s": 17.201379703357816,
+  "median_s": 17.20182068925351
+ },
+ "value_and_grad": {
+  "compile_and_first_s": 28.98454298917204,
+  "min_s": 20.733055443502963,
+  "median_s": 20.733487559482455
+ },
+ "peak_bytes_in_use": 5864251136
+}
