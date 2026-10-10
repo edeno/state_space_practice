@@ -104,16 +104,17 @@ The joint smoother is a sequential scan over time by default. On a GPU each of
 its tiny per-step factorizations is a separate kernel launch, so a single neuron
 runs several times slower than on a CPU. `parallel=True` (the default on a
 GPU/TPU, `parallel=None`) runs each linear pass by associative scans instead:
-on an A100 this was 18-129x faster for one neuron (750-70,930 time bins, rank
-20) and 5-20x for 8-32 neurons at once, with the same fit; a full `fit()` of 8
-neurons over 3,000 bins took 165 s instead of 2,065 s. On a CPU the parallel
-pass is 2-5x slower, so `None` keeps the sequential pass there.
+on an A100 this was 49-129x faster for one neuron (3,000-70,930 time bins,
+rank 20) and 5-20x for 8-32 neurons at once, with the same fit; a full `fit()`
+of 8 neurons over 3,000 bins took 165 s instead of 2,065 s. On a CPU the
+parallel pass is 1.7-4x slower, so `None` keeps the sequential pass there.
 
 The parallel pass needs three to four times the device memory with gradients:
 about 12-17 GiB per neuron at 70,930 bins and rank 20 (sequential: about 4
 GiB), scaling with `n_time * rank**2`. Set `neuron_batch_size` to infer at most
-that many neurons at once when all neurons do not fit; gradients then recompute
-each chunk rather than storing it:
+that many neurons at once when all neurons do not fit. Gradients then recompute
+each chunk rather than storing it, which cost 17-34 % more per gradient on an
+A100 during `fit()` (and about 2x under `fit_sgd` with learnable drift):
 
 ```python
 model = GraphPlaceFieldModel(env, dt=0.02, rank=20, neuron_batch_size=4)

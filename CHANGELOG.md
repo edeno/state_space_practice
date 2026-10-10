@@ -37,11 +37,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   parity fit with an unvisited graph component). The model uses
   the shared fitting/result contracts and requires the `spatial` extra and x64.
   `parallel` (default: on for GPU/TPU, off for CPU) runs the joint smoother's
-  linear passes by associative scans, with the same fit: 18-129x faster per
-  neuron on an A100 (750-70,930 time bins, rank 20; a full 8-neuron fit took
-  165 s instead of 2,065 s) and 2-5x slower on CPU, at about 3-4x the device
+  linear passes by associative scans, with the same fit: 49-129x faster per
+  neuron on an A100 (3,000-70,930 time bins, rank 20; a full 8-neuron fit took
+  165 s instead of 2,065 s) and 1.7-4x slower on CPU, at about 3-4x the device
   memory with gradients. `neuron_batch_size` bounds memory by
-  inferring neurons in chunks. `laplace_smoothing.poisson_laplace_smoother`
+  inferring neurons in checkpointed chunks (17-34 % more per gradient in
+  `fit()`). `laplace_smoothing.poisson_laplace_smoother`
   exposes the same `parallel` option, and `kalman` gains the information-form
   associative-scan filter it uses.
 - **Public API and version at package level**: `state_space_practice.__version__`

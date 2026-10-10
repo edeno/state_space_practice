@@ -130,9 +130,9 @@ within `1e-6` and drift rtol `1e-3`. Timings are value+grad min.
 | 3,000 | 32 | A100 | 4.939 | 0.922 | 5.4× | 5.44 | 22.83 |
 | 12,000 | 1 | A100 | 14.349 | 0.153 | 94.1× | 0.74 | 2.92 |
 | 12,000 | 8 | A100 | 20.733 | 1.018 | 20.4× | 5.46 | 22.98 |
-| 12,000 | 32 | A100 | 21.695 | OOM (71.7 GiB) / 7.108 chunked by 8 | 3.1× chunked | 21.78 | 26.10 chunked |
+| 12,000 | 32 | A100 | 21.695 | OOM (71.7 GiB) / 4.773 chunked by 8 | 4.5× chunked | 21.78 | 24.66 chunked |
 | 70,930 | 1 | A100 | 84.189 | 0.653 | 128.9× | 4.29 | 16.60 |
-| 70,930 | 8 | A100 | 134.339 | OOM (114 GiB) / 11.000 chunked by 2 | 12.2× chunked | 32.25 | 38.19 chunked |
+| 70,930 | 8 | A100 | 134.339 | OOM (114 GiB) / 6.986 chunked by 2 | 19.2× chunked | 32.25 | 36.18 chunked |
 | 3,000 | 1 | CPU | 1.474 | 4.158 | 0.4× | — | — |
 | 3,000 | 8 | CPU | 7.863 | 22.239 | 0.4× | — | — |
 | 12,000 | 1 | CPU | 7.962 | 13.111 | 0.6× | — | — |
@@ -158,5 +158,13 @@ memory instead.
 **Chunking needed checkpointing.** `lax.map` alone did not bound memory under
 differentiation: a chunked value+grad (T=12,000, N=32, chunks of 8) still tried
 to allocate 101.7 GiB. Reverse mode through the map keeps every chunk's
-intermediates. Each chunk is now `jax.checkpoint`-ed, which produced the
-chunked rows above.
+intermediates. Each chunk is now `jax.checkpoint`-ed and saves the converged
+Newton mode (`LAPLACE_MODE_CHECKPOINT`), so the backward pass replays only
+the exact Newton map and final linear pass. The chunked rows above are from
+`4700486`, which chunks through the library's `_vmap_by_noise_structure`.
+Against unchunked parallel at the same N (4 × 1.018 s and 8 × 0.653 s) they
+cost +17 % and +34 %. Checkpointing the whole chunk, at `9de8d86`, measured
+7.108 s and 11.000 s (+75 % and +110 %) because it also replayed the
+adaptive iteration. When the static/drifting pattern is unknown (`fit_sgd`
+with learnable drift), the iteration sits inside a batched `lax.cond` and is
+still replayed.
