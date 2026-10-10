@@ -120,4 +120,13 @@ A100 during `fit()` (and about 2x under `fit_sgd` with learnable drift):
 model = GraphPlaceFieldModel(env, dt=0.02, rank=20, neuron_batch_size=4)
 ```
 
+For large recordings, also set `store_covariances=False`. By default the fit
+keeps the per-time posterior covariances (`smoother_cov`, `smoother_cross_cov`,
+`filtered_cov`), each `(n_neurons, n_time, rank, rank)`: about 0.6 GB per
+neuron and array for an hour of 20 ms bins at rank 20. Without them the model
+keeps only the means and small per-neuron summaries, fitting and EM give the
+same results, and `predict_rate_map` recomputes the requested neuron's
+covariances. With `neuron_batch_size` set, the final inference also runs in
+blocks of that many neurons and keeps finished blocks in host memory.
+
 See the [reproducible validation](validation/graph-place-field-learning/README.md).

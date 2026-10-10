@@ -44,7 +44,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   inferring neurons in checkpointed chunks (17-34 % more per gradient in
   `fit()`). `laplace_smoothing.poisson_laplace_smoother`
   exposes the same `parallel` option, and `kalman` gains the information-form
-  associative-scan filter it uses.
+  associative-scan filter it uses. `store_covariances=False` keeps only
+  posterior means and per-neuron summaries instead of the
+  `(n_neurons, n_time, rank, rank)` covariance arrays, so long recordings with
+  many neurons fit in memory; `smoother_diagnostics_` holds per-neuron
+  `SmootherDiagnostics` scalars.
 - **Public API and version at package level**: `state_space_practice.__version__`
   and lazily loaded (PEP 562) entry points — `kalman_filter`, `kalman_smoother`,
   `switching_kalman_filter`, `switching_kalman_smoother`, `run_em`,

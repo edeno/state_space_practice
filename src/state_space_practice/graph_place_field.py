@@ -3230,7 +3230,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
         the exact posterior expected firing rate at active bin ``i``, averaged over the
         requested time window. This uses ``mean_t E[exp(...)]`` (not ``exp(mean_t ...)``),
-        which matters for a drifting field because the two differ.
+        which matters for a drifting field because the two differ. With
+        ``store_covariances=False`` the neuron's covariances are recomputed from
+        the data of the last fit.
 
         Parameters
         ----------
