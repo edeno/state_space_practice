@@ -1921,6 +1921,18 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_smoother_iter : int, optional
             Joint Newton iteration cap, by default 50. Convergence uses a
             relative remaining state update tolerance of 1e-8.
+        parallel : bool or None, optional
+            Run the joint smoother's linear passes by associative scans
+            (``poisson_laplace_smoother(parallel=...)``). ``None`` (default)
+            selects them on GPU/TPU and the sequential pass on CPU, where the
+            parallel pass is 2-4x slower. Both give the same fit. Ignored by
+            ``inference_method="sequential"``.
+        neuron_batch_size : int or None, optional
+            Infer at most this many neurons at once (``lax.map`` over chunks)
+            to bound device memory; ``None`` (default) batches every neuron.
+            With gradients, the parallel pass needs about 11.6 GiB per neuron
+            at ``n_time`` = 70,930 and rank 20 (sequential: 3.6 GiB), scaling
+            with ``n_time * rank**2``.
         """
         # The compiled filter treats dt as static; normalize concrete scalar
         # array inputs to a finite, hashable Python float before caching it.

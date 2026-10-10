@@ -98,4 +98,23 @@ ordinary Poisson observations; `max_firing_rate_hz` clamps only the causal
 sequential filter outputs, which are retained separately as `filtered_mean` and
 `filtered_cov`. Those causal outputs differ from joint smoothed trajectories.
 
+## GPU
+
+The joint smoother is a sequential scan over time by default. On a GPU each of
+its tiny per-step factorizations is a separate kernel launch, so a single neuron
+runs several times slower than on a CPU. `parallel=True` (the default on a
+GPU/TPU, `parallel=None`) runs each linear pass by associative scans instead:
+on an A100 this was 18-69x faster per neuron for 750-70,930 time bins at rank
+20, with the same fit. On a CPU the parallel pass is 2-4x slower, so `None`
+keeps the sequential pass there.
+
+The parallel pass needs about three times the device memory with gradients:
+~11.6 GiB per neuron at 70,930 bins and rank 20, scaling with
+`n_time * rank**2`. Set `neuron_batch_size` to infer at most that many neurons
+at once when all neurons do not fit:
+
+```python
+model = GraphPlaceFieldModel(env, dt=0.02, rank=20, neuron_batch_size=4)
+```
+
 See the [reproducible validation](validation/graph-place-field-learning/README.md).

@@ -36,6 +36,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rejects unpenalized modes that occupied bins cannot identify (for example, a
   parity fit with an unvisited graph component). The model uses
   the shared fitting/result contracts and requires the `spatial` extra and x64.
+  `parallel` (default: on for GPU/TPU, off for CPU) runs the joint smoother's
+  linear passes by associative scans, with the same fit: 18-69x faster per neuron
+  on an A100 (750-70,930 time bins, rank 20) and 2-4x slower on CPU, at about
+  3x the device memory with gradients. `neuron_batch_size` bounds memory by
+  inferring neurons in chunks. `laplace_smoothing.poisson_laplace_smoother`
+  exposes the same `parallel` option, and `kalman` gains the information-form
+  associative-scan filter it uses.
 - **Public API and version at package level**: `state_space_practice.__version__`
   and lazily loaded (PEP 562) entry points — `kalman_filter`, `kalman_smoother`,
   `switching_kalman_filter`, `switching_kalman_smoother`, `run_em`,
