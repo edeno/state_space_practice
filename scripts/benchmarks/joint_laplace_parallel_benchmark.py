@@ -126,8 +126,11 @@ def main() -> None:
     def per_neuron(q: jax.Array):  # type: ignore[no-untyped-def]
         if args.neuron_batch_size is None:
             return jax.vmap(lambda mean, y: one(mean, y, q))(m0, spikes)
+        # Checkpoint each chunk so gradients recompute it instead of storing it.
         return jax.lax.map(
-            lambda xs: one(*xs, q), (m0, spikes), batch_size=args.neuron_batch_size
+            jax.checkpoint(lambda xs: one(*xs, q)),
+            (m0, spikes),
+            batch_size=args.neuron_batch_size,
         )
 
     def evidence(q: jax.Array) -> jax.Array:

@@ -520,3 +520,22 @@ def test_graph_parallel_fit_matches_sequential(learning_env, scalar_data):
     np.testing.assert_allclose(
         fitted[True].drift_scale, fitted[False].drift_scale, rtol=1e-3, atol=1e-12
     )
+
+
+def test_neuron_chunks_rematerialise_under_differentiation(learning_env, scalar_data):
+    """Chunking bounds gradient memory only if each chunk is recomputed backward."""
+    times, positions, counts = scalar_data
+    spikes = np.stack([counts, counts[::-1], counts], axis=1)
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+    args, _ = model._prepare_sgd_data(times, positions, spikes, warm_start=True)
+    params = model._current_params()
+
+    def primitives(batch):
+        model.neuron_batch_size = batch
+        jaxpr = jax.make_jaxpr(
+            jax.grad(lambda q: model._forward_loss(dict(params, drift_scale=q), *args))
+        )(params["drift_scale"])
+        return str(jaxpr)
+
+    assert "remat" not in primitives(None)  # jax.checkpoint prints as remat
+    assert "remat" in primitives(2)

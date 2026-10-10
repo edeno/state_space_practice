@@ -1465,16 +1465,16 @@ def _vmap_by_noise_structure(
     ``lax.cond`` would evaluate both); outputs are restored to neuron order.
     ``None`` vmaps every neuron with the automatic branch choice. ``batch_size``
     vmaps at most that many neurons at once (``lax.map`` over chunks), bounding
-    device memory.
+    device memory. Each chunk is ``jax.checkpoint``-ed: reverse mode through the
+    map would otherwise keep every chunk's intermediates, so gradients recompute
+    one chunk at a time instead.
     """
 
     def over_neurons(flag: bool | None, *args: Array) -> _Out:
         if batch_size is None:
             return jax.vmap(partial(fn, flag))(*args)
-        return cast(
-            _Out,
-            jax.lax.map(lambda xs: fn(flag, *xs), tuple(args), batch_size=batch_size),
-        )
+        chunk = jax.checkpoint(lambda xs: fn(flag, *xs))
+        return cast(_Out, jax.lax.map(chunk, tuple(args), batch_size=batch_size))
 
     if static_neurons is None:
         return over_neurons(None, *batched)
@@ -1930,6 +1930,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         neuron_batch_size : int or None, optional
             Infer at most this many neurons at once (``lax.map`` over chunks)
             to bound device memory; ``None`` (default) batches every neuron.
+            Gradients recompute each chunk (``jax.checkpoint``) rather than
+            storing every chunk's intermediates.
             With gradients, the parallel pass needs about 11.6 GiB per neuron
             at ``n_time`` = 70,930 and rank 20 (sequential: 3.6 GiB), scaling
             with ``n_time * rank**2``.
