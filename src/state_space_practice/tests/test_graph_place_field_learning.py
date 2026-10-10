@@ -460,3 +460,63 @@ def test_drift_profile_losses_equal_pointwise_objective(
                 model._forward_loss(params, Z, spk[cell : cell + 1], valid, (q == 0,))
             )
             assert loss == pytest.approx(expected, rel=1e-10, abs=1e-9)
+
+
+@pytest.mark.slow
+def test_neuron_chunking_matches_unchunked(learning_env, scalar_data, monkeypatch):
+    times, positions, counts = scalar_data
+    spikes = np.stack(
+        [counts, counts[::-1], np.ones_like(counts), counts, counts[::-1]], axis=1
+    )
+    model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+    args, _ = model._prepare_sgd_data(times, positions, spikes, warm_start=True)
+    drift = jnp.array([0.0, 0.03, 0.0, 0.01, 0.02])
+    static = tuple(bool(d == 0) for d in np.asarray(drift))
+    model.drift_scale = drift
+    params = model._current_params()
+    chunked_calls = []
+    lax_map = jax.lax.map
+
+    def counting_map(*a, **k):
+        chunked_calls.append(k.get("batch_size"))
+        return lax_map(*a, **k)
+
+    monkeypatch.setattr(jax.lax, "map", counting_map)
+    results = {}
+    for batch in (None, 2):  # 2 leaves an uneven last chunk in each noise group
+        chunked_calls.clear()
+        model.neuron_batch_size = batch
+        value, grad = jax.value_and_grad(
+            lambda q: model._forward_loss(dict(params, drift_scale=q), *args, static)
+        )(drift)
+        evidence = model._e_step(*args)
+        results[batch] = (
+            value,
+            grad,
+            evidence,
+            np.asarray(model.smoother_mean),
+            np.asarray(model.filtered_mean),
+        )
+        # Guard: chunking is traced only when a batch size is set.
+        assert (2 in chunked_calls) == (batch == 2)
+    assert np.isfinite(results[None][0])
+    for expected, actual in zip(results[None], results[2], strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.slow
+def test_graph_parallel_fit_matches_sequential(learning_env, scalar_data):
+    fitted = {}
+    for parallel in (False, True):
+        model = GraphPlaceFieldModel(learning_env, 0.1, rank=2, parallel=parallel)
+        model.fit(*scalar_data, profile_points=9, profile_rounds=1)
+        assert model.converged_
+        fitted[parallel] = model
+    assert fitted[True].log_likelihood_ == pytest.approx(
+        fitted[False].log_likelihood_, abs=1e-6
+    )
+    # The two passes differ in the last bit, so L-BFGS stops at slightly
+    # different points within its gradient tolerance; the evidence agrees.
+    np.testing.assert_allclose(
+        fitted[True].drift_scale, fitted[False].drift_scale, rtol=1e-3, atol=1e-12
+    )

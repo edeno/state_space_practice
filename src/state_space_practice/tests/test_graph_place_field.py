@@ -911,6 +911,21 @@ def test_model_rejects_nonfinite_hyperparameters(small_grid_env, name):
         legacy_graph_model(small_grid_env, dt=0.02, **{name: np.inf})
 
 
+@pytest.mark.parametrize(
+    "setting",
+    [
+        {"parallel": "yes"},
+        {"neuron_batch_size": 0},
+        {"neuron_batch_size": -1},
+        {"neuron_batch_size": 1.5},
+        {"neuron_batch_size": True},
+    ],
+)
+def test_model_rejects_bad_parallel_settings(small_grid_env, setting):
+    with pytest.raises(ValueError, match=next(iter(setting))):
+        legacy_graph_model(small_grid_env, dt=0.02, **setting)
+
+
 def test_model_rejects_unsupported_interpolation_at_construction(small_grid_env):
     with pytest.raises(ValueError, match="interpolation"):
         legacy_graph_model(small_grid_env, dt=0.02, interpolation="cubic")

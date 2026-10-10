@@ -68,6 +68,7 @@ from state_space_practice.kalman import process_cov_residual_form, rts_backward_
 from state_space_practice.laplace_smoothing import (
     LaplaceTrajectoryResult,
     poisson_laplace_smoother,
+    resolve_parallel,
 )
 from state_space_practice.likelihood_optimization import (
     ScaleProfile,
@@ -1455,22 +1456,33 @@ def _vmap_by_noise_structure(
     fn: Callable[..., _Out],
     static_neurons: tuple[bool, ...] | None,
     *batched: Array,
+    batch_size: int | None = None,
 ) -> _Out:
     """``vmap`` ``fn(static_noise, *args)`` over neurons, grouped by noise.
 
     With ``static_neurons`` known, static and drifting neurons are vmapped as
     separate groups so each runs only its own joint solver (a batched
     ``lax.cond`` would evaluate both); outputs are restored to neuron order.
-    ``None`` vmaps every neuron with the automatic branch choice.
+    ``None`` vmaps every neuron with the automatic branch choice. ``batch_size``
+    vmaps at most that many neurons at once (``lax.map`` over chunks), bounding
+    device memory.
     """
+
+    def over_neurons(flag: bool | None, *args: Array) -> _Out:
+        if batch_size is None:
+            return jax.vmap(partial(fn, flag))(*args)
+        return cast(
+            _Out,
+            jax.lax.map(lambda xs: fn(flag, *xs), tuple(args), batch_size=batch_size),
+        )
+
     if static_neurons is None:
-        return jax.vmap(partial(fn, None))(*batched)
+        return over_neurons(None, *batched)
     mask = np.asarray(static_neurons, dtype=bool)
     groups = [(np.flatnonzero(m), flag) for m, flag in ((~mask, False), (mask, True))]
     groups = [(index, flag) for index, flag in groups if index.size]
     outputs = [
-        jax.vmap(partial(fn, flag))(*(b[index] for b in batched))
-        for index, flag in groups
+        over_neurons(flag, *(b[index] for b in batched)) for index, flag in groups
     ]
     if len(outputs) == 1:
         return outputs[0]
@@ -1496,6 +1508,8 @@ def _graph_neuron_log_evidence(
     inference_method: Literal["sequential", "joint"],
     max_smoother_iter: int,
     static_neurons: tuple[bool, ...] | None,
+    parallel: bool,
+    neuron_batch_size: int | None,
 ) -> Array:
     """Per-neuron log evidence, shape ``(n_neurons,)``; traced by its callers.
 
@@ -1518,6 +1532,7 @@ def _graph_neuron_log_evidence(
                 dt=dt,
                 max_iter=max_smoother_iter,
                 static_noise=static_noise,
+                parallel=parallel,
             )
             return jnp.where(result.converged, result.log_evidence, -jnp.inf)
         return _masked_graph_point_process_filter(
@@ -1539,6 +1554,7 @@ def _graph_neuron_log_evidence(
         params["init_mean"],
         spikes,
         params["drift_scale"],
+        batch_size=neuron_batch_size,
     )
 
 
@@ -1549,6 +1565,8 @@ _GRAPH_LOSS_STATIC_ARGS = (
     "max_newton_iter",
     "inference_method",
     "max_smoother_iter",
+    "parallel",
+    "neuron_batch_size",
 )
 
 
@@ -1568,6 +1586,8 @@ def _graph_forward_loss(
     inference_method: Literal["sequential", "joint"],
     max_smoother_iter: int,
     static_neurons: tuple[bool, ...] | None = None,
+    parallel: bool = False,
+    neuron_batch_size: int | None = None,
 ) -> Array:
     """Pure shared objective (negative log evidence summed over neurons)."""
     return -jnp.sum(
@@ -1585,6 +1605,8 @@ def _graph_forward_loss(
             inference_method=inference_method,
             max_smoother_iter=max_smoother_iter,
             static_neurons=static_neurons,
+            parallel=parallel,
+            neuron_batch_size=neuron_batch_size,
         )
     )
 
@@ -1606,6 +1628,8 @@ def _graph_profile_losses(
     inference_method: Literal["sequential", "joint"],
     max_smoother_iter: int,
     static: bool,
+    parallel: bool = False,
+    neuron_batch_size: int | None = None,
 ) -> Array:
     """Per-neuron negative log evidence at shared drift values.
 
@@ -1631,6 +1655,8 @@ def _graph_profile_losses(
             inference_method=inference_method,
             max_smoother_iter=max_smoother_iter,
             static_neurons=(static,) * n_neurons,
+            parallel=parallel,
+            neuron_batch_size=neuron_batch_size,
         )
 
     return cast(Array, jax.lax.map(at, drift_values))
@@ -1655,6 +1681,8 @@ class _GraphNeuronInference(NamedTuple):
         "inference_method",
         "max_smoother_iter",
         "static_neurons",
+        "parallel",
+        "neuron_batch_size",
     ),
 )
 def _graph_posterior(
@@ -1673,6 +1701,8 @@ def _graph_posterior(
     inference_method: Literal["sequential", "joint"],
     max_smoother_iter: int,
     static_neurons: tuple[bool, ...] | None,
+    parallel: bool = False,
+    neuron_batch_size: int | None = None,
 ) -> _GraphNeuronInference:
     """Per-neuron posterior inference as one compiled program.
 
@@ -1716,6 +1746,7 @@ def _graph_posterior(
                 dt=dt,
                 max_iter=max_smoother_iter,
                 static_noise=static_noise,
+                parallel=parallel,
             )
             smoother_mean, smoother_cov, smoother_cross_cov = (
                 result.mean,
@@ -1737,7 +1768,14 @@ def _graph_posterior(
             result,
         )
 
-    return _vmap_by_noise_structure(one, static_neurons, init_mean, spikes, drift_scale)
+    return _vmap_by_noise_structure(
+        one,
+        static_neurons,
+        init_mean,
+        spikes,
+        drift_scale,
+        batch_size=neuron_batch_size,
+    )
 
 
 class GraphPlaceFieldModel(SGDFittableMixin):
@@ -1811,6 +1849,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_newton_iter: int = 5,
         inference_method: Literal["sequential", "joint"] = "joint",
         max_smoother_iter: int = 50,
+        parallel: bool | None = None,
+        neuron_batch_size: int | None = None,
     ) -> None:
         """Build the graph basis and initialize model hyperparameters.
 
@@ -1890,6 +1930,17 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_smoother_iter = validate_int(
             max_smoother_iter, "max_smoother_iter", positive=True
         )
+        if parallel is not None and not isinstance(parallel, bool):
+            raise ValueError(f"parallel must be None, True or False; got {parallel!r}.")
+        if neuron_batch_size is not None:
+            if isinstance(neuron_batch_size, (bool, np.bool_)):
+                raise ValueError(
+                    "neuron_batch_size must be a positive integer or None; "
+                    f"got {neuron_batch_size!r}."
+                )
+            neuron_batch_size = validate_int(
+                neuron_batch_size, "neuron_batch_size", positive=True
+            )
         kappa2 = validate_scalar(kappa2, "kappa2", positive=True)
         tau2 = validate_scalar(tau2, "tau2", positive=True)
         alpha = validate_scalar(alpha, "alpha", positive=True)
@@ -1925,6 +1976,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.max_newton_iter = max_newton_iter
         self.inference_method = inference_method
         self.max_smoother_iter = max_smoother_iter
+        self.parallel = parallel
+        self.neuron_batch_size = neuron_batch_size
         self.update_drift_scale = update_drift_scale
         self.update_amplitude = update_amplitude
         self.update_init_mean = update_init_mean
@@ -2043,6 +2096,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             max_newton_iter=self.max_newton_iter,
             inference_method=self.inference_method,
             max_smoother_iter=self.max_smoother_iter,
+            parallel=self._parallel,
+            neuron_batch_size=self.neuron_batch_size,
             static_neurons=(
                 self._static_neurons() if self.inference_method == "joint" else None
             ),
@@ -2420,6 +2475,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             max_newton_iter=self.max_newton_iter,
             inference_method=self.inference_method,
             max_smoother_iter=self.max_smoother_iter,
+            parallel=self._parallel,
+            neuron_batch_size=self.neuron_batch_size,
             static_neurons=static_neurons,
         )
 
@@ -2449,9 +2506,16 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 max_newton_iter=self.max_newton_iter,
                 inference_method=self.inference_method,
                 max_smoother_iter=self.max_smoother_iter,
+                parallel=self._parallel,
+                neuron_batch_size=self.neuron_batch_size,
                 static=static,
             )
         )
+
+    @property
+    def _parallel(self) -> bool:
+        """Resolved ``parallel``; the sequential filter path has no joint pass."""
+        return self.inference_method == "joint" and resolve_parallel(self.parallel)
 
     def _static_neurons(self) -> tuple[bool, ...]:
         """Which stored per-neuron drift scales are exactly zero."""
