@@ -94,9 +94,10 @@ Out-of-bounds positions skip observations while retaining every transition on th
 full time grid. Mask held-out counts too, and use training rows only in fitting.
 The first row conditions directly on P0. Neurons have independent latent paths,
 with shared fitted spectral shape and initial amplitude. Joint inference uses
-ordinary Poisson observations; `max_firing_rate_hz` clamps only the causal
-sequential filter outputs, which are retained separately as `filtered_mean` and
-`filtered_cov`. Those causal outputs differ from joint smoothed trajectories.
+ordinary Poisson observations and does not run the causal filter, which no part
+of joint fitting or prediction uses. `inference_method="sequential"` runs it and
+keeps its past-only estimates as `filtered_mean` and `filtered_cov`;
+`max_firing_rate_hz` clamps only that filter.
 
 ## GPU
 
@@ -122,7 +123,8 @@ model = GraphPlaceFieldModel(env, dt=0.02, rank=20, neuron_batch_size=4)
 
 For large recordings, also set `store_covariances=False`. By default the fit
 keeps the per-time posterior covariances (`smoother_cov`, `smoother_cross_cov`,
-`filtered_cov`), each `(n_neurons, n_time, rank, rank)`: about 0.6 GB per
+and under sequential inference `filtered_cov`), each
+`(n_neurons, n_time, rank, rank)`: about 0.6 GB per
 neuron and array for an hour of 20 ms bins at rank 20. Without them the model
 keeps only the means and small per-neuron summaries, fitting and EM give the
 same results, and `predict_rate_map` recomputes the requested neuron's

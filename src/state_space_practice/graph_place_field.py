@@ -1214,7 +1214,6 @@ def _log_graph_newton_nonconvergence(
     max_relative_step: Array,
     *,
     max_newton_iter: int,
-    affected: str,
 ) -> None:
     """Report exhausted Newton budgets, including under jit/grad/vmap."""
     n = int(np.asarray(n_unconverged))
@@ -1223,19 +1222,15 @@ def _log_graph_newton_nonconvergence(
             "GraphPlaceFieldModel: Newton updates did not converge in %d/%d "
             "observed time bins with max_newton_iter=%d (largest remaining "
             "relative log-rate step %.3g; tolerance 1e-6). Increase "
-            "max_newton_iter; %s unconverged.",
+            "max_newton_iter; the posterior and evidence are unconverged.",
             n,
             int(np.asarray(n_observed)),
             max_newton_iter,
             float(np.asarray(max_relative_step)),
-            affected,
         )
 
 
-@partial(
-    typed_jit,
-    static_argnames=("dt", "max_log_count", "max_newton_iter", "affected"),
-)
+@partial(typed_jit, static_argnames=("dt", "max_log_count", "max_newton_iter"))
 def _masked_graph_point_process_filter(
     init_mean: Array,
     init_cov: Array,
@@ -1248,7 +1243,6 @@ def _masked_graph_point_process_filter(
     dt: float,
     max_log_count: float,
     max_newton_iter: int,
-    affected: str = "the posterior and evidence are",
 ) -> tuple[Array, Array, Array]:
     """Filter one neuron on the full time grid with masked observations.
 
@@ -1284,9 +1278,6 @@ def _masked_graph_point_process_filter(
         observation family.
     max_newton_iter : int
         Maximum Newton iterations for each per-time Laplace update.
-    affected : str
-        Outputs named in the Newton non-convergence warning, completed by
-        "unconverged".
 
     Returns
     -------
@@ -1438,11 +1429,7 @@ def _masked_graph_point_process_filter(
             n_units=jnp.maximum(jnp.sum(valid), 1),
         )
         jax.debug.callback(
-            partial(
-                _log_graph_newton_nonconvergence,
-                max_newton_iter=max_newton_iter,
-                affected=affected,
-            ),
+            partial(_log_graph_newton_nonconvergence, max_newton_iter=max_newton_iter),
             n_unconverged,
             jnp.sum(valid),
             max_step,
@@ -1730,7 +1717,7 @@ class _GraphNeuronInference(NamedTuple):
     covariance: Array | None
     cross_covariance: Array | None
     log_evidence: Array
-    filtered_mean: Array
+    filtered_mean: Array | None
     filtered_covariance: Array | None
     summary: _PosteriorSummary
     diagnostics: SmootherDiagnostics | None
@@ -1784,23 +1771,8 @@ def _graph_posterior(
         static_noise: bool | None, m0: Array, spk: Array, q_c: Array
     ) -> _GraphNeuronInference:
         Q = jnp.zeros_like(P0) if static_noise else jnp.diag(q_c * S)
-        filtered_mean, filtered_cov, marginal_ll = _masked_graph_point_process_filter(
-            m0,
-            P0,
-            Z,
-            spk,
-            valid,
-            transition,
-            Q,
-            dt=dt,
-            max_log_count=max_log_count,
-            max_newton_iter=max_newton_iter,
-            affected=(
-                "the causal filtered_mean/filtered_cov are"
-                if inference_method == "joint"
-                else "the posterior and evidence are"
-            ),
-        )
+        filtered_mean: Array | None = None
+        filtered_cov: Array | None = None
         diagnostics: SmootherDiagnostics | None = None
         if inference_method == "joint":
             result = poisson_laplace_smoother(
@@ -1829,6 +1801,20 @@ def _graph_posterior(
                 result.converged,
             )
         else:
+            filtered_mean, filtered_cov, marginal_ll = (
+                _masked_graph_point_process_filter(
+                    m0,
+                    P0,
+                    Z,
+                    spk,
+                    valid,
+                    transition,
+                    Q,
+                    dt=dt,
+                    max_log_count=max_log_count,
+                    max_newton_iter=max_newton_iter,
+                )
+            )
             smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
                 filtered_mean, filtered_cov, transition, Q
             )
@@ -1884,7 +1870,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     ``smoother_diagnostics_`` (joint inference only) holds per-neuron
     :class:`SmootherDiagnostics`; it is unset after a sequential-inference fit.
     With ``store_covariances=False`` the per-time covariance attributes
-    (``smoother_cov``, ``smoother_cross_cov``, ``filtered_cov``) are not kept.
+    (``smoother_cov``, ``smoother_cross_cov``, and under sequential inference
+    ``filtered_cov``) are not kept. ``filtered_mean`` / ``filtered_cov`` are
+    produced only by sequential inference.
     """
 
     smoother_mean: FittedAttribute[Array] = FittedAttribute()
@@ -1987,9 +1975,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Learn spatial shape kappa2 by evidence optimization, by default True.
             There is no closed-form EM update, so fit_em leaves it fixed.
         max_firing_rate_hz : float, optional
-            Numerical rate clamp for the causal sequential filter outputs,
-            by default 500.0. Joint inference uses the ordinary Poisson
-            likelihood without this clamp (an exponential overflow guard remains).
+            Numerical rate clamp for the causal sequential filter
+            (``inference_method="sequential"``), by default 500.0. Joint
+            inference uses the ordinary Poisson likelihood without this clamp
+            (an exponential overflow guard remains).
         max_newton_iter : int, optional
             Maximum Newton iterations per time-step Laplace update in the
             filter, by default 5, with damped updates and a final local
@@ -2002,7 +1991,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Joint trajectory Laplace inference (default), or experimental
             sequential local Laplace filtering/RTS. Joint inference uses adaptive damped
             Newton iteration and implicit mode derivatives; unconverged evidence
-            is rejected by gradient optimization.
+            is rejected by gradient optimization. Only sequential inference
+            produces the causal ``filtered_mean`` / ``filtered_cov``.
         max_smoother_iter : int, optional
             Joint Newton iteration cap, by default 50. Convergence uses a
             relative remaining state update tolerance of 1e-8.
@@ -2179,10 +2169,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     def _e_step(self, Z: Array, spikes: Array, valid: Array | None = None) -> float:
         """Per-neuron posterior inference; returns the total log evidence.
 
-        Always runs the causal sequential filter for ``filtered_mean`` /
-        ``filtered_cov``. Smoothed moments and the returned evidence come from
-        the joint Laplace smoother under ``inference_method="joint"`` (``-inf``
-        when it did not converge) and from the filter plus RTS otherwise.
+        Smoothed moments and the returned evidence come from the joint
+        Laplace smoother under ``inference_method="joint"`` (``-inf`` when it
+        did not converge). Under ``"sequential"`` they come from the causal
+        filter plus RTS, and the filter's ``filtered_mean`` / ``filtered_cov``
+        are also kept; joint inference does not run the filter.
         """
         assert self.init_mean is not None
         assert self.drift_scale is not None
@@ -2209,12 +2200,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         if len(parts) > 1:
             inference = jax.tree.map(lambda *xs: np.concatenate(xs), *parts)
         self.smoother_mean = inference.mean
-        self.filtered_mean = inference.filtered_mean
+        if inference.filtered_mean is not None:
+            self.filtered_mean = inference.filtered_mean
         if inference.covariance is not None:
             assert inference.cross_covariance is not None
-            assert inference.filtered_covariance is not None
             self.smoother_cov = inference.covariance
             self.smoother_cross_cov = inference.cross_covariance
+        if inference.filtered_covariance is not None:
             self.filtered_cov = inference.filtered_covariance
         self._posterior_summary = inference.summary
         self._inference_data = (Z, spikes, valid)

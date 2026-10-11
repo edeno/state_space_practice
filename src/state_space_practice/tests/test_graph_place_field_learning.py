@@ -313,34 +313,39 @@ def test_unusable_static_candidate_keeps_positive_fit(
 
 
 @pytest.mark.slow
-def test_joint_fit_attributes_filter_nonconvergence_to_causal_outputs(
-    learning_env, scalar_data, caplog
-):
-    """Under joint inference the causal filter only supplies filtered_*."""
-    model = GraphPlaceFieldModel(
-        learning_env,
-        0.1,
-        rank=1,
-        max_newton_iter=2,
-        init_drift_scale=0.03,
-        update_drift_scale=False,
-        update_amplitude=False,
-        update_kappa2=False,
-        update_init_mean=False,
-    )
-    with caplog.at_level(logging.WARNING, logger="state_space_practice"):
-        model.fit(*scalar_data, warm_start=False)
-        jax.effects_barrier()
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if "Newton updates did not converge" in record.getMessage()
-    ]
-    assert messages  # the causal filter really is unconverged here
-    assert bool(model.smoother_diagnostics_.converged.all())
-    for message in messages:
-        assert "filtered_mean" in message
-        assert "posterior and evidence" not in message
+def test_joint_fit_skips_the_causal_filter(learning_env, scalar_data, caplog):
+    """Joint inference never reads the causal filter, so it does not run it."""
+    fitted = {}
+    for inference_method in ("joint", "sequential"):
+        model = GraphPlaceFieldModel(
+            learning_env,
+            0.1,
+            rank=1,
+            max_newton_iter=2,  # leaves the causal filter unconverged here
+            init_drift_scale=0.03,
+            inference_method=inference_method,
+            update_drift_scale=False,
+            update_amplitude=False,
+            update_kappa2=False,
+            update_init_mean=False,
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="state_space_practice"):
+            model.fit(*scalar_data, warm_start=False)
+            jax.effects_barrier()
+        fitted[inference_method] = [
+            r.getMessage()
+            for r in caplog.records
+            if "Newton updates did not converge" in r.getMessage()
+        ]
+        if inference_method == "joint":
+            assert not is_set(model, "filtered_mean")
+            assert not is_set(model, "filtered_cov")
+            assert bool(model.smoother_diagnostics_.converged.all())
+        else:
+            assert is_set(model, "filtered_mean") and is_set(model, "filtered_cov")
+    assert fitted["sequential"]  # guard: the filter really is unconverged here
+    assert not fitted["joint"]
 
 
 @pytest.mark.slow
@@ -490,13 +495,7 @@ def test_neuron_chunking_matches_unchunked(learning_env, scalar_data, monkeypatc
             lambda q: model._forward_loss(dict(params, drift_scale=q), *args, static)
         )(drift)
         evidence = model._e_step(*args)
-        results[batch] = (
-            value,
-            grad,
-            evidence,
-            np.asarray(model.smoother_mean),
-            np.asarray(model.filtered_mean),
-        )
+        results[batch] = (value, grad, evidence, np.asarray(model.smoother_mean))
         # Guard: chunking is traced only when a batch size is set.
         assert (2 in chunked_calls) == (batch == 2)
     assert np.isfinite(results[None][0])
@@ -580,11 +579,10 @@ def test_compact_posterior_fit_matches_full(learning_env, scalar_data):
     full, compact = fitted[True], fitted[False]
     assert compact.log_likelihood_ == pytest.approx(full.log_likelihood_, rel=1e-12)
     np.testing.assert_allclose(compact.drift_scale, full.drift_scale, rtol=1e-10)
-    for name in ("smoother_mean", "filtered_mean"):
-        np.testing.assert_allclose(
-            getattr(compact, name), getattr(full, name), rtol=1e-10, atol=1e-12
-        )
-    for name in ("smoother_cov", "smoother_cross_cov", "filtered_cov"):
+    np.testing.assert_allclose(
+        compact.smoother_mean, full.smoother_mean, rtol=1e-10, atol=1e-12
+    )
+    for name in ("smoother_cov", "smoother_cross_cov"):
         assert is_set(full, name) and not is_set(compact, name), name
     for neuron in (0, 1):
         np.testing.assert_allclose(
@@ -619,7 +617,6 @@ def test_compact_posterior_storage_scales_with_rank(learning_env, scalar_data):
     args, _ = model._prepare_sgd_data(*scalar_data, warm_start=True)
     model._e_step(*args)
     n_time = args[0].shape[0]
-    for name in ("smoother_mean", "filtered_mean"):
-        assert np.shape(getattr(model, name)) == (1, n_time, 3), name
-    for name in ("smoother_cov", "smoother_cross_cov", "filtered_cov"):
+    assert np.shape(model.smoother_mean) == (1, n_time, 3)
+    for name in ("smoother_cov", "smoother_cross_cov", "filtered_mean", "filtered_cov"):
         assert not is_set(model, name), name

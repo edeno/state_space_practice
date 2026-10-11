@@ -28,8 +28,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   because q and fitted spatial shape can trade off. Constructor defaults are
   `inference_method="joint"` (joint-trajectory Laplace inference) and
   `update_drift_scale=True`; `inference_method="sequential"` selects the local
-  Laplace filter/RTS approximation. That causal filter (which also supplies
-  `filtered_mean`/`filtered_cov` under joint inference) takes up to
+  Laplace filter/RTS approximation. That causal filter (the source of
+  `filtered_mean`/`filtered_cov`; joint inference does not run it) takes up to
   `max_newton_iter=5` damped Newton iterations per observation and logs observed
   bins whose remaining relative log-rate step exceeds 1e-6. `score()` uses the selected evidence
   approximation and restarts from the fitted initial prior. The static estimator
