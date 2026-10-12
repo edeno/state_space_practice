@@ -21,8 +21,12 @@ validated comparison recipe. The HMM still represents population map identity.
   change is the small single-map prototype in
   [phase 3](phase-3-recurrence-versus-drift.md#experience-dependent-directional-fields).
   A small [joint drift/switching reference](drift-and-discrete-states.md) is also
-  owned by phase 3. Arbitrary continuous-heading interactions and production-scale
-  hybrid fields are later extensions, not prerequisites for this directional adapter.
+  owned by phase 3. This bidirectional adapter is the first reference, not the full
+  complex-environment target. Phase 3 adds a small local edge-direction or circular
+  heading interaction adapter under the
+  [complex-environment design](complex-environments-and-scale.md#complex-environments-are-an-inference-requirement).
+  Unrestricted heading interactions and production-scale hybrid fields remain later
+  extensions; they are not prerequisites for this first adapter.
 
 ## Observation model
 

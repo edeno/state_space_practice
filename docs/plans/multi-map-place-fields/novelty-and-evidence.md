@@ -31,9 +31,19 @@ versus preprint versions and separate verified absence from unexamined features.
 
 ## Proposed narrow contribution
 
-**Candidate:** a calibrated test of when chronic recordings support reusable
-population maps beyond continuous drift and local field turnover, despite incomplete
-position/direction sampling and changing neuron availability.
+**Candidate:** scalable, geometry-aware inference of reusable population maps versus
+continuous drift and local field turnover in complex environments, from chronic
+recordings with thousands of units, incomplete position/direction sampling and
+changing neuron availability.
+
+Complex geometry and population/chronic scale are primary differentiators to test,
+not optional application examples. The
+[complex-environment and scale design](complex-environments-and-scale.md) defines
+branches/loops/rooms/barriers, resolution and direction checks, a provisional chronic
+workload ladder, and separate 24 GB GPU/A100 benchmarks. A graph basis, a GPU kernel,
+or an increased neuron count is not alone a verified methods advance. Audit prior
+geometry-aware and scalable inference methods as well as the place-field studies
+above before claiming uniqueness; that expanded capability audit is still pending.
 
 This is a hypothesis about a useful methodological gap, not a verified first claim.
 It should produce decisions with uncertainty and an explicit unresolved category,
@@ -53,6 +63,10 @@ Separate three possible contributions:
 - **Software:** a reliable, efficient implementation and reproducible benchmark.
   This has value even when a new model or biological claim does not pass; runtime
   improvements require matched accuracy and measured resources.
+  Report end-to-end fitting, memory/I/O and uncertainty quality at matched physical
+  resolution. A scalable calibrated approximation may be a methods contribution
+  if the capability comparison demonstrates an advance; label pure implementation
+  improvements separately.
 
 ## Smallest decisive benchmark
 
@@ -69,6 +83,13 @@ barrier-driven coverage changes, missing cells and long gaps. Include simulation
 outside our own fitted model family. Report false map-discovery rates, power at
 matched false-positive rates, predictive scores, uncertainty calibration and runtime.
 Map the observation regimes where the alternatives cannot be distinguished.
+
+Then scale validated comparisons across neurons, recorded time, days, physical graph
+size and basis rank independently. Include branching multi-room and wall-separated
+paths, loops, bottlenecks and rarely sampled arms. Preserve the same physical field
+resolution and scientific targets as size grows. Run on a 24 GB GPU and an A100 with
+declared host/disk budgets. A large static-map run with missing drift/local-change
+comparators is a software feasibility result, not the completed mechanism comparison.
 
 Local change is a substantive competitor, not just a null with no population
 coordination. Start with independent field-level amplitude/on-off processes and a
@@ -89,6 +110,9 @@ cannot distinguish a whole-map state from a changing assembly.
 1. Write one contribution sentence and a capability matrix for the closest methods,
    supported by method/supplement/code references. Identify the exact inference or
    experimental difference; a list of familiar components is insufficient.
+   Include topology/geometry changes, local direction, spatial resolution, chronic
+   missingness, unit/time scale, peak memory, uncertainty and later-visit prediction.
+   Record untested capabilities as unknown rather than absent.
 2. Freeze the small benchmark, primary metric, acceptable calibration and practical
    improvement tolerance before comparing final results. Allow competing methods a
    comparable tuning budget and reproduce at least one published result or trusted

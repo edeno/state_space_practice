@@ -7,6 +7,12 @@ neuron availability. This phase supplies the data semantics needed for chronic
 recordings; it does not introduce drift within maps or infer activity during overnight
 gaps. **Status: not started.**
 
+**Scale target:** thousands of simultaneous units on 24 GB GPUs and A100s, across long
+recordings and repeated days. Read the
+[complex-environment and scale design](complex-environments-and-scale.md) for the
+provisional workloads and architecture. Masked padded arrays remain the small-data
+reference; a replayable out-of-core path is an explicit deliverable here.
+
 ## Entry gates and inputs
 
 - Multi-map [phase 1](phase-1-static-maps-hmm.md) has merged.
@@ -78,10 +84,30 @@ new model accept masked or batched inputs. Its phase 5 is needed separately for 
    zero rate. A changed graph needs phase 3's geometry adapter; do not silently replace
    a fitted eigenbasis or require identical graphs across a barrier manipulation.
 6. **Bound memory.** Accumulate per-sequence likelihoods and sufficient statistics
-   without constructing an `(S,T,N,K)` rate tensor. Measure peak memory and runtime
-   on a declared hours/days workload; use the sibling sequence mapping strategy when
-   needed. Do not call independent chunks of a continuous visit separate sessions
-   just to reduce memory: that changes the model's boundary conditions.
+   without constructing an `(S,T,N,K)` rate tensor. Batch both time and neurons;
+   evaluate graph/directional rows from blocks and stream input counts/masks.
+   Define the replayable reader and output contracts before implementation; neither
+   a full padded recording nor its dense design is a required host/GPU allocation.
+7. **Preserve inference across compute chunks.** Carry forward messages and likelihood
+   normalizers within visits. Use checkpoint/recompute or disk messages for exact
+   backward smoothing. Accumulate pairwise counts including internal chunk edges;
+   reset only at real visit boundaries. Provide optional posterior/path disk output
+   and summary-only execution. Extend the dense attribute contract explicitly;
+   never return missing arrays as if a requested full posterior had been stored.
+8. **Stream fitting and diagnostics.** Keep E-step responsibilities fixed throughout
+   the M-step; accumulate weighted GLM objectives/derivatives over blocks and batch
+   neuron/map solves. Replay data as needed for Newton steps and line search. Bound
+   initialization and support-summary memory too. Validate exact aggregation only
+   for identical complete design rows. A gradient-based large-data path additionally
+   needs validated checkpointed derivatives; random time chunks are not independent
+   HMM objectives. Full-data EM is the first scale gate; report SGD capacity separately.
+9. **Measure resources and restartability.** Run the scale design's population/chronic
+   ladder on a 24 GB GPU and an A100; record actual hardware, compilation, I/O, host
+   RSS, GPU peak memory, disk output/checkpoints, full-fit iterations and held-out
+   scores. Keep parameter/optimizer/configuration and iteration checkpoints to resume
+   a long fit reproducibly. Set duration and turnaround targets with the dataset owner;
+   the ladder's day/hour counts are provisional. Do not call independent chunks of a
+   continuous visit separate sessions merely to reduce memory.
 
 ## Validation and exit gates
 
@@ -95,6 +121,9 @@ new model accept masked or batched inputs. Its phase 5 is needed separately for 
 | Recurrence | A planted A–B–A visit sequence with overlapping tracked cells recovers the return to A under one global label permutation. Disjoint observed populations are flagged as inadequate evidence for cross-session map identity. |
 | Compatibility | Unmasked 2-D inputs reproduce phase 1; single-sequence batching matches within numerical reduction tolerance; EM and SGD use the same masked objective. Phase-1a directional designs retain their coefficient blocks and prediction semantics across sequences. |
 | Resources | Record runtime and peak memory, dimensions, bin width, missingness and sequence lengths for the benchmark; no unmeasured claim of chronic-scale feasibility. |
+| Chunked parity | Across arbitrary chunk sizes, match the dense likelihood, posteriors, boundary pairwise counts and GLM updates, including a switch at a chunk edge and missing interior bins. |
+| Out-of-core fitting | Complete declared thousand-unit fits with bounded working memory on 24 GB hardware; account for initialization, all fitting passes, I/O and optional posterior storage. Report A100 capacity/throughput separately. |
+| Restart | Restoring a checkpoint preserves the objective and updates under a fixed configuration; no skipped/repeated observations or priors, changed labels, or fabricated sequence boundaries. |
 
 Run the targeted multi-map, HMM and sequence tests, then the existing unmasked
 regressions affected by the adapters. Mark fitting tests slow. This phase is complete

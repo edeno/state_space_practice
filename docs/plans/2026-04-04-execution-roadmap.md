@@ -145,6 +145,14 @@ directional design adapter is a separate E7 phase-3 gate. N4 must pass its
 before claiming a cross-day drift-versus-switching comparison. E7 phase 1b is an
 optional E6-dependent branch, not a prerequisite for chronic support. See the
 [multi-map router](multi-map-place-fields/PLAN.md) for ownership and evidence gates.
+**Primary E7 application:** complex branching/looping environments and chronic
+recordings with thousands of simultaneous units on 24 GB GPUs and A100s. The
+[geometry/scale requirements](multi-map-place-fields/complex-environments-and-scale.md)
+add phase-2 out-of-core input, exact chunked HMM processing and streamed GLM fitting;
+phase 3 validates local direction, spatial resolution and matched scalable comparators.
+Record fixed-K capacity separately from Bayesian/hybrid prototype capacity. General
+Laplace parallelism can support drift comparisons but does not replace these HMM/data
+requirements. Day/hour and host/turnaround budgets remain provisional.
 For learning/barrier questions, add the
 [sampling and intervention benchmark](multi-map-place-fields/sampling-and-barriers.md):
 phase 2 supplies exposure/support diagnostics; phase 3 separates shared-support

@@ -20,6 +20,15 @@ position is the animal's.
 
 ## Scientific target and literature
 
+**Operating target, 2026-10-12:** complex environments and chronic recordings with
+thousands of simultaneous units, using 24 GB GPUs and A100s. Treat branches, loops,
+rooms, barriers and sparse revisitation as central inference cases. The
+[geometry and scale design](complex-environments-and-scale.md) specifies resolution
+checks, local direction features, disk-backed data, exact chunked HMM processing,
+batched GLM updates and measured population/chronic workloads. Geometry correctness,
+calibration and feasible end-to-end fitting must be demonstrated together; a graph
+basis interface alone is insufficient. These are targets, not current capabilities.
+
 **Updated 2026-10-12:** distinguish continuous representational change from switches
 between reusable population maps. Long recordings let us test A–B–A recurrence, pool
 observations across repeated map visits, and separate changes in map usage from changes
@@ -37,7 +46,7 @@ A [small joint drift/switching prototype](drift-and-discrete-states.md) is requi
 before interpreting those counts biologically: stickiness alone can partition
 continuous change into long-lived states.
 The [novelty audit](novelty-and-evidence.md) records additional close methods and
-field-level evolution studies. Our candidate contribution is a calibrated chronic
+field-level evolution studies. Our candidate contribution is a scalable, geometry-aware chronic
 comparison against both drift and local field/assembly changes; novelty remains
 unestablished until the capability audit and smallest decisive benchmark pass.
 
@@ -146,6 +155,9 @@ new helpers appended to `utils.py` and `simulate_data.py`; registrations in `__i
   objective through `SGDFittableMixin.fit_sgd`.
 - Basis-agnostic: the model consumes a per-time design matrix `(n_time, n_basis)` from
   `build_2d_spline_basis` / `evaluate_basis` or `graph_design_matrix`.
+  Phase 2 evaluates rows from replayable blocks for large recordings. Phase 3 tests
+  topology-aware resolution and local direction/heading on complex geometries; the
+  physical node count and fitted basis rank are separate scaling axes.
 - Initialisation: k-means on windowed population rate-map vectors with a fixed seed;
   labels ordered by occupancy after the fit; `initial_responsibilities=` override.
 - Outputs: smoothed and filtered map posteriors, pairwise posteriors, Viterbi path,
@@ -164,6 +176,9 @@ new helpers appended to `utils.py` and `simulate_data.py`; registrations in `__i
   reward/error history and experience effects with valid information cutoffs.
 - Phase 2: shared static maps across visits/sessions with per-neuron masks, independent
   initial map draws at sequence boundaries, common cell/spatial axes and bounded memory.
+  Add disk-backed input/output, neuron/time batching, exact checkpointed HMM smoothing,
+  streamed GLM updates and restartability; measure full fixed-K fits on thousands of
+  units on a 24 GB GPU and an A100. Session batching alone is insufficient.
 - Phase 3: nondirectional, stable directional, evolving directional, drifting and
   switching comparisons, including a small K=1 directional-evolution prototype
   and a low-dimensional fixed-K joint drift/switching reference.
@@ -280,7 +295,10 @@ does not by itself establish identifiability.
 - **SGD:** on a small problem `fit_sgd` reaches the EM objective within `1e-3` relative.
 - **Runtime:** fast suite additions ≤ 10 s total; every fitting test marked slow; the
   simulated two-map recovery fit (8 neurons, 15 000 bins, 49 basis functions) completes in
-  under 60 s on CPU (measure and record in the PR).
+  under 60 s on CPU (measure and record in the PR). This is only a reference test.
+  Phase 2's [population/chronic workload ladder](complex-environments-and-scale.md#workload-ladder-and-acceptance-evidence)
+  measures full fitting/scoring, GPU and host memory, disk/I/O and compile time.
+  Thousand-unit capacity on 24 GB hardware and A100 throughput are separate gates.
 - **Real data (script, not test):** on the J16 session the switch probability–speed
   correlation is reported with a circular-shift null and a BIC table over K. This is
   a single-session smoke check; the chronic scientific gate is phase 3's later-visit
@@ -306,6 +324,8 @@ does not by itself establish identifiability.
 | EM and SGD optimise different objectives, so `fit` and `fit_sgd` disagree | One `_log_prior` term shared by the EM objective and the SGD loss (pattern of `switching_point_process._sgd_loss_fn`). |
 | Penalty-clipped expected counts (`_safe_expected_count`) make Newton stall for saturated neurons | Same clip in E- and M-step keeps the objective consistent; line-searched steps never increase it; a saturation warning mirrors `PlaceFieldModel._warn_if_rate_saturated` (`place_field_model.py:920-981`). |
 | Materialising `(n_time, n_neurons, n_maps)` expected counts blows memory | `lax.map(..., batch_size=)` over bins; only `(n_time, n_maps)` is stored. |
+| Full inputs, HMM posteriors, initialization or optimizer temporaries exceed chronic memory budgets | Phase 2 adds replayable disk-backed blocks, exact message checkpoints, streamed statistics and optional disk posterior output; measure the whole fit, not only emissions. |
+| A low-rank graph basis blurs fields across complex branches or cannot resolve narrow passages | Benchmark physical resolution versus basis rank; validate local/multiresolution alternatives where needed. Direction coding is local to the geometry. |
 | BIC with a penalised likelihood mis-counts parameters | Document nominal-count limits and a parsimony tolerance; phase 3 uses blocked predictive performance as the primary criterion. |
 | Behaviour-correlation false positives from autocorrelated switch probability | Circular-shift null preserves autocorrelation; 1b tests the relationship as a parameter. |
 | Smooth drift, behavioral gains or unit instability produce apparent maps | Phase 3 compares drift and nuisance-covariate/gain controls, uses held-out target neurons and varies cell-quality/matching thresholds. |
@@ -369,9 +389,15 @@ conclude that evidence is insufficient; completion does not require finding maps
    capacity choice and persistent identities; birth/death and indefinite growth
    require separate evidence and design.
 9. **Directional fields.** Begin with a bidirectional shared-plus-contrast adapter;
-   test K=1 directional evolution across experience in phase 3. General heading
-   interactions and full-rank K-map drift remain follow-ons; the small low-rank
-   joint comparison is explicitly scheduled before repertoire interpretation.
+   test K=1 directional evolution across experience in phase 3. A small local
+   edge-direction/circular-heading adapter is scheduled for the complex-environment
+   comparison; unrestricted heading models and full-rank K-map drift remain follow-ons.
+   The small low-rank joint comparison precedes repertoire interpretation.
+10. **Scale and geometry.** Thousands of simultaneous units, 24 GB GPUs and A100s are
+    user targets. Recorded duration/day count, host-memory and turnaround budgets
+    remain open; use the labelled provisional workload ladder in the
+    [scale design](complex-environments-and-scale.md). Verify fixed-K scale first,
+    then the approximations needed for matched drift/local-change comparisons.
 
 ## Estimated Effort
 
@@ -386,4 +412,5 @@ conclude that evidence is insufficient; completion does not require finding maps
 - Phase 1b: ~200 LOC source, ~250 LOC tests.
 - These estimates cover the original phases 1/1b only. Scope 1a and phases 2–4
   after the helper/data audit; include directional designs, multi-session memory,
-  comparison runtime and Bayesian prototype costs in that estimate.
+  out-of-core data/optimization, complex-geometry resolution, comparison runtime
+  and Bayesian prototype costs in that estimate.

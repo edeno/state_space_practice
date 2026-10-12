@@ -10,6 +10,12 @@ Learning and barrier insertion/removal are explicit intervention benchmarks. The
 sampling, geometry and uncertainty requirements are specified in
 [sampling and barriers](sampling-and-barriers.md); read that design before analysis.
 
+**Primary application:** complex environments and chronic recordings with thousands
+of simultaneous units. Follow the
+[geometry and scale design](complex-environments-and-scale.md): validate small
+references first, then measure larger comparisons on 24 GB GPUs and A100s. A fixed-K
+scale demonstration alone does not establish a large-data drift-versus-map result.
+
 ## Entry gates and inputs
 
 - Multi-map [phases 1](phase-1-static-maps-hmm.md),
@@ -91,6 +97,15 @@ prototypes are additional gates for the new-space analysis, not assumed capabili
 of the current fixed-basis graph model or phase-1 MAP-weight HMM.
 
 ## Experience-dependent directional fields
+
+Phase 1a's bidirectional example is the reference case. For branching tracks and
+arenas, first validate the scale design's local edge-direction or small circular
+heading interaction adapter, with explicit junction/low-speed semantics and identical
+observed covariates across arms. Its spatial design must preserve topology and resolve
+localized fields at the chosen rank. Then apply the evolving-contrast comparison
+below to those direction features. Avoid a global inbound/outbound code when the
+geometry has no such orientation; route destination must obey prediction-time
+availability. Complex-environment validation is required for the target application.
 
 [Navratilova et al. 2012](https://pmc.ncbi.nlm.nih.gov/articles/PMC3282921/) motivates
 testing directional selectivity that develops with experience.
@@ -199,12 +214,25 @@ inference remains a separate resource/approximation decision.
    split/seed/configuration manifests, model-comparison tables, uncertainty, exclusions,
    runtime/peak memory and failure cases. Keep raw recordings out of git. Bootstrap
    at the animal/session level appropriate to the claim, not over correlated bins.
+8. **Validate complex geometry and population scale.** Use the
+   [workload and fixture ladder](complex-environments-and-scale.md#workload-ladder-and-acceptance-evidence).
+   Cross branches/loops/rooms/barriers and uneven coverage with neuron/time scale.
+   Compare physical resolution versus basis rank; validate local or multiresolution
+   alternatives if needed. Carry the small-reference uncertainty/calibration checks
+   into larger, validated approximate comparators. Report full fitting, scoring,
+   compile/I/O, disk use, host RSS and peak GPU memory separately for 24 GB and A100
+   configurations. Record a missing or infeasible comparator as an unmet scientific
+   gate; static-model throughput alone cannot resolve drift/local changes at scale.
 
 ## Synthetic validation and scientific exit gates
 
 Use a fixed multi-seed suite with static fields, smooth drift without recurrence,
 abrupt A–B–A returns, changing map occupancy, and a mixed switching-plus-drift case.
 Add behavioral gain changes, tracking gaps, unit dropout and registration errors.
+Add excess count variability and residual shared neural fluctuations; test whether
+the independent-Poisson model invents extra maps or becomes overconfident as neuron
+count grows. Include these observation-model failures in the calibration report,
+and justify any richer likelihood/gain alternative before using it as a comparator.
 Add asynchronous and correlated local field changes without a reusable whole-map
 state; test whether the shared-map model incorrectly reports repertoire growth.
 Add one stable directional map with changing travel-direction proportions, one map

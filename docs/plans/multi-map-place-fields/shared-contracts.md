@@ -154,6 +154,10 @@ The unmasked phase-1 input path remains unchanged. Multi-map-specific requiremen
 
 ## Scientific comparison contract
 
+- Complex environments and thousand-unit chronic recordings are primary targets;
+  follow the [geometry/scale contract](complex-environments-and-scale.md). Compare
+  methods at matched physical resolution, direction coding and observation support.
+  A bidirectional track fixture alone does not validate a branching or open arena.
 - Use identical evaluation observations, spatial coordinates, direction encoding,
   likelihood and masks
   across static, drifting and switching arms; document differences in boundary priors
@@ -170,6 +174,28 @@ The unmasked phase-1 input path remains unchanged. Multi-map-specific requiremen
   retrieval, or changes in represented position. A larger K may approximate continuous
   drift or developing directional selectivity. [Phase 3](phase-3-recurrence-versus-drift.md)
   owns controls, false-recurrence simulations and the scientific evidence gate.
+
+## Scalable execution contract
+
+- The dense single-sequence/batched shapes above remain reference APIs. Phase 2
+  defines an additional replayable input and summaries/disk-output interface for
+  recordings too large to materialize. Full posterior arrays must be explicitly
+  requested; access and storage semantics must be documented, not silently changed.
+- A compute chunk is not an independent visit. Carry HMM boundary messages and
+  normalization through chunks, including cross-chunk pairwise statistics. Exact
+  smoothing requires backward information through checkpoint/recompute or disk
+  storage. Reset initial probabilities only at declared visit boundaries.
+- Batch neurons before reducing emissions, and batch GLM solves. Masked entries have
+  no contribution; observed zero spikes retain exposure. Replayed M-steps use frozen
+  E-step responsibilities. Priors enter once in the total objective. Large-data
+  gradients require their own validation, not a sum of reset time-chunk objectives.
+- Report device and host peak memory, disk/I/O, compilation and end-to-end fit/score
+  time on the [workload ladder](complex-environments-and-scale.md#workload-ladder-and-acceptance-evidence).
+  Thousands of units on a 24 GB GPU and throughput on an A100 are separate checks.
+  Do not meet the target by undisclosed neuron subsampling or reduced resolution.
+- Full-scale fixed-K inference and a small joint drift/count prototype are distinct
+  capabilities. Scientific scale claims require validated, adequately matched
+  alternatives at the evaluated size, or explicit restriction of the claim.
 
 ## Spatial sampling and intervention contract
 

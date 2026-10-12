@@ -9,6 +9,10 @@ anchor; this file does not repeat the task lists. All code assumes float64
 These code sketches describe phase 1's single-sequence model. Phase 2 adapters must
 also satisfy [long-recording contracts](shared-contracts.md#long-recording-inputs-and-boundaries);
 use its phase file for mask/sequence tasks. Phase 3 owns the predictive comparison.
+The [complex-environment and scale design](complex-environments-and-scale.md) is
+authoritative for phase 2's out-of-core execution and phase 3's geometry/scale gates.
+The dense posterior attributes and whole-recording initialization shown here are
+small-data references, not the intended chronic thousand-unit storage architecture.
 
 Sections:
 
@@ -1078,6 +1082,12 @@ though the generative model never does. Three options, none evidenced yet:
 switching models do, `switching_point_process.py:2996-3004`), for `T = 150 000` bins
 (10 min at 4 ms), `N = 100`, `B = 36`, `K = 3`:
 
+These are dense-storage arithmetic estimates, not measured limits of current master
+or the target architecture. Current `GraphPlaceFieldModel` provides neuron batching
+and optional covariance retention; remeasure that baseline. The complex-environment
+scale target additionally requires chunked input/inference and explicit disk/output
+budgets, not merely turning off retained covariance arrays.
+
 | Quantity | Floats | Bytes |
 | --- | --- | --- |
 | static-map model (phase 1): `(T, K)` likelihoods + posteriors + `(T-1, K, K)` pairwise | 2.3e6 | 18 MB |
@@ -1086,8 +1096,9 @@ switching models do, `switching_point_process.py:2996-3004`), for `T = 150 000` 
 | option 2, per-map blocks `(N, T, K, B, B, K)` | 1.7e11 | 1.4 TB |
 | option 2 with collapsed (marginal) posterior only `(N, T, K, B, B)` | 5.8e10 | 470 GB |
 
-Even the single-map `PlaceFieldModel` is only practical at `N ~ 10-30`, `dt = 20 ms`,
-`T ~ 3e4` (then `(N, T, B, B)` is 6-19 GB); the drift model multiplies that by `K` to `K^2`.
+For this dense covariance storage, `N ~ 10-30`, `dt = 20 ms`, `T ~ 3e4` already costs
+6–19 GB for `(N, T, B, B)`; the sketch multiplies that by powers of K. This motivates
+an alternative storage/inference design, not a fixed population-size ceiling.
 It therefore needs (a) measured memory control and appropriate boundary conditions —
 independent sessions from phase 2 are not a state-carrying chunked smoother — and (b) a
 decision between options 1-3 backed by a small exact-oracle study (the `T <= 5`

@@ -191,6 +191,13 @@ pass the [sampling/uncertainty gate](sampling-and-barriers.md#field-uncertainty-
 
 ## Validation slice
 
+The small fixtures below establish the discrete reference, not chronic-scale
+feasibility. Include a fixed branching/looping graph fixture with nearby positions
+separated by a wall, and check predictions in physical coordinates. The
+[complex-environment and scale design](complex-environments-and-scale.md) assigns
+out-of-core thousand-unit fitting to phase 2 and geometry/direction/resolution
+comparisons to phase 3. Profile phase 1 before choosing the large-data interfaces.
+
 | Test | Asserts |
 | --- | --- |
 | `test_utils.py::TestDiscreteStateUtilities::test_hmm_forward_backward_matches_path_enumeration` | `T=6, K=3`, random `pi`, `Z`, log-likelihoods: `smoothed_prob`, `pairwise_prob`, `filtered_prob`, `log_likelihood` match [designs H](designs.md#h-exact-path-enumeration-oracle-for-tests) at `rtol=1e-10`; same with a random `(T-1, K, K)` stack |

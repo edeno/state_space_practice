@@ -30,6 +30,9 @@ does not date biological map creation, and an unused map need not have been lost
 - Read the current HMM code, prior/penalty contracts and phase-3 validation reports.
   Keep this work in reproducible analysis prototypes until its inference, resource
   costs and calibration justify a separately reviewed production API.
+  The [24 GB/A100 scale targets](complex-environments-and-scale.md) do not imply this
+  full Bayesian hybrid already fits thousands of units. Measure capacity/prior sweep
+  and parameter-uncertainty costs separately, with explicit limits on any approximation.
 
 ## Quantities to keep separate
 
