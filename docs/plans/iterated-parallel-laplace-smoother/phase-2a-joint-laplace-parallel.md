@@ -168,3 +168,72 @@ cost +17 % and +34 %. Checkpointing the whole chunk, at `9de8d86`, measured
 adaptive iteration. When the static/drifting pattern is unknown (`fit_sgd`
 with learnable drift), the iteration sits inside a batched `lax.cond` and is
 still replayed.
+
+### Real-data E-step
+
+Measured 2026-10-10 to 2026-10-11 on `zephyr` (NVIDIA A100 80GB PCIe, one
+otherwise idle GPU per run), JAX 0.10.2, x64. The data are the full session
+described in [overview.md#prototype-evidence](overview.md#prototype-evidence):
+T = 70,931 bins of 20 ms and every unit firing at 0.5-10 Hz (107 units).
+`GraphPlaceFieldModel(rank=20, parallel=True, store_covariances=False)` was run
+at its initial parameters. The harness scripts (`estep_*.py`) are in
+`/cumulus/edeno/` and their records are in `/cumulus/edeno/ssp-2a-bench/`.
+Copies of the JSON records are in
+[benchmarks/joint-laplace-2a/real_estep/](benchmarks/joint-laplace-2a/real_estep/).
+
+**Joint inference no longer runs the causal filter** (`528e1d1`). Before, the
+E-step ran the filter and then the smoother for each neuron.
+
+Steady-state time for one neuron:
+
+| step | time |
+| --- | --- |
+| filter | 92.9 s |
+| smoother | 0.55 s |
+
+Steady-state time for a whole block of neurons:
+
+| block | time |
+| --- | --- |
+| 1 neuron | 90.5 s |
+| 2 neurons | 97.5 s |
+
+The filter was over 99 % of the E-step. With blocks of 2, the full E-step
+extrapolates to about 54 × 97.5 s ≈ 88 min. The one end-to-end attempt
+stopped after 62 min with `CUDA_ERROR_MISALIGNED_ADDRESS`. That error did not
+recur in any later run, and its cause is unknown.
+
+Without the filter, a block takes 1.07 s for 2 neurons and 4.0 s for 8. The
+bare joint smoother takes 1.01 s and 3.8 s for the same blocks, so posterior
+assembly adds about 5 %. Per neuron, the GPU is already saturated at 2
+neurons per block: about 0.5 s either way.
+
+| block | peak device memory |
+| --- | --- |
+| 2 | 3.64 GiB |
+| 8 | 15.0 GiB |
+
+The stored posterior was 1.13 GiB, which is `smoother_mean` alone. The log
+evidence for blocks of 2 and 8 agrees to 2e-16 relative.
+
+**Compiles per block pattern.** `_graph_posterior` compiles once for each
+block shape and static/drifting pattern. Blocking neurons in their original
+order therefore compiled one program for each distinct block, at about 3 min
+apiece at this size. `2a67e53` blocks static and drifting neurons separately
+and pads each group's last block by repeating a neuron, so blocked inference
+compiles at most two programs.
+
+Runs use blocks of 8. "Mixed" means a seeded random 27 of the 107 neurons have
+zero drift.
+
+| code | pattern | compiles | first E-step | second E-step |
+| --- | --- | --- | --- | --- |
+| before (`528e1d1`) | all drifting | 2 | 366.6 s | 67.0 s |
+| after (`2a67e53`) | all drifting | 1 | 222.4 s | 69.4 s |
+| before (`528e1d1`) | mixed | 12 | 1,002.9 s | 54.0 s |
+| after (`2a67e53`) | mixed | 2 | 218.4 s | 51.3 s |
+
+The log evidence is bit-identical before and after for each pattern. Padding
+costs +3.6 % in steady state when all neurons drift: 5 padded neurons, about
+4.7 % of the work. With the mixed pattern, steady state was 5 % faster. That speedup was not
+investigated.

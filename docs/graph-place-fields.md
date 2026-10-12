@@ -131,4 +131,13 @@ same results, and `predict_rate_map` recomputes the requested neuron's
 covariances. With `neuron_batch_size` set, the final inference also runs in
 blocks of that many neurons and keeps finished blocks in host memory.
 
+For scale, here is one real recording on an A100: 107 units, 70,931 bins of
+20 ms, rank 20, with `store_covariances=False`.
+
+| setting | time | peak device memory |
+| --- | --- | --- |
+| first posterior pass, which compiles | about 3.5 min | |
+| each later pass, at `neuron_batch_size=8` | about 67 s | 15 GiB |
+| `neuron_batch_size=2` | about the same speed | 3.6 GiB |
+
 See the [reproducible validation](validation/graph-place-field-learning/README.md).

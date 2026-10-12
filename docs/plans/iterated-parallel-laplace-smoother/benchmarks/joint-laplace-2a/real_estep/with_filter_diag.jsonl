@@ -1,0 +1,5 @@
+{"mode": "smoother", "n_neurons": 1, "n_time": 70931, "first_s": 24.696386142633855, "second_s": 0.550405633635819, "ok": true, "peak_gib": 1.8589868545532227}
+{"mode": "filter", "n_neurons": 1, "n_time": 70931, "first_s": 83.14498358592391, "second_s": 92.91923428047448, "ok": true, "peak_gib": 0.5669698715209961}
+{"mode": "block1", "n_neurons": 1, "n_time": 70931, "first_s": 111.1262434469536, "second_s": 90.54298633057624, "ok": true, "peak_gib": 2.401400566101074}
+{"mode": "block2", "n_neurons": 2, "n_time": 70931, "first_s": 126.55380659922957, "second_s": 97.5402981992811, "ok": true, "peak_gib": 3.6389243602752686}
+DONE
