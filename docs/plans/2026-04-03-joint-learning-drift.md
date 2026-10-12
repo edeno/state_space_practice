@@ -25,6 +25,18 @@
 
 **Feasibility Status:** SPECULATIVE (high integration complexity)
 
+**Learning/barrier integration gate (2026-10-12):** first compare independently
+estimated behavioral learning and neural map/drift states using
+[multi-map phase 3](multi-map-place-fields/phase-3-recurrence-versus-drift.md) and its
+[sampling/intervention protocol](multi-map-place-fields/sampling-and-barriers.md).
+Use past-only estimates to predict later behavior, propagate learning uncertainty,
+and control shared spatial coverage, geometry, speed and task history. A joint model
+that assumes a shared learning/remapping state is not independent evidence that the
+two processes are linked. Require held-out improvement over independent and observed-
+covariate alternatives before advancing that interpretation. New-space exploration
+alone must not masquerade as learning-linked drift. Full joint inference remains a
+separate prototype after these gates, not a prerequisite for the barrier benchmark.
+
 **Codebase Reality Check:**
 
 - Useful building blocks exist: Smith learning in `src/state_space_practice/smith_learning_algorithm.py`, point-process smoothing in `src/state_space_practice/point_process_kalman.py`, and switching infrastructure in `src/state_space_practice/switching_kalman.py`.

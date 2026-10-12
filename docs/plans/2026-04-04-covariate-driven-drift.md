@@ -4,7 +4,7 @@
 >
 > **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
-**Goal:** Extend `PlaceFieldModel` so that place field drift rate and direction are modulated by observable covariates — reward, errors, running speed, context, time. This directly tests what causes representational drift and remapping.
+**Goal:** Extend `PlaceFieldModel` so that place field drift rate and direction are modulated by observable covariates — reward, errors, running speed, context, time. Test whether these covariates predict representational change; a causal interpretation additionally requires an appropriate intervention design.
 
 **Architecture:** The standard random-walk model `θ_t = θ_{t-1} + noise` becomes `θ_t = θ_{t-1} + B @ (covariates_t ⊗ Z(p_t)) + noise(Q(context_t))`. Two extensions: (1) **input-driven drift** where reward, errors, etc. push the weights in a specific direction via learned coefficients B, and (2) **context-modulated noise** where the drift rate Q depends on behavioral context via learned log-linear coefficients. Both B and Q parameters are learned via EM alongside the existing place field inference.
 
@@ -24,6 +24,32 @@
 - Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
 
 **Feasibility Status:** PARTIAL
+
+**Learning/barrier integration (2026-10-12):** this is the gradual-change alternative
+in [multi-map phase 3](multi-map-place-fields/phase-3-recurrence-versus-drift.md), compared
+with event-dependent map switching and local geometry-aware changes. Follow the
+[sampling and barrier contract](multi-map-place-fields/sampling-and-barriers.md):
+
+- Distinguish direction of coefficient drift from selectivity for the animal's
+  travel direction. [Multi-map phase 1a](multi-map-place-fields/phase-1a-directional-fields.md)
+  supplies shared-plus-directional emissions; its phase 3 first tests a small K=1
+  evolving-directional-contrast prototype. A covariate-driven mean change is a
+  subsequent alternative; this plan does not automatically supply that emission
+  adapter or a full switching/drifting directional model.
+- Separate insertion, first encounter, reward/error history, cumulative experience
+  and elapsed time; predictors must be available before the predicted update, or the
+  analysis must be labelled contemporaneous association. Fit learning from behavior
+  alone first and propagate its uncertainty.
+- Use observed exposure and compare remapping on common sampled support. First visits
+  to a previously unobserved region test spatial prediction/adaptation; they cannot
+  identify when its field formed. A stationary field with expanding coverage is a
+  mandatory negative control, alongside true gradual change and abrupt switching.
+- A barrier changes physical adjacency as well as behavior. Compare fields in common
+  coordinates using validated geometry priors/adapters. Never reinterpret coefficients
+  from independently rebuilt graph bases as a neural increment.
+- Use held-out predictive comparisons and behavior-only controls before interpreting
+  fitted drift coefficients as a learning mechanism. Keep constant Q in the MVP;
+  this integration does not authorize the deferred context-noise or joint model.
 
 **Codebase Reality Check:**
 

@@ -12,6 +12,21 @@
 
 **Out of scope:** modifying `PlaceFieldModel` (its basis is the patsy spline built inside `_build_spline_basis_matrix`; a graph-basis model is the separate drifting-graph-GP plan), a *drifting* SR model, learning the SR online (Fang et al. 2023; Bono et al. 2023), direction-split state spaces, sparse/iterative SVD, GPU.
 
+**Barrier/sampling integration (2026-10-12):** this basis is an optional movement-history
+alternative in the [multi-map intervention benchmark](../multi-map-place-fields/sampling-and-barriers.md).
+Estimate transitions using training/past trajectories and the geometry active at each
+move. Missing traversals are not proof of blocked edges; keep unvisited-row fallbacks
+explicitly prior-driven. Never use later exploratory routes to construct an earlier
+first-visit prediction. Compare fields on registered physical nodes, not coefficients
+across changing bases, and preserve the symmetrised-movement control below. Geometry
+version adapters require a separate prototype; this note does not expand the MVP into
+online SR learning or imply that movement-induced basis changes are neural learning.
+Observed directional firing is handled by the
+[multi-map directional emission adapter](../multi-map-place-fields/phase-1a-directional-fields.md),
+with experience-dependent contrasts tested in its phase 3. A directed movement
+matrix alone does not condition a neuron's firing on its current travel direction;
+the SR comparison and its symmetrised control do not replace those emission tests.
+
 ## Design finding from the planning prototype — read before the Tasks
 
 A NumPy prototype of exactly this design (ring of 48 bins from `Environment.from_samples` on a circle, 24 cells, 600 s at 50 Hz, 5-fold contiguous cross-validation, isotropic ridge `1e-3`, `gamma` selected on the grid `0.3 … 0.98`, three seeds) gave, in **nats per held-out spike** at rank 10:

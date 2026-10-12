@@ -60,7 +60,7 @@ from genuinely missing modules and from plans de-risked by the latest findings:
 | **N1** | dynamic-neuron-coupling.md | READY-ish | Medium | PointProcessModel + SGD (DONE) | Safe from bilinear latent degeneracy because regressors are observed lagged spikes; reuse `glm_laplace_update`. |
 | **N2** | ca1-represented-state-switching.md | READY-ish | Medium | Position decoder + switching Kalman + point-process update (DONE) | Best first step toward replay/value scientific claims. |
 | **N3** | gaussian-sum-filter-replay.md | PLANNED | Med-High | Position decoder (DONE) | Strong replay decoder extension; bigger implementation due to GSF smoother/mixture management. |
-| **N4** | cross-session-drift.md | READY | Low-Med | PlaceFieldModel + Kalman (DONE) | Additive module for long-timescale remapping. |
+| **N4** | cross-session-drift.md | NEEDS INTEGRATION REVIEW | Medium | PlaceFieldModel + Kalman (DONE); summary/mask/predictive-score gate | Elapsed-time drift comparator for E7 phase 3; reconcile session-summary uncertainty before implementation. |
 | **N5** | sgd-v2-improvements.md | PLANNED | Low-Med | SGDFittableMixin (DONE) | Do `log_det_jacobian` first; benchmark-gate chunked `lax.scan`. |
 | **N6** | adaptive-decoder.md | READY-ish | Medium | Position decoder + PlaceFieldModel (DONE) | Useful for long recordings; implement semi-supervised MVP only. |
 | **N7** | joint-learning-drift.md | SPECULATIVE | High | Smith + PlaceField + switching_kalman (DONE) | Prototype first; high integration complexity. |
@@ -101,10 +101,10 @@ questions are recorded in its `overview.md` — do not restate them here.
 | **E1** | `identifiability-diagnostics/` | 2 | — | Observed-Fisher-information report; gate for E6 phase 2, E9 phase 2 and E10. |
 | **E2** | `wolf-robust-updates/` | 3 | — | Generalised-Bayes weighted updates. Oscillator models go through the *switching* filter, hence their own phase. Spike weights use unit-deviance residuals, not Pearson. |
 | **E3** | `glm-families-nb-zig/` | 2 | — | Negative binomial, then zero-inflated gamma. Makes `family=` first-class on the point-process filters (they currently call the Poisson-only legacy update directly). |
-| **E4** | `masks-and-multi-sequence/` | 5 | — | `obs_mask=` at `kalman_filter` (the parallel smoother never sees `H`/`R`/`y`); masks reach the oscillator models through `switching_kalman_filter` / its M-step. Multi-sequence batching lives in the models, not `run_em`. |
+| **E4** | `masks-and-multi-sequence/` | 5 | — | Shared mask/sequence helpers gate E7 phase 2; phase 5 supplies its single-map drift baseline. Multi-map owns its HMM adapter. Batching lives in models, not `run_em`. |
 | **E5** | `iterated-parallel-laplace-smoother/` | 4 | E3 (`family=`); E4 optional | Gauss–Newton re-linearisation + parallel information-form filter. Phase 3 is the position decoder; phase 4 retires `temporal_rate_gp`'s private Newton loop onto the shared core. |
 | **E6** | `recurrent-switching-transitions/` | 5 (1a/1b/1c, 2a/2b) | E1 gate for phase 2 | Covariate- then state-dependent transition logits across the Gaussian / point-process / choice switching families. `switching_kalman_filter` becomes a validating wrapper over a jitted core (**Changed** entry). |
-| **E7** | `multi-map-place-fields/` | 1 (+1b) | 1b gated on E6 phase 1 | Static-maps HMM with a shared discrete state. Per-map drift is deferred with a three-part trigger (storage runs to 10²–10³× the single-map covariance store). |
+| **E7** | `multi-map-place-fields/` | 5 (1, 1a, 2–4; +optional 1b) | 2: E4 helpers; 3: 1a, E4 phase 5, validated N4 for cross-day drift claims; 4: validated phase-3 alternatives/uncertainty; 1b: E6 phase 1 | Directional fields and their evolution before unknown-count/sequential-discovery prototypes. Shared maps, position/direction support and learning/barrier comparisons; full hybrid drift remains evidence-gated. |
 | **E8** | `successor-representation-basis/` | 1 | — | Planning prototype showed the held-out gain over the Laplacian basis comes from movement-graph adaptation, not direction (a symmetrised SR ties the directed one); the plan carries a `symmetrize=True` control arm and restates the tests accordingly. |
 | **E9** | `volatile-kalman-choice/` | 3 | E1 gate for phase 2 | Piray & Daw VKF transcribed from the authors' code; hybrid `CovariateChoiceModel(dynamics="volatile")`; comparison harness against fixed-q and switching models. Motivation: Comrie et al. 2024 (spatial bandit). |
 | **E10** | `theta-sweep-amplitude/` | 3 (1, 2a, 2b) | E1 gate; E4 optional | 1-D linearised track; requires LFP theta phase as an input (the J16 session has none), so synthetic validation is the gate. |
@@ -134,6 +134,35 @@ Several plans edit the same function. Merge order matters more than plan order:
 
 ### Suggested order
 
+**Long-recording priority path (2026-10-12):** when the target is chronic spatial
+recordings, use E1 diagnostics and the graph validation findings to assess
+identifiability, then E7 phase 1 → E7 phase 1a directional fields → E4 shared
+mask/sequence helpers + E7 phase 2 → E7 phase 3 comparison → E7 phase 4
+unknown-repertoire prototype. Phase 1a and the phase-2 mask work can proceed
+alongside each other. E4 phase 5 supplies the single-map drift baseline; its
+directional design adapter is a separate E7 phase-3 gate. N4 must pass its
+[integration gate](2026-04-03-cross-session-drift.md#long-recording-integration-gate-2026-10-12)
+before claiming a cross-day drift-versus-switching comparison. E7 phase 1b is an
+optional E6-dependent branch, not a prerequisite for chronic support. See the
+[multi-map router](multi-map-place-fields/PLAN.md) for ownership and evidence gates.
+For learning/barrier questions, add the
+[sampling and intervention benchmark](multi-map-place-fields/sampling-and-barriers.md):
+phase 2 supplies exposure/support diagnostics; phase 3 separates shared-support
+remapping from first-visit prediction and validates field uncertainty/changing geometry.
+Support includes direction: first travel in an unobserved direction is a new sampling
+condition. Phase 3 must compare developing directional selectivity within a single
+map before interpreting additional maps. Start with blocked fixed-K selection and
+report ambiguity. A [small joint drift/switching prototype](multi-map-place-fields/drift-and-discrete-states.md)
+then tests whether extra static states approximate within-map drift. Phase 4 tests
+a capped Bayesian library, repeating its count comparison with drift allowed before
+recruitment/reactivation claims. First supported expression does not date biological
+map birth. The full hybrid remains resource- and approximation-gated.
+Phase 1b is required for fitted event-dependent within-visit hazards; between-visit
+manipulations use initial-map/occupancy analyses. Covariate-driven drift is the gradual
+change alternative; the full joint learning model remains prototype-first.
+This targeted path takes precedence over the general extension order below; it does
+not require completing unrelated robustness, decoder or oscillator integrations.
+
 E1 → E3 → E4 → E2 → E11 (at least phase 3b) → E5 → E6 → E7 / E8 / E9 / E10 in
 any order. E1 phase 1, E3 phase 1 and E8 are small and independent and can run
 in parallel from the start.
@@ -155,8 +184,9 @@ in parallel from the start.
   are complete.
 - Replay/value work now starts with `ca1-represented-state-switching.md`, then
   `value-gated-sequence-expression.md`, then dual-latent or hierarchical plans.
-- Long-timescale remapping should start with `cross-session-drift.md` before
-  covariate-driven drift or hierarchical multi-timescale modeling.
+- Long-recording spatial work follows E7's recurrence-versus-drift path, with N4 as
+  the elapsed-time drift comparator. Covariate-driven drift or hierarchical
+  multi-timescale modeling still requires a validated N4 first.
 - Dynamic spike-history coupling is safe to pursue because its regressors are
   observed lagged spikes. Spike-only latent oscillator coupling is blocked as a
   scientific estimator unless an observed field anchors the latent.
@@ -184,7 +214,7 @@ Order 0.6: **DONE.** SGD fitting mixin for all model classes. SGDFittableMixin w
 | Order | Plan | Feasibility | Risk | Effort | Depends On | Status |
 |---|---|---|---|---|---|---|
 | 1 | position-decoding.md | READY | Low-Med | 1-2 weeks | None | **DONE** |
-| 2 | cross-session-drift.md | READY | Low-Med | 1-2 weeks | None | Not started (deferred) |
+| 2 | cross-session-drift.md | NEEDS INTEGRATION REVIEW | Medium | Re-estimate after review | Summary/mask/predictive-score gate | Not started; comparator for E7 phase 3 |
 | 3 | multinomial-choice-model.md | READY | Low-Med | 2-3 weeks | None | **DONE** |
 | 3.5 | rl-state-space-covariates.md | READY | Low-Med | 1-2 weeks | Multinomial Choice | **DONE** |
 | 3.6 | contingency-belief-latent-task-state.md | DONE | — | — | Multinomial Choice | **DONE** |
@@ -287,9 +317,12 @@ Stop condition:
 
 35 tests passing. Exit gate satisfied.
 
-### Order 2: Cross-Session Drift (deferred)
+### Order 2: Cross-Session Drift (integration review required)
 
-Entry gate:
+Entry gate: first pass the
+[long-recording integration review](2026-04-03-cross-session-drift.md#long-recording-integration-gate-2026-10-12),
+including covariance of the chosen session summary, missing cells and comparable
+held-out spike prediction. Then run:
 
 ```bash
 uv run pytest src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_kalman.py -v
@@ -304,7 +337,8 @@ uv run ruff check src/state_space_practice
 
 Stop condition:
 
-- session summary extraction API cannot provide stable means/covariances
+- session summary extraction cannot provide validated means/covariances, or the
+  missing-cell/predictive-score integration gate remains unmet
 
 ### Order 3: Multinomial Choice — DONE
 

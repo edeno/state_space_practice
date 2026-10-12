@@ -167,9 +167,9 @@ that reason and no other (the switching *point-process* models stay out).
   `point_process_models.py`, `switching_point_process.py`): they call
   `switching_kalman_maximization_step` with dummy observations and
   `estimate_measurement_params=False` (`point_process_models.py:1351`,
-  `switching_point_process.py:3073`) and are untouched. Revisit trigger:
-  `docs/plans/multi-map-place-fields/` phase 2 needing masked spike-oscillator
-  fits.
+  `switching_point_process.py:3073`) and are untouched. Revisit when a concrete
+  consumer needs masked spike-oscillator fits; multi-map phase 2 implements its own
+  HMM adapter and does not need these models.
 - `switching_kalman_viterbi` (`switching_kalman.py:1079`): no mask (not on any
   model's fit path). Revisit if a consumer appears.
 - Per-neuron mask handling in warm-init GMM beyond mean imputation.

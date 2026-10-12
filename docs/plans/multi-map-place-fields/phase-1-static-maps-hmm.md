@@ -6,7 +6,17 @@ Ships the complete static-maps model: exact log-space HMM helpers in `utils`, th
 class (k-means initialisation, EM through `run_em`, SGD through `SGDFittableMixin`,
 occupancy-ordered labels, Viterbi, per-map rate maps, switch probability, `score`, BIC),
 behaviour-alignment helpers, a two-map simulator, the tests, user docs and a real-data
-smoke script. After this PR a user can fit K maps to a session and pick K.
+smoke script. After this PR a user can fit K maps to a contiguous, fully observed
+interval and pick K. This establishes the single-session primitive; chronic support
+is [phase 2](phase-2-long-recording-support.md), and scientific recurrence versus drift
+is tested in [phase 3](phase-3-recurrence-versus-drift.md).
+[Phase 1a](phase-1a-directional-fields.md) adds a directional design adapter before
+scientific map-count interpretation. A fixed-K grid remains the first baseline;
+[phase 4](phase-4-unknown-map-repertoire.md) separately prototypes count uncertainty
+and sequential discovery. Do not add those inference layers to this first model.
+Map probabilities in this phase condition on fitted fields. They do not incorporate
+field uncertainty at unvisited positions; scientific first-visit predictions must
+pass the [sampling/uncertainty gate](sampling-and-barriers.md#field-uncertainty-is-an-additional-deliverable).
 
 **Inputs to read first:**
 
@@ -63,7 +73,7 @@ smoke script. After this PR a user can fit K maps to a session and pick K.
 - **Create `src/state_space_practice/multi_map_place_field.py`.** Module docstring:
   the model equation, the EM (exact E-step, penalised MAP M-steps), the basis-agnostic
   design-matrix contract with both recipes (spline: `build_2d_spline_basis` /
-  `evaluate_basis`; graph: `graph_design_matrix` + dropping `~valid` rows), and
+  `evaluate_basis`; graph: `graph_design_matrix` on a contiguous all-valid interval), and
   references (Low et al. 2021; Sheintuch et al. 2020; Sanders, Wilson & Gershman 2020;
   Rabiner 1989; Schwarz 1978; Eilers & Marx 1996 — say what each supports, as in
   [overview](overview.md)). Contents, in this order:
@@ -149,19 +159,31 @@ smoke script. After this PR a user can fit K maps to a session and pick K.
   gitignored `data.load_bandit_data.load_neural_recording_from_files` (`:48, :67`); bin
   spikes at `dt = 0.02` with `preprocessing.bin_spike_times`; `select_units` as in `:305`
   region; interpolate `head_speed` with `interpolate_to_new_times` (`:327`); build
-  `build_2d_spline_basis(position, n_interior_knots=6)`; `fit_over_n_maps(K ∈ {1, 2, 3})`
-  with a 70/30 train/held-out split; print the BIC / held-out table and `select_n_maps`;
+  `build_2d_spline_basis(position, n_interior_knots=6)` using training data and a common
+  coordinate frame; `fit_over_n_maps(K ∈ {1, 2, 3})` with a chronological 70/30
+  train/held-out split of one contiguous fully observed interval. Report exclusions;
+  do not compress time across tracking gaps or concatenate visits. Initialise each
+  scored segment from the documented prior. Print the BIC / held-out table and `select_n_maps`;
   for the selected K: `lagged_correlation(switch_probability_, speed[1:], max_lag=50)`,
   `circular_shift_null(..., n_shuffles=200, min_shift=500)`, `covariate_by_map`; save
   `multi_map_ca1_switch_vs_speed.png` (switch probability and speed over 5 minutes; rate
   maps per map for the six highest-rate units). Not a test; no data is checked in. Record
-  runtime and peak memory in the PR description.
+  runtime and peak memory in the PR description. This split is a smoke check, not the
+  final scientific test: selecting K and reporting its score on the same held-out
+  portion requires phase 3's separate validation/test visits before a biological claim.
 
 ## Deliberately not in this phase
 
-- Covariate-dependent transitions (`transition_covariates=`): [phase 1b](phase-1b-speed-gated-transitions.md), gated on `docs/plans/recurrent-switching-transitions/`.
-- Per-map weight drift: not in this plan — [overview → Deliberately not in this plan](overview.md#scope-and-dependency-policy), [designs K](designs.md#k-slow-per-map-drift--sketch-not-scheduled).
-- `obs_mask=` / multi-session fitting: consumed later from `docs/plans/masks-and-multi-sequence/`; callers drop invalid graph-basis rows themselves for now (documented in the module docstring).
+- Directional design/prediction helpers: [phase 1a](phase-1a-directional-fields.md).
+- Posterior uncertainty over map count and sequential repertoire discovery:
+  [phase 4](phase-4-unknown-map-repertoire.md); fixed-K model selection stays here.
+- Learning/event-dependent transitions (`transition_covariates=`, including speed): [phase 1b](phase-1b-speed-gated-transitions.md), gated on `docs/plans/recurrent-switching-transitions/`.
+- Per-map weight drift: a small phase-3 [joint prototype](drift-and-discrete-states.md)
+  precedes repertoire interpretation; production-scale inference remains deferred
+  in [designs K](designs.md#k-slow-per-map-drift--sketch-not-scheduled).
+- `obs_mask=` / multi-session fitting: implemented in [phase 2](phase-2-long-recording-support.md)
+  using the masks plan's helpers. Until then, use contiguous fully observed intervals;
+  never drop interior invalid rows to manufacture an apparently continuous sequence.
 - `identifiability_report()`: `docs/plans/identifiability-diagnostics/`.
 - Any change to `PlaceFieldModel`, `update_spike_glm_params`, `contingency_belief`, or `hmm_viterbi` (1b adapts to the recurrent plan's Viterbi stack convention).
 - Plotting methods on the model; the smoke script plots inline.

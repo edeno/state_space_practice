@@ -23,7 +23,50 @@
 - Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
 - Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
 
-**Feasibility Status:** READY
+**Feasibility Status:** NEEDS INTEGRATION REVIEW for the long-recording comparison below.
+
+## Long-recording integration gate (2026-10-12)
+
+This model is the elapsed-time drift comparator for
+[multi-map phase 3](multi-map-place-fields/phase-3-recurrence-versus-drift.md).
+Recurring A–B–A maps are an alternative explanation to continuous drift; compare
+them on the same tracked cells, coordinates, observations and held-out targets.
+Independent within-session drift fits do not establish between-day dynamics.
+
+Before implementing the historical recipes below, reconcile these requirements;
+this gate takes precedence over their summary/uncertainty shortcuts:
+
+- Use a common spatial basis and explicit cell IDs. Missing or uncertainly matched
+  cells are missing session-level observations, not zero weights/counts. Retain
+  timestamps and registration/quality metadata; consume the
+  [mask contracts](masks-and-multi-sequence/shared-contracts.md) where applicable.
+- Also retain per-cell spatial exposure: an unvisited part of a session's field is
+  prior-informed, not an observed zero. Follow the
+  [shared-support/new-space distinction](multi-map-place-fields/sampling-and-barriers.md).
+  A late first visit cannot identify an earlier field change. Keep geometry versions
+  and compare physical field predictions if a barrier changes the spatial basis;
+  raw coefficient differences across such bases are not drift observations.
+- Validate the session-summary definition and covariance. The covariance of an
+  average latent weight is `sum_{t,u} Cov(w_t,w_u | y) / T^2`, not the average of
+  the marginal covariances. Replace the `smoother_cov.mean(axis=0)` shortcut below
+  with a justified summary/covariance estimator and validate uncertainty coverage on
+  a small oracle problem before using it as known measurement noise.
+- Test a single coherent representation per visit or inspect within-visit switching
+  before interpreting a session-averaged weight as one map. Include static, smooth
+  drift and recurrent-map simulations; drift fits must not be treated as evidence
+  against recurrence simply because no switching alternative was fitted.
+- Define a comparable predictive score on held-out spike observations, integrating
+  summary/state uncertainty. Fit preprocessing and drift parameters on training
+  visits only. A score on extracted weight summaries cannot be compared directly
+  to the multi-map model's spike likelihood.
+- Use irregular elapsed-time gaps in the drift dynamics. Any inferred trajectory
+  during an unrecorded interval is model-dependent interpolation with uncertainty,
+  not an observed remapping event or precisely timed switch.
+
+The numerical primitives exist; this review must pass before the plan is advertised
+as a validated cross-day comparator. The multi-map comparison owns a small
+[joint drift/switching prototype](multi-map-place-fields/drift-and-discrete-states.md);
+production-scale hybrid inference remains a separate, evidence-gated follow-on.
 
 **Codebase Reality Check:**
 

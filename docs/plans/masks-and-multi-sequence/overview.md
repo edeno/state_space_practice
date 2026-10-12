@@ -4,10 +4,11 @@
 
 ## Current codebase integration points
 
-Verified against the working tree at `4b74f03` (master). Nothing in the library
-handles missing observations or a leading sequence axis today (`grep` for
-`mask` / `n_sequences` in `kalman.py`, `em_driver.py`, `sgd_fitting.py` finds
-only an unrelated `is_array_mask` name in `sgd_fitting.py:145`).
+Original integration audit: `4b74f03` (master); recheck line references before
+implementation. The graph-place-field model added since that audit already handles
+trajectory-validity masks internally. This plan concerns the shared per-observation
+mask and sequence APIs for the families listed below; it does not imply that the
+graph model has arbitrary per-neuron masks or multi-session fitting.
 
 - `src/state_space_practice/kalman.py:426-475` — `kalman_measurement_update`: the
   single point where `H`, `R`, `y` meet (innovation covariance `:456-458`,
@@ -97,8 +98,9 @@ only an unrelated `is_array_mask` name in `sgd_fitting.py:145`).
   `switching_kalman_viterbi`. The Gaussian switching filter and M-step *are*
   changed, but only because the oscillator `BaseModel` is implemented on them
   (`oscillator_models.py:913`, `:1000`); nothing else in `switching_kalman.py`
-  moves. Revisit trigger: `docs/plans/multi-map-place-fields/` phase 2 needing
-  masked or multi-session spike-oscillator fits.
+  moves. The multi-map HMM has its own adapter in that plan's phase 2 and does not
+  require these spike-oscillator integrations. Revisit them when a concrete caller
+  needs masked or multi-session spike-oscillator fits.
 - `PositionDecoder`, `coupling_*`, `hamiltonian_*`, `temporal_rate_gp`,
   `smith_learning_algorithm`, the choice / belief models, and the deprecated
   `models.stochastic_point_process_filter`.
@@ -114,13 +116,25 @@ only an unrelated `is_array_mask` name in `sgd_fitting.py:145`).
 ### Dependency policy
 
 No new runtime dependencies. Consumers of this work:
-`docs/plans/multi-map-place-fields/` (phase 2 of that plan consumes phase 5
-here — multi-sequence `PlaceFieldModel`) and the deferred cross-session-drift
-plan (multi-sequence fitting generally). This plan depends on no other plan.
+[multi-map phase 2](../multi-map-place-fields/phase-2-long-recording-support.md)
+consumes C1–C4 and C6–C8 helpers; that plan implements its own likelihood/HMM/GLM
+adapters. Its [phase 3](../multi-map-place-fields/phase-3-recurrence-versus-drift.md)
+also consumes phase 5 here for the multi-sequence `PlaceFieldModel` baseline.
+A separately reviewed extraction of the shared helpers can unblock multi-map work
+without waiting for unrelated oscillator integrations; preserve their contracts and
+oracle tests. The cross-session-drift plan is another consumer. This plan depends on
+no other plan.
 Names other plans rely on are fixed in
 [shared-contracts C1 and C6-C7](shared-contracts.md); `parallel_kalman_smoother`
 deliberately gets no `obs_mask` (it never sees observations) — consumers pass
 the mask to `kalman_filter`.
+
+For chronic data, sequence resets represent separate visits, not computational chunks
+of a continuous visit. Preserve interior gaps at the original bin spacing. A common
+neuron axis with per-entry masks is required when cells are unobserved on some days;
+mask support cannot resolve incorrect cell registration. Cell matching and coordinate
+registration remain upstream responsibilities, with metadata retained for sensitivity
+analyses. Multi-session parameter sharing does not itself infer across-day drift.
 
 ## Metrics
 

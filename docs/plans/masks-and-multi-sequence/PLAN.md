@@ -12,6 +12,14 @@ observations with a leading `n_sequences` axis (padded, with the mask carrying
 the padding). Both are additive keyword options; existing calls run the
 existing code bit-for-bit.
 
+**Long-recording integration (2026-10-12):** the
+[multi-map plan's phase 2](../multi-map-place-fields/phase-2-long-recording-support.md)
+consumes this plan's mask/sequence helpers and owns its own HMM/model adapter. Phase 5
+also supplies the single-map drift comparator for its phase 3. Per-cell absence must
+be masked rather than treated as silence; separate visits have independent initial
+states and no artificial transition across a recording gap. Preserve real interior
+missing bins. See the [consumer contract](../multi-map-place-fields/shared-contracts.md#long-recording-inputs-and-boundaries).
+
 ## Reading order
 
 For agent invocation, **load only the slice you need**:

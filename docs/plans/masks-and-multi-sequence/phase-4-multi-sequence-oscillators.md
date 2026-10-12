@@ -162,9 +162,10 @@ carrying the padding. `run_em` and `SGDFittableMixin` are unchanged
   the block-diagonal container work of
   [D7](designs.md#d7--block-diagonal-covariances-with-a-sequence-axis).
 - The switching point-process models and `SwitchingSpikeOscillatorModel`
-  (revisit trigger: `docs/plans/multi-map-place-fields/` phase 2; their
-  `_m_step_reparameterized` calls the switching M-step with dummy observations
-  and would need the batched transition statistics only).
+  (revisit when a concrete spike-oscillator consumer needs batching; multi-map
+  phase 2 owns its HMM adapter). Their `_m_step_reparameterized` calls the
+  switching M-step with dummy observations and would need the batched transition
+  statistics only.
 - Per-sequence parameters (e.g. per-session `R`): shared parameters only; a
   per-sequence `R` is the cross-session-drift plan's concern.
 - A public `lax.map` knob: `_SEQUENCE_MAP` is module-private; flipping it is a

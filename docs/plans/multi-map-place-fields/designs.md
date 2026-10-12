@@ -6,6 +6,10 @@ Per-component designs with complete code. Phase files reference these sections b
 anchor; this file does not repeat the task lists. All code assumes float64
 (`jax.config.update("jax_enable_x64", True)` before import, as the whole library does).
 
+These code sketches describe phase 1's single-sequence model. Phase 2 adapters must
+also satisfy [long-recording contracts](shared-contracts.md#long-recording-inputs-and-boundaries);
+use its phase file for mask/sequence tasks. Phase 3 owns the predictive comparison.
+
 Sections:
 
 - [A. Exact HMM forward–backward in log space](#a-exact-hmm-forwardbackward-in-log-space) (`utils.hmm_filter`, `utils.hmm_forward_backward`)
@@ -1042,6 +1046,12 @@ form exactly 0; a bump has a positive form. A pure ridge is `lam * np.eye(n_basi
 
 ## K. Slow per-map drift — sketch, not scheduled
 
+This sketch concerns production-scale inference with every coefficient drifting.
+The small low-rank [joint comparison](drift-and-discrete-states.md) is now scheduled
+within phase 3 as a prerequisite for phase-4 repertoire interpretation. Its purpose
+is to measure the drift/state confound before deciding whether this full model is
+needed. A positive static-map recurrence finding does not gate that prototype.
+
 Model: `w_{n,k,t} = w_{n,k,t-1} + eps`, `eps ~ N(0, Q_k)` per map (map-specific process
 noise), shared discrete `s_t`; spikes from block `s_t` only. Per neuron the continuous state
 is the stacked `n_maps * n_basis` vector; neurons are independent given `s_t`
@@ -1057,7 +1067,8 @@ imported at `switching_point_process.py:123`) mixes Gaussians with different mea
 block-diagonal across maps — the collapse correlates a neuron's map-0 and map-1 weights even
 though the generative model never does. Three options, none evidenced yet:
 
-1. keep the full `(K n_basis)^2` per-neuron covariance (exact GPB1);
+1. keep the full `(K n_basis)^2` per-neuron covariance (full-covariance GPB1, still an
+   approximation to the path mixture);
 2. drop the cross-map spread terms after every collapse ("block-GPB" approximation; the
    marginal per-map covariances stay exact, cross-map correlations are discarded);
 3. treat the inactive maps' weights as frozen within a dwell (no diffusion while
@@ -1077,10 +1088,13 @@ switching models do, `switching_point_process.py:2996-3004`), for `T = 150 000` 
 
 Even the single-map `PlaceFieldModel` is only practical at `N ~ 10-30`, `dt = 20 ms`,
 `T ~ 3e4` (then `(N, T, B, B)` is 6-19 GB); the drift model multiplies that by `K` to `K^2`.
-It therefore needs (a) segment-wise processing — sessions or chunks with boundary
-conditions, which is what `docs/plans/masks-and-multi-sequence/` provides — and (b) a
+It therefore needs (a) measured memory control and appropriate boundary conditions —
+independent sessions from phase 2 are not a state-carrying chunked smoother — and (b) a
 decision between options 1-3 backed by a small exact-oracle study (the `T <= 5`
-path-enumeration harness in `tests/test_oracle_switching_point_process.py` extends
-directly). Neither exists yet, so drift is **not planned here**; see
+path-enumeration pattern in `tests/test_oracle_switching_point_process.py` can check
+the discrete part; continuous Poisson integration needs a separate validated
+reference), plus phase 3's small joint comparison showing predictive value after
+sampling/behavior controls. These gates are unmet, so the production-scale model
+is **not scheduled here**; see
 [overview → Deliberately not in this plan](overview.md#scope-and-dependency-policy) for the
 trigger.

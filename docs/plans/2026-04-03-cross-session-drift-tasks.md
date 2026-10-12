@@ -8,6 +8,13 @@
 
 **Design doc:** `docs/plans/2026-04-03-cross-session-drift.md`
 
+**Updated prerequisite (2026-10-12):** first complete the design doc's
+[long-recording integration gate](2026-04-03-cross-session-drift.md#long-recording-integration-gate-2026-10-12).
+It overrides the averaged-marginal-covariance recipe below. Resolve cell identity and
+missing-session semantics, validate the covariance of the chosen session summary,
+and specify held-out spike prediction before implementing the drift comparator for
+[multi-map phase 3](multi-map-place-fields/phase-3-recurrence-versus-drift.md).
+
 **Key files:**
 
 - Create: `src/state_space_practice/cross_session_drift.py`

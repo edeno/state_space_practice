@@ -18,6 +18,53 @@ This is distinct from the deferred represented-state plan
 *position* switches away from the tracked position; here the *map* switches while the
 position is the animal's.
 
+## Scientific target and literature
+
+**Updated 2026-10-12:** distinguish continuous representational change from switches
+between reusable population maps. Long recordings let us test A–B–A recurrence, pool
+observations across repeated map visits, and separate changes in map usage from changes
+within maps. These are hypotheses to compare, not properties guaranteed by an HMM fit.
+Learning and environmental interventions are explicit targets. The
+[sampling and barrier design](sampling-and-barriers.md) separates observed silence,
+unvisited fields, inaccessible space and missing cells, and specifies how to learn
+from first visits without manufacturing apparent remapping.
+Observed travel direction belongs in the field model, and directional selectivity
+may itself evolve with experience. Model that alternative before interpreting extra
+states as a growing map repertoire. Fixed-K predictive comparisons come first;
+posterior count uncertainty and sequential discovery are a later capped-library
+prototype, with first supported expression kept distinct from biological birth.
+A [small joint drift/switching prototype](drift-and-discrete-states.md) is required
+before interpreting those counts biologically: stickiness alone can partition
+continuous change into long-lived states.
+The [novelty audit](novelty-and-evidence.md) records additional close methods and
+field-level evolution studies. Our candidate contribution is a calibrated chronic
+comparison against both drift and local field/assembly changes; novelty remains
+unestablished until the capability audit and smallest decisive benchmark pass.
+
+| Evidence | Design implication |
+| --- | --- |
+| [Sheintuch et al. 2020, Current Biology](https://doi.org/10.1016/j.cub.2020.02.018): multiple CA1 maps in the same familiar environment recurred over weeks; switches occurred between separate visits. | Share maps across visits and days, respect visit boundaries, and include a fixed-map-per-visit reference. Do not cite this as evidence of rapid within-visit CA1 switching. |
+| [Low et al. 2021, Neuron](https://doi.org/10.1016/j.neuron.2021.07.005): reversible, population-coordinated MEC remapping during an unchanged task, correlated with running speed. | Shared latent map state and optional transition covariates; transferring MEC switching dynamics to CA1 requires validation. |
+| [Sanders, Wilson & Gershman 2020, eLife](https://doi.org/10.7554/eLife.51140): a theory of remapping as hidden-context inference. | Conceptual motivation, not a claim that our finite HMM recovers the animal's beliefs or proves an attractor mechanism. |
+| [Ziv et al. 2013, Nature Neuroscience](https://doi.org/10.1038/nn.3329): changing ensemble membership with stable fields among recurring cells over weeks. | Track neuron identity and availability; retain stable-map and drift alternatives. |
+| [Climer et al. 2025, Nature](https://doi.org/10.1038/s41586-025-09245-y): drift persists with highly reproducible sensory environments and behavior. | Test a continuous-drift baseline; a finite-state fit can discretise continuous changes into spurious maps. |
+| [Dupret et al. 2010, Nature Neuroscience](https://doi.org/10.1038/nn.2599): CA1 reorganisation around learned goals and stabilization/reactivation related to memory performance. | Estimate learning independently from behavior and test whether neural state predicts later performance beyond behavioral history. |
+| [Alvernhe et al. 2011, European Journal of Neuroscience](https://doi.org/10.1111/j.1460-9568.2011.07653.x): a barrier elicited local changes near the blocked route, while distant fields were unaffected. | Include local geometry-aware alternatives, distinguish insertion from encounter, and do not require global remapping. |
+| [Geva et al. 2023, Neuron](https://doi.org/10.1016/j.neuron.2023.05.005): time and experience affected different aspects of representational drift. | Include elapsed time, cumulative experience and sampling history separately in learning/manipulation analyses. |
+| [Navratilova et al. 2012, Frontiers in Neural Circuits](https://pmc.ncbi.nlm.nih.gov/articles/PMC3282921/): directional selectivity developed through experience-dependent firing-rate remapping. | Include position-dependent directional emissions and an evolving-directionality single-map comparison before interpreting additional maps. |
+| [Mehta et al. 2000, Neuron](https://pubmed.ncbi.nlm.nih.gov/10774737/): experience-dependent asymmetric field shapes. | Distinguish directional rate contrasts from spatial shape changes; both can vary within a map. |
+| [Fox et al. 2011, Annals of Applied Statistics](https://ics.uci.edu/~sudderth/papers/aoas11hdphmm.pdf): a sticky HDP-HMM for an unknown number of persistent states. | Motivate a capped Bayesian library with count uncertainty and persistence; this prior does not establish biological map birth/death times. |
+| [Linderman et al. 2016, Journal of Neuroscience Methods](https://pmc.ncbi.nlm.nih.gov/articles/PMC4801699/): HDP-HMM inference from rat hippocampal spikes. | Direct neural precedent; its latent states represent spatial location/topology, whereas ours index whole maps conditional on observed position. |
+| [Linderman et al. 2017, AISTATS](https://proceedings.mlr.press/v54/linderman17a.html): recurrent switching linear dynamical systems. | A discrete/continuous modeling lineage for the joint prototype; not a ready-made unknown-count drifting-field model. |
+| [Costacurta et al. 2022, NeurIPS](https://papers.neurips.cc/paper_files/paper/2022/hash/96b3aa81a9e593ca5e9b184756034a43-Abstract-Conference.html): continuous behavioral variation can generate duplicate ARHMM states. | Test whether inferred extra maps survive allowing continuous variation within maps; evidence by methodological analogy, not direct place-field evidence. |
+
+Phase 1 is a useful single-session model. Chronic-recording claims require
+[phase 1a](phase-1a-directional-fields.md), [phase 2](phase-2-long-recording-support.md)
+and the controls and predictive tests in
+[phase 3](phase-3-recurrence-versus-drift.md). The observation model is for binned spike
+counts; fluorescence from imaging papers is not automatically a compatible Poisson
+observation. Any imaging benchmark needs a justified observation/preprocessing model.
+
 ## Current codebase integration points
 
 Nothing existing changes behaviour. New module `src/state_space_practice/multi_map_place_field.py`;
@@ -59,10 +106,12 @@ new helpers appended to `utils.py` and `simulate_data.py`; registrations in `__i
   `:652-821` (`_fit_stationary_glm`) is the K = 1 parity reference; `:550-565`
   (`_check_fitted` / `NotFittedError`), `:852-862` (`_max_log_count`), `:1886-1979`
   (`score`), `:2005-2049` (`n_free_params`, `bic`) are the API conventions mirrored. Untouched.
-- `src/state_space_practice/graph_place_field.py:58-92` (`GraphBasis`), `:328-376`
-  (`graph_design_matrix`): the graph basis the model accepts. `graph_design_matrix` returns a
-  `valid` mask whose invalid rows the caller must drop until `obs_mask=` lands
-  (`docs/plans/masks-and-multi-sequence/`). Untouched.
+- `src/state_space_practice/graph_place_field.py` (`GraphBasis`, `graph_design_matrix`):
+  the graph basis the model accepts; recheck historical line references after the
+  graph-place-field merge. Phase 1 requires a contiguous fully observed interval.
+  Phase 2 retains invalid-position bins with all neural emissions masked. Never drop
+  interior invalid rows and treat the remaining bins as adjacent. The existing graph
+  estimator is a drift comparator subject to phase 3's mask/boundary compatibility gate.
 - `src/state_space_practice/em_driver.py:58-77` (`run_em`): the EM loop, with default
   rollback policy (exact EM). `src/state_space_practice/sgd_fitting.py:354-373`
   (`SGDFittableMixin` protocol), `:384-397` (`_prepare_sgd_data`), `:506-535` (`fit_sgd`),
@@ -107,21 +156,48 @@ new helpers appended to `utils.py` and `simulate_data.py`; registrations in `__i
   `select_n_maps` with a parsimony tolerance.
 - K = 1 reduces exactly to a penalised Poisson-GLM place-field fit (parity with
   `PlaceFieldModel._fit_stationary_glm`).
-- Phase 1b (gated): speed-gated transitions through the recurrent-transitions interface, so
-  Low et al.'s speed correlation is a fitted parameter rather than a post-hoc correlation.
+- Phase 1a: stable directional fields via a shared spatial component plus
+  position-dependent directional contrast, partial pooling and direction-conditioned
+  predictions. Direction is observed; K counts latent maps, not travel directions.
+- Phase 1b (gated): learning- and event-dependent transitions through the recurrent
+  interface, with speed as a minimal fixture/nuisance covariate. Test encounter,
+  reward/error history and experience effects with valid information cutoffs.
+- Phase 2: shared static maps across visits/sessions with per-neuron masks, independent
+  initial map draws at sequence boundaries, common cell/spatial axes and bounded memory.
+- Phase 3: nondirectional, stable directional, evolving directional, drifting and
+  switching comparisons, including a small K=1 directional-evolution prototype
+  and a low-dimensional fixed-K joint drift/switching reference.
+  Use blocked model selection, later-visit prediction of held-out neurons, behavior/
+  registration controls and recurrence/occupancy summaries. Predictive performance
+  is primary; BIC is supplementary and near-tied K values remain unresolved.
+- Phase 4: a capped Bayesian library prototype with posterior count uncertainty,
+  prior/capacity sensitivity, field uncertainty and the joint drift/count comparison;
+  then sequential discovery versus
+  reactivation. Preserve dormant identities and distinguish map usage, observed
+  repertoire and first supported expression from biological availability/birth/loss.
+- Sampling and manipulations: per-map position/direction support, shared-support remapping versus
+  first-visit prediction, proper-prior field uncertainty and a small changing-geometry
+  prototype. The current plug-in map weights and fixed graph basis do not already
+  implement these first-visit/barrier capabilities.
 
 ### Non-Goals
 
-- No within-map drift of the weights (the phase-2 idea). See "Deliberately not in this
-  plan" below and [designs K](designs.md#k-slow-per-map-drift--sketch-not-scheduled).
+- No production joint switching/within-map drift inference. Phase 3's small K=1
+  evolving-directionality and fixed-K joint comparators are scheduled; the full hybrid
+  remains deferred below and in [designs K](designs.md#k-slow-per-map-drift--sketch-not-scheduled).
 - No represented-position switching (`docs/plans/2026-04-05-ca1-represented-state-switching.md`).
-- No semi-Markov / explicit dwell-time distributions; no hierarchical (session-level) map
-  priors; no multi-session fitting or observation masks in this plan (consumed from
-  `docs/plans/masks-and-multi-sequence/` later, additively: `fit(..., obs_mask=)`).
+- No semi-Markov / explicit dwell-time distributions, hierarchical session-level map
+  priors, automated cell registration or inferred transitions during overnight gaps.
+  Observation masks and multi-session adapters are scheduled in phase 2; they are not
+  part of phase 1.
+- No production joint learning/neural inference, indefinite online map creation,
+  explicit biological birth/death model or online SR learning. Phase 3's directional,
+  visit-level, geometry and uncertainty prototypes and phase 4's capped-library
+  discovery experiment do not add those broader production models.
 - No change to `PlaceFieldModel`, `switching_point_process.py` solvers, or
   `contingency_belief.py`; helpers are imported, not modified.
-- No new plotting helpers beyond what the smoke script does inline.
-- No automatic K selection inside `fit`.
+- No model plotting API; smoke and comparison scripts plot inline.
+- No automatic K selection inside the phase-1 `fit`; phase 4 is a separate prototype.
 
 ### Dependency policy
 
@@ -135,27 +211,46 @@ graph basis stays behind the existing `spatial` extra. Sibling plans this one to
   transition input as "a `(K, K)` matrix or a `(n_time - 1, K, K)` stack"
   ([contract](shared-contracts.md#hmm-forward-backward)) so plugging it in is additive.
   **Gate:** phase 1b does not start until that plan's phase 1 has merged.
-- `docs/plans/masks-and-multi-sequence/` — `obs_mask=` and multi-session fitting. Not
-  consumed in phase 1 (callers drop invalid graph-basis rows themselves); it is the
-  prerequisite for the drift follow-on.
+- `docs/plans/masks-and-multi-sequence/` — shared mask/sequence contracts and helpers
+  gate phase 2; the multi-map adapter is implemented here, not by that sibling plan.
+  Its phase 5 gates the multi-session `PlaceFieldModel` comparison in phase 3.
+  Phase 1 uses contiguous fully observed intervals until these adapters land.
+- `docs/plans/2026-04-03-cross-session-drift.md` — validated elapsed-time drift is a
+  comparator for cross-day drift-versus-switching claims. Independent within-session
+  drift fits cannot stand in for it. Reconcile its summary uncertainty and missing-cell
+  handling before use; see that plan's long-recording integration gate.
+- `docs/plans/2026-04-04-covariate-driven-drift.md` — gradual learning/event-associated
+  change alternative. `docs/plans/2026-04-03-joint-learning-drift.md` remains a later
+  prototype after independent behavior/neural tests. The SR basis is a separate
+  movement-history comparison with its symmetrised control, not a requirement for
+  a barrier benchmark.
 - `docs/plans/identifiability-diagnostics/` — `.identifiability_report()` is the intended
   gate on K-map fits (near-identical maps, low-occupancy maps). Phase 1 exposes what it
   needs (per-map occupancy, per-map rate maps, pairwise posteriors) and does not implement
   the report.
 
+Phase 1b is optional for basic recurrence but required for fitted within-visit
+learning/event transition effects. Direct effects of behavior on firing and changes
+in visited positions must still be controlled in the comparison. Reuse measured graph
+validation findings when assessing drift parameters; an apparently converged optimizer
+does not by itself establish identifiability.
+
 ### Deliberately not in this plan
 
-- **Slow per-map drift (random-walk weights per map with a shared discrete state).** Not
-  designable yet: the GPB collapse correlates a neuron's weights across maps
+- **Production-scale drift of all per-map coefficients.** Inference and scaling
+  remain unresolved: the GPB collapse correlates a neuron's weights across maps
   (block-diagonal only conditional on the path), and the exact-vs-approximate choice has no
-  evidence; the state-conditional storage is 10²–10³× the already-heavy `PlaceFieldModel`
-  covariance store ([designs K](designs.md#k-slow-per-map-drift--sketch-not-scheduled) has
-  the numbers). **Trigger to plan it:** (1) `docs/plans/masks-and-multi-sequence/` has
-  merged (segment-wise processing), (2) phase-1 fits on real data show within-map drift
-  (rate-map correlation between the first and second half of a map's occupancy below ~0.8
-  for a majority of neurons), and (3) a `T <= 5` path-enumeration study (extending
-  `tests/test_oracle_switching_point_process.py`) has picked between exact GPB1, block-GPB,
-  and frozen-inactive-map inference.
+  evidence; state-conditional covariance storage can be prohibitive
+  ([designs K](designs.md#k-slow-per-map-drift--sketch-not-scheduled) has the estimates).
+  **Trigger to plan it:** (1) phase 2's masks/session support and a measured memory
+  strategy are available, (2) phase 3's small joint comparison shows predictive value
+  beyond matched coverage, sampling and behavioral controls, and (3) tiny discrete
+  path enumeration plus a validated continuous-integration reference quantifies
+  error for full-covariance GPB1 and block-GPB. Freezing inactive maps changes the
+  generative model and needs its own sensitivity analysis. GPB1 is itself approximate.
+  The [small joint prototype](drift-and-discrete-states.md) is scheduled before
+  repertoire interpretation; it does not require prior evidence of static-map recurrence.
+  A raw early/late map correlation threshold alone does not satisfy this gate.
 - Effective-degrees-of-freedom BIC (`tr(H (H + P)^{-1})`) — revisit if nominal-count BIC
   under-selects K on real data relative to held-out likelihood.
 
@@ -187,20 +282,41 @@ graph basis stays behind the existing `spatial` extra. Sibling plans this one to
   simulated two-map recovery fit (8 neurons, 15 000 bins, 49 basis functions) completes in
   under 60 s on CPU (measure and record in the PR).
 - **Real data (script, not test):** on the J16 session the switch probability–speed
-  correlation is reported with a circular-shift null and a BIC table over K.
+  correlation is reported with a circular-shift null and a BIC table over K. This is
+  a single-session smoke check; the chronic scientific gate is phase 3's later-visit
+  prediction under competing models and controls. Report an unmet data gate explicitly.
+- **Long-recording semantics:** masked/batched likelihood and sufficient-statistic
+  identities, padding invariance, no cross-session transition, and masked-neuron versus
+  zero-count distinction; see phase 2's validation table.
+- **Scientific comparison:** multi-seed simulations measure false recurrence under
+  smooth drift/gain changes and sensitivity to true returns. Real-data results report
+  animal/session-level uncertainty, convergence/seed sensitivity and compute cost.
+- **New-space/manipulation gates:** stationary fields with expanding coverage and late
+  first visits must be tested for false remapping. Report predictive calibration by
+  support stratum, geometry invariance, zero-overlap non-identifiability and strict
+  score-before-update behavior; see [sampling and barriers](sampling-and-barriers.md).
 
 ## Risks and Mitigations
 
 | Risk | Mitigation |
 | --- | --- |
-| Label switching across fits / seeds makes maps incomparable | Deterministic occupancy ordering after every fit; `find_permutation` in tests; relabelling-invariance test pins the ordering is applied to every fitted quantity. |
+| Label switching across fits / seeds makes maps incomparable | Deterministic occupancy ordering for each completed fit; `find_permutation` in tests. Phase 4 separately aligns persistent identities on supported fields and reports ambiguity; occupancy rank cannot track identity over time. |
 | A map collapses to near-zero occupancy during EM (degenerate M-step) | Occupancy gate keeps that map's previous weights and logs a warning (`warn_low_occupancy_states`); transition row keeps its previous value when its expected mass is zero. |
 | Poor k-means initialisation on real data (windows too short, sparse spiking) | `init_window_bins` and `seed` are parameters; `initial_responsibilities=` lets the user seed from anything (e.g. lap labels); k-means quality test on planted maps. |
 | EM and SGD optimise different objectives, so `fit` and `fit_sgd` disagree | One `_log_prior` term shared by the EM objective and the SGD loss (pattern of `switching_point_process._sgd_loss_fn`). |
 | Penalty-clipped expected counts (`_safe_expected_count`) make Newton stall for saturated neurons | Same clip in E- and M-step keeps the objective consistent; line-searched steps never increase it; a saturation warning mirrors `PlaceFieldModel._warn_if_rate_saturated` (`place_field_model.py:920-981`). |
 | Materialising `(n_time, n_neurons, n_maps)` expected counts blows memory | `lax.map(..., batch_size=)` over bins; only `(n_time, n_maps)` is stored. |
-| BIC with a penalised likelihood mis-counts parameters | Nominal count documented as conservative; `select_n_maps` parsimony tolerance; held-out `score()` as the second criterion. |
+| BIC with a penalised likelihood mis-counts parameters | Document nominal-count limits and a parsimony tolerance; phase 3 uses blocked predictive performance as the primary criterion. |
 | Behaviour-correlation false positives from autocorrelated switch probability | Circular-shift null preserves autocorrelation; 1b tests the relationship as a parameter. |
+| Smooth drift, behavioral gains or unit instability produce apparent maps | Phase 3 compares drift and nuisance-covariate/gain controls, uses held-out target neurons and varies cell-quality/matching thresholds. |
+| Stable or developing directional fields are split into extra maps | Phase 1a models spatially varying directional contrasts; phase 3 compares evolving directionality within K=1 and matches position/direction support. |
+| A fitted count or first supported expression is mistaken for the biological repertoire | Phase 4 reports count/prior/capacity uncertainty, retains dormant maps, tests later predictions and separates discovery from birth/loss. |
+| A sticky prior turns drift into long-lived staircase states | Joint drift/switching prototype before repertoire claims; compare counts and predictions across drift scale/rank, persistence and concentration, and report unresolved tradeoffs. |
+| Missing cells or tracking gaps look like silence or instantaneous transitions | Explicit per-entry masks, preserved interior time bins and independent visit/session boundaries in phase 2. |
+| A newly visited high-rate region looks like field formation or a new map | Zero exposure is unknown; compare shared support and first-visit prediction separately, with weight uncertainty and stationary-coverage controls. |
+| A changed graph or barrier creates apparent changes in coefficients | Stable physical coordinates, explicit connectivity and distribution-aware basis transforms; compare predicted fields, never unmatched coefficients. |
+| Learning appears to precede remapping because future outcomes enter predictors | Availability timestamps, filtered estimates, behavior-only learning fits and held-out event repetitions. |
+| Map labels appear to recur only because they were reordered independently per day | Fit shared maps; order once globally; freeze labels on later visits and report cell-overlap support. |
 | Lifting the trajectory helper changes `simulate_2d_moving_place_field` | Baseline capture before, byte-equality after, and a pinned test on seeded values. |
 
 ## Rollout Strategy
@@ -209,6 +325,14 @@ All at once per phase, purely additive: a new module, new `utils` functions, a n
 simulator, a lazy export. No existing public behaviour changes, so no deprecation window.
 Phase 1b is gated on the sibling plan and lands as its own PR; `fit(...,
 transition_covariates=None)` defaults preserve phase-1 behaviour exactly.
+The chronic-recording path is phase 1 → phase 1a → phase 2 → phase 3 → phase 4.
+Phase 2's mask work can proceed alongside 1a, with directional sequence integration
+required before the comparison. Phase 1b can land separately and is required only for
+fitted learning/event transition effects. Phase 3 tests developing directionality
+and a small joint drift/switching model before phase 4's repertoire interpretation.
+Phase 4 validates the capped library and repeats its count comparison with drift
+allowed before sequential discovery. Both analysis phases can
+conclude that evidence is insufficient; completion does not require finding maps.
 
 ## Open Questions
 
@@ -231,12 +355,23 @@ transition_covariates=None)` defaults preserve phase-1 behaviour exactly.
 5. **Newton steps per M-step.** Best answer: `max_newton_iter=5` (generalised EM keeps the
    objective monotone; the K = 1 parity test converges by running more EM iterations).
    Tune from the recorded runtime of the recovery fit.
-6. **Drift follow-on.** Deferred — see "Deliberately not in this plan" and
+6. **Drift follow-on.** Small [joint comparison](drift-and-discrete-states.md) in
+   phase 3; production-scale inference remains gated in
    [designs K](designs.md#k-slow-per-map-drift--sketch-not-scheduled).
 7. **Phase 1b parametrisation.** Assumed to be the centered-softmax (last map as reference)
    of `contingency_belief.compute_input_output_transition_matrix`; if the merged
    recurrent-transitions interface differs, phase 1b adopts that plan's parametrisation and
    only the M-step reshaping changes.
+8. **Unknown/changing K.** Decided sequence: fixed-K blocked/joint drift comparison,
+   capped Bayesian count uncertainty with drift sensitivity, then sequential
+   recruitment/reactivation. The
+   [phase-4 prototype](phase-4-unknown-map-repertoire.md) owns inference calibration,
+   capacity choice and persistent identities; birth/death and indefinite growth
+   require separate evidence and design.
+9. **Directional fields.** Begin with a bidirectional shared-plus-contrast adapter;
+   test K=1 directional evolution across experience in phase 3. General heading
+   interactions and full-rank K-map drift remain follow-ons; the small low-rank
+   joint comparison is explicitly scheduled before repertoire interpretation.
 
 ## Estimated Effort
 
@@ -249,3 +384,6 @@ transition_covariates=None)` defaults preserve phase-1 behaviour exactly.
 - Docs/registration: ~40 LOC (`__init__`, `pyproject`, CHANGELOG, README). Smoke script
   ~150 LOC.
 - Phase 1b: ~200 LOC source, ~250 LOC tests.
+- These estimates cover the original phases 1/1b only. Scope 1a and phases 2–4
+  after the helper/data audit; include directional designs, multi-session memory,
+  comparison runtime and Bayesian prototype costs in that estimate.

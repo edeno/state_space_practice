@@ -1,4 +1,4 @@
-# Phase 1b — Speed-gated map transitions through the recurrent-transitions interface
+# Phase 1b — Learning- and event-dependent map transitions
 
 [← back to PLAN.md](PLAN.md) · [overview](overview.md) · [designs](designs.md) · [contracts](shared-contracts.md)
 
@@ -10,11 +10,24 @@ centered-softmax convention assumed below (`contingency_belief.compute_input_out
 last state as reference), adopt its parametrisation — only the M-step reshaping in this
 file changes ([overview open question 7](overview.md#open-questions)).
 
-Low et al. (2021) report that map switching covaries with running speed. Phase 1 tests
-that post hoc (switch probability vs speed). This phase makes the switch hazard a
+Low et al. (2021) report that map switching covaries with running speed. Speed remains
+the minimal recovery fixture. This phase also tests learning history and environmental
+events using the same interface. It makes the switch hazard a
 *function of the covariate*: `Z_t[i, :] = softmax(logits_i + Gamma_i h_t)`, so the
-speed effect is a fitted parameter with a likelihood, and `hmm_forward_backward` runs on
+covariate effect is a fitted parameter with a likelihood, and `hmm_forward_backward` runs on
 the resulting `(n_time - 1, K, K)` stack — the branch phase 1 already made exact.
+
+This phase is optional for basic recurrence, and required for claims about fitted
+learning/event effects on within-visit transitions. Transition covariates do not
+account for direct effects on firing; phase 3 still needs behavioral emission and
+spatial-support controls. Follow the [sampling and barrier design](sampling-and-barriers.md).
+In particular, [phase 1a](phase-1a-directional-fields.md) models position-dependent
+directional firing within each map. Adding direction to a switch hazard cannot
+substitute for that emission model or phase 3's evolving-directionality alternative.
+If phase 2 has already merged, accept its leading
+sequence axis, apply covariates only to real within-sequence edges, and exclude
+padding/boundaries from transition fitting and behavior-alignment summaries. Test
+that batched covariate sufficient statistics equal explicit per-sequence sums.
 
 **Inputs to read first:**
 
@@ -29,10 +42,29 @@ the resulting `(n_time - 1, K, K)` stack — the branch phase 1 already made exa
 
 - [HMM forward-backward](shared-contracts.md#hmm-forward-backward) — consumed with a stack; no change.
 - [Model attributes](shared-contracts.md#model-attributes) — extended with `transition_logits_` and `transition_weights_`; `transition_matrix_` becomes the baseline (zero-covariate) matrix. Every phase-1 row keeps its meaning.
+- [Sampling and barriers](sampling-and-barriers.md) — coverage, event timing, uncertainty and interpretation.
 
 **Designs referenced:** [designs A](designs.md#a-exact-hmm-forwardbackward-in-log-space) (stack semantics), [designs I](designs.md#i-behavioural-alignment-helpers) (the post-hoc comparison this replaces).
 
 ## Tasks
+
+- **Define a small event/history covariate set and availability times.** Include speed
+  as a nuisance covariate, barrier presence, first-encounter events, lagged reward/error,
+  cumulative experience and elapsed time as candidate columns; select a predeclared
+  subset with enough independent events to estimate it. Save units, encoding, timestamp,
+  availability cutoff and training-only scaling for every column. Destination-bin
+  indexing does not make an outcome observed at the end of that bin available at its
+  start: lag it for prediction, or label the fit contemporaneous association. A barrier
+  inserted between visits has no within-sequence edge; analyse initial map occupancy
+  in phase 3 rather than inventing an overnight transition.
+
+- **Link learning without circularity.** Estimate learning/uncertainty from behavior
+  alone first, using training-fit parameters and past behavior at prediction time.
+  Evaluate covariate effects across behavioral posterior draws or a documented
+  uncertainty sensitivity analysis; a plug-in learning curve is not known truth.
+  Test whether filtered neural state adds prediction of later behavior beyond its
+  history on held-out visits. Fully joint learning/neural inference is deferred to
+  its sibling plan and cannot serve as independent evidence for this relationship.
 
 - **Consume the existing `hmm_viterbi` stack branch.** Recurrent transitions
   already supplies the public `(T, K, K)` convention: entry `t` is the
@@ -84,20 +116,31 @@ the resulting `(n_time - 1, K, K)` stack — the branch phase 1 already made exa
 
 - **Interpretation helpers.** `switch_hazard(covariate_values) -> (n_values, K)`:
   `1 - diag(Z(h))` per map for a grid of covariate values, so a user can plot hazard vs
-  speed with the fitted parameters. `viterbi_path()` pads the stored edge stack as above before calling the shared helper.
+  speed, experience or an event indicator while holding other columns at declared
+  supported values. Avoid unsupported covariate combinations. `viterbi_path()` pads
+  the stored edge stack as above before calling the shared helper.
 
 - **Docs.** CHANGELOG `### Added`: "`MultiMapPlaceFieldModel.fit(...,
-  transition_covariates=)`: covariate-dependent (e.g. speed-gated) map transitions".
+  transition_covariates=)`: learning- and event-dependent map transitions".
   Class docstring: the transition model, the standardisation advice, the `xi[t] ↔ h_{t+1}`
   pairing, and a two-line example. Extend `notebooks/multi_map_ca1_smoke.py` with a
   speed-gated fit and a printed `switch_hazard` table at speed quantiles.
+  Add a synthetic barrier/encounter example; the controlled real-data learning/barrier
+  benchmark lives in phase 3, not in the single-session smoke script. Retain a
+  constant-transition comparison and test held-out gain beyond speed/position/coverage.
 
 ## Deliberately not in this phase
 
 - Any change to the recurrent-transitions interface itself, or a second parametrisation of it here.
 - Covariate-dependent *maps* (weights depending on speed) — a different model.
 - Nonlinear (spline) covariate effects on the hazard; callers can pass basis-expanded covariates.
-- Drift, masks, multi-session — as in phase 1.
+- Drift and first implementation of masks/multi-session support (phase 2 owns the
+  latter; if already merged, maintain its semantics in this extension).
+- Changing geometry/bases: phase 3's prototypes. Unknown map count and sequential
+  discovery: [phase 4](phase-4-unknown-map-repertoire.md), initially with constant
+  transitions; joint integration with these covariate logits needs a later design.
+- A latent joint learning model or covariate-dependent initial map distribution in
+  the production API; phase 3 may use a small visit-level analysis reference.
 
 ## Validation slice
 
@@ -112,6 +155,9 @@ the resulting `(n_time - 1, K, K)` stack — the branch phase 1 already made exa
 | `::test_covariate_fit_objective_monotone` (slow) | `assert_ll_monotonic(log_likelihood_history_, tol=1e-6 * \|LL\|)` — the BFGS row optimiser is approximate; the tolerance is looser than phase 1's and the reason is stated in the test docstring |
 | `::test_fit_sgd_with_covariates_matches_em` (slow) | small problem: SGD final objective within `1e-3` relative of EM's; `transition_weights_` signs agree |
 | `::test_covariate_validation` | covariates with wrong `n_time`, non-finite values, or 1-D shape → `ValueError`; `score(..., transition_covariates=)` requires covariates when the model was fitted with them |
+| Event/history timing | Distinct insertion and encounter times recover the planted encounter effect; modifying future rewards/choices does not change earlier predictive covariates or filtered estimates. |
+| Coverage-only negative control | Stationary fields with changed route sampling and event-correlated speed are included in the phase-3 false-switch calibration; a transition effect must add predictive value beyond those controls. |
+| Event generalisation | Fit on earlier manipulations and score held-out repetitions/animals; fixed event effects alone cannot pass a neural switching claim without held-out-neuron evidence on shared support. |
 
 Mark slow / integration tests explicitly where fitting hides in helpers; the rest are
 auto-marked (`conftest.py:143`).
@@ -123,6 +169,10 @@ auto-marked (`conftest.py:143`).
   covariate `c` (`phi = 0.99`, unit variance, seeded) — speed-like autocorrelation without
   needing a speed-varying trajectory.
 - The phase-1 `tiny_problem` and `enumerate_hmm_posterior` oracle for the stack tests.
+- Synthetic insertion/encounter/reward histories with known information cutoffs,
+  repeated events and stationary-coverage controls from [sampling and barriers](sampling-and-barriers.md).
+  Event nulls preserve the experiment's block structure; do not circularly shift across
+  nonstationary geometry blocks as if they were exchangeable.
 
 ## Review
 

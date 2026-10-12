@@ -1,6 +1,7 @@
 # Multi-Map Place Fields Implementation Plan
 
-**Status:** Not started.
+**Status:** Not started. Scope updated 2026-10-12 for directional fields, recurrence
+versus drift, and an unknown/changing observed map repertoire in long recordings.
 
 Adds `MultiMapPlaceFieldModel`: a population-level switching model in which a shared hidden
 map state picks, at every time bin, which of K spatial maps generates the recorded spikes at
@@ -8,8 +9,34 @@ the animal's actual position. Users hand it a spatial design matrix (2D spline o
 basis) and binned spikes, and get back per-map rate maps, the smoothed/filtered map
 posterior, the Viterbi map sequence, a per-transition map-switch probability, helpers to
 align switching with behaviour (e.g. running speed), BIC / held-out likelihood for choosing
-K, and both EM and SGD fitting. K = 1 is an ordinary penalised place-field GLM fit. A gated
-follow-on phase makes the map-switch hazard depend on behavioural covariates.
+K, and both EM and SGD fitting. K = 1 is an ordinary penalised place-field GLM fit.
+
+The scientific target is whether changing place fields reflect continuous drift,
+returns to previously expressed population maps, or both. Long recordings supply
+repeated visits for estimating shared maps and testing their return on later data.
+Learning and barrier insertion/removal provide controlled tests of those changes.
+Unequal coverage requires separate analyses of remapping on shared position/direction
+support and prediction in newly visited conditions; first observation is not field
+formation. Observed travel direction can change firing within one map, and that
+directional tuning may itself develop with experience.
+
+The delivery path is **phase 1 → phase 1a → phase 2 → phase 3 → phase 4**:
+fixed-K HMM, stable directional fields, masked multi-session fitting, comparisons
+including evolving directionality, then an unknown-count/sequential-discovery prototype.
+Phase 3 also includes a small joint drift/switching comparison before phase 4's
+biological repertoire interpretation: persistent states can still discretise drift.
+Phase 2's mask work can proceed alongside 1a; both gate the scientific comparison.
+Choose among fixed K with blocked prediction first. Only after the confound/uncertainty
+benchmarks are validated, test a capped Bayesian library and later recruitment of
+unused capacity. Changing usage, first supported expression and biological map birth
+are separate claims. Phase 1b adds learning/event transitions on a separate branch.
+Production-scale switching-plus-drift inference and indefinite online map creation
+remain deferred pending the small joint prototype and resource/approximation evidence.
+
+Novelty is a separate evidence gate. The [contribution audit](novelty-and-evidence.md)
+identifies close existing methods and a candidate target: calibrated discrimination
+of reusable maps, drift and local field turnover under incomplete chronic sampling.
+Run the small comparison before expanding model complexity or claiming a new method.
 
 ## Reading order
 
@@ -23,8 +50,15 @@ For agent invocation, **load only the slice you need**:
 ## Files
 
 - [overview.md](overview.md) — goals, non-goals, integration points into the existing code, sibling-plan dependencies, metrics, risks, open questions, the deferred drift follow-on
-- [shared-contracts.md](shared-contracts.md) — the HMM forward–backward interface (constant or time-varying transitions) and the model's fitted-attribute names/shapes
+- [shared-contracts.md](shared-contracts.md) — HMM interface, directional/map semantics, repertoire counts, chronic-recording boundaries/masks and scientific comparison rules
+- [sampling-and-barriers.md](sampling-and-barriers.md) — unvisited versus silent fields, coverage and first-visit prediction, changing geometry, learning/intervention benchmark and uncertainty gates
+- [drift-and-discrete-states.md](drift-and-discrete-states.md) — neuroscience HDP-HMM/hybrid precedents, low-dimensional joint drift/switching prototype and evidence needed to distinguish drift from additional maps
+- [novelty-and-evidence.md](novelty-and-evidence.md) — closest prior work, provisional contribution, local field-change competitors and go/no-go criteria for scientific novelty
 - [designs.md](designs.md) — complete code for the log-space forward–backward, per-map likelihoods, weighted penalised GLM M-step, k-means initialisation, model wiring, simulator, exact test oracle, behaviour helpers, spline penalty; drift sketch
 - Phases (each ships as a separable PR):
   - [phase-1-static-maps-hmm.md](phase-1-static-maps-hmm.md) — the complete static-maps model: `utils` HMM helpers, `MultiMapPlaceFieldModel` (EM + SGD), simulator, model selection, behaviour helpers, tests, docs, real-data smoke script
-  - [phase-1b-speed-gated-transitions.md](phase-1b-speed-gated-transitions.md) — covariate-dependent (speed-gated) map transitions through the recurrent-transitions interface; gated on `docs/plans/recurrent-switching-transitions/` phase 1
+  - [phase-1a-directional-fields.md](phase-1a-directional-fields.md) — shared spatial fields plus position-dependent directional contrasts, partial pooling, direction-conditioned predictions and confounding checks
+  - [phase-1b-speed-gated-transitions.md](phase-1b-speed-gated-transitions.md) — learning- and event-dependent transitions (speed, encounter, reward/error history, experience); gated on `docs/plans/recurrent-switching-transitions/` phase 1
+  - [phase-2-long-recording-support.md](phase-2-long-recording-support.md) — shared static maps across visits/sessions, per-neuron observation masks, sequence boundaries and chronic-recording input requirements; consumes the masks plan's shared helpers
+  - [phase-3-recurrence-versus-drift.md](phase-3-recurrence-versus-drift.md) — stable/evolving directional, drifting, switching and small joint comparisons; held-out-neuron recurrence and learning/barrier tests, shared-support versus first-visit evaluation
+  - [phase-4-unknown-map-repertoire.md](phase-4-unknown-map-repertoire.md) — prototype posterior uncertainty over map count, capacity/prior sensitivity, then sequential discovery versus reactivation; no automatic biological birth/death interpretation

@@ -7,7 +7,10 @@ Ships a leading `n_sequences` axis on `PointProcessModel.fit` / `fit_sgd` and
 and masks batched; padding carried by the mask), the batched
 `dynamics_only_m_step`, and a `BlockDiagonalCovariance` that holds a sequence
 axis so the place-field block path never materialises dense covariances. This
-is the deliverable `docs/plans/multi-map-place-fields/` (phase 2) consumes.
+supplies the single-map drift baseline for
+[multi-map phase 3](../multi-map-place-fields/phase-3-recurrence-versus-drift.md).
+Multi-map phase 2 consumes the shared mask/sequence helpers and owns its own HMM
+adapter; it does not require this block-diagonal continuous-state implementation.
 
 **Inputs to read first:**
 
