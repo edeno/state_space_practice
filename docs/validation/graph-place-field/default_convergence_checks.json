@@ -1,0 +1,185 @@
+{
+  "scope": "Post-hoc iteration-budget diagnostic on representative seed 10; not an additional independent benchmark",
+  "records": [
+    {
+      "case": "stable",
+      "seed": 10,
+      "ten_iteration_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.10185251865705919,
+          "fitting": "default EM"
+        },
+        "validation_log_score": -520.1589681079113,
+        "test_log_score": -433.9128589461957,
+        "field_log_rate_rmse": 0.3996327475506245,
+        "observed_log_rate_rmse": 0.40436626639580137,
+        "drift_nrmse": null,
+        "estimated_drift_rms": 0.1353947971507809,
+        "observed_log_rate_95_coverage": 0.9722222222222222,
+        "binned_log_rate_95_coverage": 0.975,
+        "mean_log_rate_95_interval_width": 1.7741780080037086,
+        "test_bits_per_spike_over_static": -0.06363409594762998,
+        "test_bits_per_spike_over_windowed": -0.03568310653447416
+      },
+      "hundred_iteration_budget_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.07892794683871282,
+          "fitting": "default EM",
+          "em_iteration_budget": 100,
+          "accepted_e_steps": 14,
+          "converged": true
+        },
+        "validation_log_score": -520.2664763843459,
+        "test_log_score": -434.02160653096746,
+        "field_log_rate_rmse": 0.4041215966288147,
+        "observed_log_rate_rmse": 0.40847293418335645,
+        "drift_nrmse": null,
+        "estimated_drift_rms": 0.13544623240611953,
+        "observed_log_rate_95_coverage": 0.9694444444444444,
+        "binned_log_rate_95_coverage": 0.9736111111111111,
+        "mean_log_rate_95_interval_width": 1.7716562414234116,
+        "test_bits_per_spike_over_static": -0.06427185855437345,
+        "test_bits_per_spike_over_windowed": -0.036320869141217633
+      }
+    },
+    {
+      "case": "smooth",
+      "seed": 10,
+      "ten_iteration_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.08872947237632677,
+          "fitting": "default EM"
+        },
+        "validation_log_score": -599.1895647984713,
+        "test_log_score": -532.1133288545225,
+        "field_log_rate_rmse": 1.047758165588597,
+        "observed_log_rate_rmse": 1.1357147258714604,
+        "drift_nrmse": 0.8288802026477916,
+        "estimated_drift_rms": 0.2915763971073556,
+        "observed_log_rate_95_coverage": 0.44305555555555554,
+        "binned_log_rate_95_coverage": 0.4486111111111111,
+        "mean_log_rate_95_interval_width": 1.5301293226516994,
+        "test_bits_per_spike_over_static": 0.1422064990339412,
+        "test_bits_per_spike_over_windowed": -0.3987615407355461
+      },
+      "hundred_iteration_budget_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.07442274431486273,
+          "fitting": "default EM",
+          "em_iteration_budget": 100,
+          "accepted_e_steps": 13,
+          "converged": true
+        },
+        "validation_log_score": -599.2500230152309,
+        "test_log_score": -532.1517742761961,
+        "field_log_rate_rmse": 1.047781145525897,
+        "observed_log_rate_rmse": 1.1356837321290125,
+        "drift_nrmse": 0.8289155514636485,
+        "estimated_drift_rms": 0.2918246872829885,
+        "observed_log_rate_95_coverage": 0.4444444444444444,
+        "binned_log_rate_95_coverage": 0.4486111111111111,
+        "mean_log_rate_95_interval_width": 1.5290285779714317,
+        "test_bits_per_spike_over_static": 0.14199398938185925,
+        "test_bits_per_spike_over_windowed": -0.398974050387628
+      }
+    },
+    {
+      "case": "remap",
+      "seed": 10,
+      "ten_iteration_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.09865427444022264,
+          "fitting": "default EM"
+        },
+        "validation_log_score": -552.5001792966495,
+        "test_log_score": -491.65522200410584,
+        "field_log_rate_rmse": 0.8121657556853783,
+        "observed_log_rate_rmse": 0.8961746830997892,
+        "drift_nrmse": 0.5077563449303348,
+        "estimated_drift_rms": 0.6933088735385039,
+        "observed_log_rate_95_coverage": 0.7013888888888888,
+        "binned_log_rate_95_coverage": 0.7055555555555556,
+        "mean_log_rate_95_interval_width": 1.5520701254321358,
+        "test_bits_per_spike_over_static": 0.3846070772562447,
+        "test_bits_per_spike_over_windowed": -0.09628556679559937
+      },
+      "hundred_iteration_budget_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.07712954994501378,
+          "fitting": "default EM",
+          "em_iteration_budget": 100,
+          "accepted_e_steps": 14,
+          "converged": true
+        },
+        "validation_log_score": -552.6315779367819,
+        "test_log_score": -491.71177019298216,
+        "field_log_rate_rmse": 0.8145373665055783,
+        "observed_log_rate_rmse": 0.898140860364864,
+        "drift_nrmse": 0.5073499985339605,
+        "estimated_drift_rms": 0.6941673549578792,
+        "observed_log_rate_95_coverage": 0.7013888888888888,
+        "binned_log_rate_95_coverage": 0.7041666666666667,
+        "mean_log_rate_95_interval_width": 1.55052343647075,
+        "test_bits_per_spike_over_static": 0.38430037879134576,
+        "test_bits_per_spike_over_windowed": -0.09659226526049831
+      }
+    },
+    {
+      "case": "sparse",
+      "seed": 10,
+      "ten_iteration_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.153191545581912,
+          "fitting": "default EM"
+        },
+        "validation_log_score": -296.5319159131198,
+        "test_log_score": -213.2499779861726,
+        "field_log_rate_rmse": 1.0563417407898348,
+        "observed_log_rate_rmse": 1.1211600179098862,
+        "drift_nrmse": 0.9279235677139636,
+        "estimated_drift_rms": 0.18077085212889063,
+        "observed_log_rate_95_coverage": 0.5944444444444444,
+        "binned_log_rate_95_coverage": 0.5930555555555556,
+        "mean_log_rate_95_interval_width": 2.0225728882216174,
+        "test_bits_per_spike_over_static": -0.1263555471521686,
+        "test_bits_per_spike_over_windowed": -0.5979509368847802
+      },
+      "hundred_iteration_budget_run": {
+        "config": {
+          "rank": 41,
+          "q": 0.001,
+          "tau2": 0.08168729739534361,
+          "fitting": "default EM",
+          "em_iteration_budget": 100,
+          "accepted_e_steps": 21,
+          "converged": true
+        },
+        "validation_log_score": -297.26538747766165,
+        "test_log_score": -213.60678233474917,
+        "field_log_rate_rmse": 1.0622378685669902,
+        "observed_log_rate_rmse": 1.1284188627469007,
+        "drift_nrmse": 0.9281306119269256,
+        "estimated_drift_rms": 0.18176667480302228,
+        "observed_log_rate_95_coverage": 0.5930555555555556,
+        "binned_log_rate_95_coverage": 0.5902777777777778,
+        "mean_log_rate_95_interval_width": 2.0119584509234065,
+        "test_bits_per_spike_over_static": -0.13523071722559998,
+        "test_bits_per_spike_over_windowed": -0.6068261069582116
+      }
+    }
+  ]
+}

@@ -1385,6 +1385,124 @@ def _parallel_kalman_smoother_impl(
     return smoothed_means, smoothed_covariances, cross_covariances
 
 
+class _FilterElement(NamedTuple):
+    """Associative filtering element ``(A, b, C, eta, J)`` (Särkkä 2021)."""
+
+    A: jax.Array  # (..., D, D)
+    b: jax.Array  # (..., D)
+    C: jax.Array  # (..., D, D)
+    eta: jax.Array  # (..., D)
+    J: jax.Array  # (..., D, D)
+
+
+@jax.vmap
+def _combine_filter_elements(
+    earlier: _FilterElement, later: _FilterElement
+) -> _FilterElement:
+    """Compose two filtering elements; one LU factor of ``I + C_i J_j`` serves both
+    the plain and transposed (``(I + J_j C_i)^{-1}``) solves."""
+    identity = jnp.eye(earlier.b.shape[-1], dtype=earlier.b.dtype)
+    lu = jax.scipy.linalg.lu_factor(identity + earlier.C @ later.J)
+
+    def solve(rhs: jax.Array) -> jax.Array:
+        return cast(jax.Array, jax.scipy.linalg.lu_solve(lu, rhs))
+
+    def solve_transposed(rhs: jax.Array) -> jax.Array:
+        return cast(jax.Array, jax.scipy.linalg.lu_solve(lu, rhs, trans=1))
+
+    return _FilterElement(
+        A=later.A @ solve(earlier.A),
+        b=later.A @ solve(earlier.b + earlier.C @ later.eta) + later.b,
+        C=symmetrize(later.A @ solve(earlier.C) @ later.A.T + later.C),
+        eta=earlier.A.T @ solve_transposed(later.eta - later.J @ earlier.b)
+        + earlier.eta,
+        J=symmetrize(earlier.A.T @ solve_transposed(later.J) @ earlier.A + earlier.J),
+    )
+
+
+def _parallel_information_filter(
+    prior_mean: jax.Array,
+    prior_cov: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    info_matrices: jax.Array,
+    info_vectors: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Filter information-form observations by associative scan (O(log T) span).
+
+    The model is ``x_{t+1} = A x_t + N(0, Q)`` with observation sites
+    ``exp(g_t·x_t − ½ x_tᵀ G_t x_t)``. The first site conditions
+    ``N(prior_mean, prior_cov)`` directly; a caller whose filter predicts before
+    its first update passes ``A m_0`` and ``A P_0 Aᵀ + Q``. A zero site
+    ``(G_t, g_t) = 0`` is a pure prediction step. Nothing is divided by the site
+    precision, so rank-deficient or zero ``G_t`` and singular ``Q`` are allowed.
+
+    Parameters
+    ----------
+    prior_mean : jax.Array, shape (D,)
+        Prior mean of the first observed state.
+    prior_cov : jax.Array, shape (D, D)
+        Prior covariance of the first observed state.
+    transition_matrix : jax.Array, shape (D, D)
+    process_cov : jax.Array, shape (D, D)
+        Positive semidefinite process covariance.
+    info_matrices : jax.Array, shape (T, D, D)
+        Site precisions ``G_t`` (positive semidefinite).
+    info_vectors : jax.Array, shape (T, D)
+        Site information vectors ``g_t``.
+
+    Returns
+    -------
+    filtered_means : jax.Array, shape (T, D)
+    filtered_covariances : jax.Array, shape (T, D, D)
+
+    References
+    ----------
+    Särkkä, S. & García-Fernández, Á.F. (2021). Temporal parallelization of
+    Bayesian smoothers. IEEE Trans. Automatic Control 66(1), 299-306.
+    """
+    n_time, D = info_vectors.shape
+    if info_matrices.shape != (n_time, D, D) or prior_mean.shape != (D,):
+        raise ValueError(
+            "info_matrices must be (T, D, D) and prior_mean (D,) for info_vectors "
+            f"(T, D); got {info_matrices.shape}, {prior_mean.shape}, "
+            f"{info_vectors.shape}."
+        )
+    A, Q = transition_matrix, process_cov
+    identity = jnp.eye(D, dtype=info_vectors.dtype)
+
+    first_cov = symmetrize(
+        jnp.linalg.solve(identity + prior_cov @ info_matrices[0], prior_cov)
+    )
+    first = _FilterElement(
+        A=jnp.zeros((D, D), dtype=identity.dtype),
+        b=prior_mean + first_cov @ (info_vectors[0] - info_matrices[0] @ prior_mean),
+        C=first_cov,
+        eta=jnp.zeros(D, dtype=identity.dtype),
+        J=jnp.zeros((D, D), dtype=identity.dtype),
+    )
+
+    def element(G: jax.Array, g: jax.Array) -> _FilterElement:
+        # p(x_t | x_{t-1}, site_t) and the site's likelihood of x_{t-1}:
+        # M = (I + Q G)^{-1}, so (Q^{-1} + G)^{-1} = M Q and (I + G Q)^{-1} = Mᵀ.
+        M = jnp.linalg.solve(identity + Q @ G, identity)
+        MQ = symmetrize(M @ Q)
+        return _FilterElement(
+            A=M @ A,
+            b=MQ @ g,
+            C=MQ,
+            eta=A.T @ (M.T @ g),
+            J=symmetrize(A.T @ (M.T @ G) @ A),
+        )
+
+    rest = jax.vmap(element)(info_matrices[1:], info_vectors[1:])
+    elements = jax.tree.map(
+        lambda f, r: jnp.concatenate((f[None], r), axis=0), first, rest
+    )
+    filtered = jax.lax.associative_scan(_combine_filter_elements, elements)
+    return filtered.b, filtered.C
+
+
 def sum_of_outer_products(x: ArrayLike, y: ArrayLike) -> jax.Array:
     """Compute the sum of outer products between corresponding vectors.
 

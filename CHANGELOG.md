@@ -7,6 +7,49 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Graph-field mathematical validation** against dense graph matrix functions,
+  independent Gaussian conditioning and EM optimization, finite-difference SGD
+  gradients, and converged scalar posterior integration. A reproducible study
+  records Newton-step approximation errors and drift-scale evidence profiles.
+- **Independent graph-field validation** with analytic moving fields, continuous
+  trajectories, blocked held-out observations, static and time-varying occupancy-map
+  baselines, validation-based parameter selection, and uncertainty coverage reports.
+  EM/SGD regression tests guard against masked evaluation spikes leaking into fits.
+- **Drifting graph-GP place fields** in `graph_place_field`: distance and
+  inverse-distance Laplacian bases, a static penalized Poisson estimator with
+  Laplace-evidence amplitude selection, and `GraphPlaceFieldModel` for masked
+  per-neuron filtering/smoothing, automatic drift-scale fitting, posterior field
+  trajectories, rate maps, and sequence evidence scoring. The normal `fit()`
+  profiles exact-zero and positive scales, then optimizes joint Laplace evidence
+  with full-sequence bounded L-BFGS. Fixed q, experimental `fit_em()`/`fit_sgd()`,
+  final conditional profiles, bound hits and convergence diagnostics are also
+  available. Component baseline prior means are free; spatial prior means stay
+  zero. Mean field-increment variance is reported separately from coefficient q
+  because q and fitted spatial shape can trade off. Constructor defaults are
+  `inference_method="joint"` (joint-trajectory Laplace inference) and
+  `update_drift_scale=True`; `inference_method="sequential"` selects the local
+  Laplace filter/RTS approximation. That causal filter (the source of
+  `filtered_mean`/`filtered_cov`; joint inference does not run it) takes up to
+  `max_newton_iter=5` damped Newton iterations per observation and logs observed
+  bins whose remaining relative log-rate step exceeds 1e-6. `score()` uses the selected evidence
+  approximation and restarts from the fitted initial prior. The static estimator
+  rejects unpenalized modes that occupied bins cannot identify (for example, a
+  parity fit with an unvisited graph component) or that have no finite MAP (a
+  visited component where the neuron never spikes). The model uses
+  the shared fitting/result contracts and requires the `spatial` extra and x64.
+  `parallel` (default: on for GPU/TPU, off for CPU) runs the joint smoother's
+  linear passes by associative scans, with the same fit: 49-129x faster per
+  neuron on an A100 (3,000-70,930 time bins, rank 20; a full 8-neuron fit took
+  165 s instead of 2,065 s) and 1.7-4x slower on CPU, at about 3-4x the device
+  memory with gradients. `neuron_batch_size` bounds memory by
+  inferring neurons in checkpointed chunks (17-34 % more per gradient in
+  `fit()`). `laplace_smoothing.poisson_laplace_smoother`
+  exposes the same `parallel` option, and `kalman` gains the information-form
+  associative-scan filter it uses. `store_covariances=False` keeps only
+  posterior means and per-neuron summaries instead of the
+  `(n_neurons, n_time, rank, rank)` covariance arrays, so long recordings with
+  many neurons fit in memory; `smoother_diagnostics_` holds per-neuron
+  `SmootherDiagnostics` scalars.
 - **Public API and version at package level**: `state_space_practice.__version__`
   and lazily loaded (PEP 562) entry points — `kalman_filter`, `kalman_smoother`,
   `switching_kalman_filter`, `switching_kalman_smoother`, `run_em`,
@@ -162,6 +205,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`GraphBasis` gains a trailing `laplacian_convention` field** (default
+  `"distance"`), set by `build_graph_basis(..., laplacian_convention=...)`.
+  The existing fields keep their positions and `env_key` keeps its
+  `(n_bins, nnz, digest)` layout, so positional construction from the six
+  original fields still works; unpacking a basis into exactly six names does
+  not. The digest now also covers the convention, so keys from earlier
+  versions differ.
 - **Refitting an oscillator model restarts from the constructor's
   parameters**: `fit` (and the Gaussian models' `fit_sgd`) on
   `CorrelatedNoiseModel`, `DirectedInfluenceModel`,

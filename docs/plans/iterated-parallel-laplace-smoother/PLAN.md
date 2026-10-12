@@ -1,6 +1,6 @@
 # Iterated and Parallel Laplace Smoother Implementation Plan
 
-**Status:** Not started.
+**Status:** Phase 2a implemented on branch `feat/joint-laplace-parallel` (not merged; results in its phase file). Phases 1, 2b, 3 and 4 not started (gated on overview.md Open Question 6).
 
 Adds an *iterated* Laplace smoother for point-process (Poisson GLM) observations to
 `stochastic_point_process_smoother` and the models built on it (`PointProcessModel`,
@@ -16,6 +16,11 @@ arguments (`n_iterations`, `parallel`, ...); the defaults reproduce today's outp
 bit-for-bit. A final phase retires the private Newton loop in `temporal_rate_gp.py` in
 favour of the shared core.
 
+Phase 2a ships first and on its own. It brings the same associative-scan pass to the
+joint Laplace core already in `laplace_smoothing.py`, which `GraphPlaceFieldModel` uses,
+as `parallel` (default chosen by backend). Prototype measurements on real data motivate
+it. Phases 1, 2b, 3 and 4 wait on overview.md Open Question 6.
+
 ## Reading order
 
 For agent invocation, **load only the slice you need**:
@@ -27,11 +32,12 @@ For agent invocation, **load only the slice you need**:
 
 ## Files
 
-- [overview.md](overview.md) — integration points (file:line), goals/non-goals, dependency policy toward the sibling plans, metrics, risks, rollout, open questions, effort.
+- [overview.md](overview.md) — integration points (file:line), goals/non-goals, dependency policy toward the sibling plans, metrics, prototype evidence (GPU/CPU measurements), risks, rollout, open questions, effort.
 - [shared-contracts.md](shared-contracts.md) — the public keywords and return layout, `IteratedSmootherDiagnostics`, the pseudo-observation site contract, the Gauss–Newton core and linear-pass interfaces, the warning contract.
 - [designs.md](designs.md) — full derivation (pseudo-observations in information form, Gauss–Newton step as a linear smoother pass, line search, Laplace evidence, parallel filter elements, decoder penalty sites, gradients) with complete code for the non-obvious parts.
 - Phases (each ships as a separable PR):
   - [phase-1-sequential-iterated-smoother.md](phase-1-sequential-iterated-smoother.md) — `n_iterations` on `stochastic_point_process_smoother` (dense and block-diagonal paths), threaded through `PointProcessModel` and `PlaceFieldModel`; oracle, monotone-ascent, temporal-rate-GP agreement, block-parity and bit-identical tests; docs.
-  - [phase-2-parallel-in-time.md](phase-2-parallel-in-time.md) — `parallel=True`: information-form parallel Kalman filter (`kalman.parallel_kalman_filter`) + `parallel_kalman_smoother` for every pass; baseline capture before, output comparison and speedup table after.
+  - [phase-2a-joint-laplace-parallel.md](phase-2a-joint-laplace-parallel.md) — `parallel` on `poisson_laplace_smoother` and `GraphPlaceFieldModel`: `kalman._parallel_information_filter`, parallel linear pass and prior powers, backend default, `neuron_batch_size`, remat experiment; baseline before, comparison table after. Independent of phase 1.
+  - [phase-2b-point-process-parallel.md](phase-2b-point-process-parallel.md) — `parallel=True` on `stochastic_point_process_smoother` and the point-process models, reusing 2a's filter; public `kalman.parallel_kalman_filter`; baseline capture before, output comparison and speedup table after.
   - [phase-3-position-decoder.md](phase-3-position-decoder.md) — `n_iterations` / `parallel` on `position_decoder_smoother` and `PositionDecoder`, with the track penalty as a Gauss–Newton pseudo-observation and adaptive inflation confined to the initialisation.
   - [phase-4-consolidate-temporal-rate-gp.md](phase-4-consolidate-temporal-rate-gp.md) — `temporal_rate_gp._infer_log_rate_traced` runs on the shared core; its private Newton loop is removed; dense-GP oracle agreement preserved.

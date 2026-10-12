@@ -2,11 +2,13 @@
 
 **Status:** Not started.
 
+**Integration note (2026-10-05):** The drifting graph-GP model is now implemented in this module. The shared `GraphBasis` prefix has seven fields, including `laplacian_convention`; the SR fingerprint uses `build_graph_laplacian(env)` and `_laplacian_key(laplacian, "distance")`. Task 4 should reuse the existing `fit_static_graph_glm`. Historical source line references and the standalone static-solver sketch below must be reconciled with these interfaces before execution.
+
 **Goal:** Add a successor-representation (predictive-map) spatial basis to `graph_place_field` as a drop-in alternative to the graph-Laplacian eigenbasis, together with the held-out spike log-likelihood comparison at matched rank that decides whether to adopt it.
 
-**Architecture:** Estimate the animal's bin-to-bin transition matrix `T` from the trajectory (adjacency-restricted counts, pseudo-count smoothing on graph edges, row-normalised; NumPy/SciPy like the rest of the module), form the successor representation `M = (I - gamma T)^-1` and use its leading left singular vectors — computed per connected component as right singular vectors of `I - gamma T`, so no inverse is ever formed — as a real orthonormal basis. Package it as `SuccessorBasis`, a `NamedTuple` whose leading six fields are those of `GraphBasis`, so `graph_design_matrix`, `bin_spike_counts` and `spectral_shape` consume it unchanged and the per-time design-matrix contract `(Z (n_time, rank), valid (n_time,))` is untouched. Decide adoption with a static ridge-penalised Poisson fit on per-bin sufficient statistics and contiguous-block cross-validated held-out log-likelihood, sweeping `gamma`, against the Laplacian basis at the same rank and against a *symmetrised-SR* control arm (same movement graph, direction removed). The Laplacian path (`build_graph_basis`, `GraphBasis`) is not modified.
+**Architecture:** Estimate the animal's bin-to-bin transition matrix `T` from the trajectory (adjacency-restricted counts, pseudo-count smoothing on graph edges, row-normalised; NumPy/SciPy like the graph substrate), form the successor representation `M = (I - gamma T)^-1` and use its leading left singular vectors — computed per connected component as right singular vectors of `I - gamma T`, so no inverse is ever formed — as a real orthonormal basis. Package it as `SuccessorBasis`, a `NamedTuple` whose leading seven fields are those of `GraphBasis`, so `graph_design_matrix`, `bin_spike_counts` and `spectral_shape` consume it unchanged and the per-time design-matrix contract `(Z (n_time, rank), valid (n_time,))` is untouched. Decide adoption with a static ridge-penalised Poisson fit on per-bin sufficient statistics and contiguous-block cross-validated held-out log-likelihood, sweeping `gamma`, against the Laplacian basis at the same rank and against a *symmetrised-SR* control arm (same movement graph, direction removed). The Laplacian path (`build_graph_basis`, `GraphBasis`) is not modified.
 
-**Tech stack:** NumPy, SciPy (`linalg.svd`, `linalg.solve`, `linalg.subspace_angles`, `special.gammaln`, `sparse.csgraph.connected_components`), networkx (adjacency of `env.connectivity`), `neurospatial.Environment` (the `spatial` extra). JAX appears only in one downstream smoke test that runs the Laplace-EKF filter on the SR design matrix.
+**Tech stack:** NumPy, SciPy (`linalg.svd`, `linalg.solve`, `linalg.subspace_angles`, `special.gammaln`, `sparse.csgraph.connected_components`), networkx (adjacency of `env.connectivity`), `neurospatial.Environment` (the `spatial` extra). JAX supplies the existing static estimator reused by Task 4 and the downstream Laplace-EKF smoke test on the SR design matrix.
 
 **Out of scope:** modifying `PlaceFieldModel` (its basis is the patsy spline built inside `_build_spline_basis_matrix`; a graph-basis model is the separate drifting-graph-GP plan), a *drifting* SR model, learning the SR online (Fang et al. 2023; Bono et al. 2023), direction-split state spaces, sparse/iterative SVD, GPU.
 
@@ -48,16 +50,16 @@ Therefore the validation is restated to what is actually testable: a positive co
 
 ## Dependencies
 
-- **Cross-plan.** `docs/plans/multi-map-place-fields/` consumes any spatial basis through the per-time design matrix. This plan keeps `graph_design_matrix`'s contract identical (`Z[t] = basis.eigvecs[bin_id(t)]`, zero row + `valid=False` out of bounds; `graph_place_field.py:344-384`); only the `basis` annotation widens to `SpatialBasis`. The local drifting-graph-GP plan (`.claude/docs/plans/drifting-graph-gp-place-field/`, gitignored) plans a per-bin static estimator in its phase 1; `fit_penalized_poisson_field` here accepts a per-coefficient penalty vector with zeros allowed for exactly that reason, so phase 1 should wrap it rather than add a parallel solver.
+- **Cross-plan.** `docs/plans/multi-map-place-fields/` consumes any spatial basis through the per-time design matrix. This plan keeps `graph_design_matrix`'s contract identical (`Z[t] = basis.eigvecs[bin_id(t)]`, zero row + `valid=False` out of bounds; `graph_place_field.py:344-384`); only the `basis` annotation widens to `SpatialBasis`. The [drifting graph-GP plan](../2026-07-16-drifting-graph-gp-place-field.md) has implemented `fit_static_graph_glm` with per-coefficient penalties and zero penalties allowed. Task 4 should adapt/reuse that estimator under the proposed API rather than add another static Poisson solver; its original solver sketch below predates this integration.
 - **neurospatial.** Importable in this checkout's `.venv` as an *editable* install of `/Users/edeno/Documents/GitHub/neurospatial` at commit `2522021fe2e7`, while `uv.lock` / `pyproject.toml:167-171` pin the git commit `e81dec62…` (both report version 0.8.0). Every neurospatial API this plan uses is already used by the shipped module or its tests (`bin_sequence`, `connectivity`, `get_differential_operator`, `n_bins`, `bin_sizes`, `bin_centers`, `from_samples`, `make_w_maze`); tests use `env.connectivity.neighbors` (networkx) rather than `env.neighbors` to avoid a new upstream surface. The executor should confirm the install source with `uv run --no-sync python -c "import neurospatial, inspect; print(inspect.getsourcefile(neurospatial))"` and expect the ring fixture's bin count to be a property of the installed version (never hard-code `48`).
 - **Real data.** `data/` (gitignored) is absent in this checkout; the script is written against the loader signature used by `scripts/position_decoding_demo.py:22-36` and cannot be run here.
 
 ## Inputs to read first
 
 - [src/state_space_practice/graph_place_field.py:1-27](../../../src/state_space_practice/graph_place_field.py) — module docstring: active-bin convention and the distance-weighted Laplacian choice; extend it (Task 1).
-- [graph_place_field.py:59-93](../../../src/state_space_practice/graph_place_field.py) — `GraphBasis` fields; `SuccessorBasis` mirrors the first six in order.
-- [graph_place_field.py:96-124](../../../src/state_space_practice/graph_place_field.py) — `_distance_weighted_laplacian`, `_laplacian_key`, `_env_key`: reused for `env_key`, components and `eps`.
-- [graph_place_field.py:127-147](../../../src/state_space_practice/graph_place_field.py) — `_check_basis_matches_env`: the only fields consumers read are `eigvecs.shape[0]` and `env_key`; error strings at `:136-140` and `:143-147` name `build_graph_basis` (Task 6 generalises them).
+- [graph_place_field.py:59-93](../../../src/state_space_practice/graph_place_field.py) — `GraphBasis` fields; `SuccessorBasis` mirrors the first seven in order.
+- [graph_place_field.py:96-124](../../../src/state_space_practice/graph_place_field.py) — `build_graph_laplacian`, `_laplacian_key`, `_env_key`: reused for `env_key`, components and `eps`.
+- [graph_place_field.py:127-147](../../../src/state_space_practice/graph_place_field.py) — `_check_basis_matches_env`: the environment check reads `eigvecs.shape[0]`, `laplacian_convention` and `env_key`; error strings at `:136-140` and `:143-147` name `build_graph_basis` (Task 6 generalises them).
 - [graph_place_field.py:150-181](../../../src/state_space_practice/graph_place_field.py) — `_resolve_rank` (reuse with `sigma=None`).
 - [graph_place_field.py:184-210](../../../src/state_space_practice/graph_place_field.py) — `_full_eigensystem`: the per-component decompose-pad-sort pattern to mirror.
 - [graph_place_field.py:213-277](../../../src/state_space_practice/graph_place_field.py) — `build_graph_basis` (untouched): read-only arrays, `np.array(env.bin_sizes)` copy at `:266`.
@@ -86,7 +88,7 @@ Add after `GraphBasis` (`graph_place_field.py:93`):
 class SuccessorBasis(NamedTuple):
     """Truncated successor-representation (predictive-map) basis over active bins.
 
-    The leading six fields are those of :class:`GraphBasis`, in the same order, so
+    The leading seven fields are those of :class:`GraphBasis`, in the same order, so
     every consumer of a ``GraphBasis`` (:func:`graph_design_matrix`,
     :func:`bin_spike_counts`, :func:`spectral_shape`) accepts it unchanged.
 
@@ -109,6 +111,9 @@ class SuccessorBasis(NamedTuple):
         Per-bin volume (``env.bin_sizes``). **Not** exposure.
     n_components : int
         Number of connected components (``rank >= n_components`` is enforced).
+    laplacian_convention : LaplacianConvention
+        ``"distance"`` for the environment fingerprint; the SR basis itself is
+        defined by the empirical transition matrix.
     env_key : tuple
         The environment's Laplacian fingerprint (as in :class:`GraphBasis`), so the
         consumers' environment check applies unchanged.
@@ -125,7 +130,8 @@ class SuccessorBasis(NamedTuple):
     component_labels: NDArray[np.int_]
     bin_sizes: NDArray[np.float64]
     n_components: int
-    env_key: tuple[int, int, str]
+    laplacian_convention: LaplacianConvention
+    env_key: tuple[str, int, int, str]
     kind: str
     gamma: float
     singular_values: NDArray[np.float64]
@@ -340,7 +346,7 @@ def build_successor_basis(
         :func:`graph_design_matrix` accepts the basis exactly like a ``GraphBasis``.
     """
     gamma = _validate_gamma(gamma)
-    laplacian = _distance_weighted_laplacian(env)
+    laplacian = build_graph_laplacian(env)
     n_components, labels = connected_components(laplacian, directed=False)
     labels = np.asarray(labels)
     n_bins = int(laplacian.shape[0])
@@ -370,7 +376,8 @@ def build_successor_basis(
         component_labels=labels,
         bin_sizes=np.array(env.bin_sizes, dtype=float),
         n_components=int(n_components),
-        env_key=_laplacian_key(laplacian),
+        laplacian_convention="distance",
+        env_key=_laplacian_key(laplacian, "distance"),
         kind="successor",
         gamma=gamma,
         singular_values=singular_values[:keep].copy(),

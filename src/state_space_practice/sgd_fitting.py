@@ -32,11 +32,17 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from jax import Array
+from jax.flatten_util import ravel_pytree
 from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import clear_attributes
 from state_space_practice.exceptions import NonFiniteLikelihoodError
 from state_space_practice.fitted_state import FittedAttribute
+from state_space_practice.likelihood_optimization import (
+    LikelihoodOptimum,
+    minimize_likelihood,
+    warn_if_unconverged,
+)
 from state_space_practice.parameter_transforms import (
     ParameterTransform,
     transform_to_constrained,
@@ -198,6 +204,7 @@ class _CompiledSGDStep:
 
     def __init__(self, keepalive: list[object]) -> None:
         self.train_step: Callable[..., Any] = _unbuilt_step
+        self.value_and_grad_step: Callable[..., Any] = _unbuilt_step
         self.state_fingerprints: dict[str, Hashable] = {}
         self.cacheable = True
         self.keepalive = keepalive
@@ -344,12 +351,9 @@ def _build_sgd_step(
         p = transform_to_constrained(unc_p, param_spec, static_params=frozen)
         return model._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
-    def _sgd_train_step(
-        unc_p: SGDParams,
-        opt_st: optax.OptState,
-        frozen_leaves: list[Any],
-        data_leaves: list[Any],
-    ) -> tuple[Array, SGDParams, optax.OptState, Array]:
+    def _value_and_grad_step(
+        unc_p: SGDParams, frozen_leaves: list[Any], data_leaves: list[Any]
+    ) -> tuple[Array, SGDParams]:
         if baked_leaves is not None:
             frozen_leaves, data_leaves = baked_leaves
         # Runs only while tracing: record which model attributes the loss
@@ -361,6 +365,15 @@ def _build_sgd_step(
                 unc_p, frozen_leaves, data_leaves
             )
         entry.record_trace(model, reads, recorded)
+        return loss, grads
+
+    def _sgd_train_step(
+        unc_p: SGDParams,
+        opt_st: optax.OptState,
+        frozen_leaves: list[Any],
+        data_leaves: list[Any],
+    ) -> tuple[Array, SGDParams, optax.OptState, Array]:
+        loss, grads = _value_and_grad_step(unc_p, frozen_leaves, data_leaves)
         updates, new_opt_st = optimizer.update(grads, opt_st, unc_p)
         new_unc_p = optax.apply_updates(unc_p, updates)
         step_finite = (
@@ -371,6 +384,7 @@ def _build_sgd_step(
         return loss, new_unc_p, new_opt_st, step_finite
 
     entry.train_step = typed_jit(_sgd_train_step)
+    entry.value_and_grad_step = typed_jit(_value_and_grad_step)
     return entry
 
 
@@ -427,13 +441,15 @@ class SGDFittableMixin:
     #: training objective).
     log_likelihood_: FittedAttribute[float] = FittedAttribute()
     #: The last fit's trajectory: one log-likelihood per accepted EM E-step,
-    #: or the per-step SGD training objective (log-likelihood plus any
-    #: penalty term).
+    #: or the training objective (log-likelihood plus any penalty term) per
+    #: SGD step or per accepted L-BFGS iterate (starting point included).
     log_likelihood_history_: FittedAttribute[list[float]] = FittedAttribute()
     #: Length of ``log_likelihood_history_`` after an EM fit (EM's final
     #: synchronising E-step can make it ``max_iter + 1``); ``None`` before
-    #: fitting and after ``fit_sgd``.
+    #: fitting and after ``fit_sgd``/``fit_lbfgs``.
     n_iter_: int | None = None
+    #: L-BFGS result with projected-gradient diagnostics (``fit_lbfgs``).
+    optimizer_result_: FittedAttribute[LikelihoodOptimum] = FittedAttribute()
 
     def _build_param_spec(
         self,
@@ -566,25 +582,26 @@ class SGDFittableMixin:
     ) -> None:
         """Record a finished fit, replacing whatever an earlier fit recorded.
 
-        Every ``fit`` (EM) and ``fit_sgd`` calls this, so switching fitters
-        never leaves the previous fitter's results behind.
+        Every fitter (EM ``fit``, ``fit_sgd``, ``fit_lbfgs``) calls this, so
+        switching fitters never leaves the previous fitter's results behind.
 
         Parameters
         ----------
         log_likelihoods : list[float]
             The fit's history (``log_likelihood_history_``): per-iteration EM
-            log-likelihoods, or per-step SGD training objective (the
-            log-likelihood plus any penalty term).
+            log-likelihoods, or the training objective (the log-likelihood
+            plus any penalty term) per SGD step or accepted L-BFGS iterate.
         converged : bool
             Whether the fit met its convergence criterion (``converged_``).
         n_iter : int or None
-            EM iterations (``n_iter_``); ``None`` for SGD.
+            EM iterations (``n_iter_``); ``None`` for gradient fitters.
         log_likelihood : float or None
             Log-likelihood at the stored parameters (``log_likelihood_``).
             Defaults to the last history entry; with an empty history and no
             value, ``log_likelihood_`` is unset.
         """
         self.log_likelihood_history_ = log_likelihoods
+        del self.optimizer_result_
         self.converged_ = converged
         self.n_iter_ = n_iter
         if log_likelihood is None and log_likelihoods:
@@ -607,6 +624,7 @@ class SGDFittableMixin:
                 "converged_",
                 "log_likelihood_",
                 "log_likelihood_history_",
+                "optimizer_result_",
                 *self._fit_output_attrs,
             ),
         )
@@ -694,6 +712,149 @@ class SGDFittableMixin:
             while len(cache) > _MAX_CACHED_STEPS_PER_MODEL:
                 cache.pop(next(iter(cache)))
         return entry, cache, key
+
+    def _baked_sgd_step(
+        self,
+        step_cache: dict[Hashable, _CompiledSGDStep] | None,
+        cache_key: Hashable,
+        optimizer: Any,
+        param_spec: SGDParamSpec,
+        n_timesteps: float,
+        data_structure: _LeafStructure,
+        frozen_structure: _LeafStructure,
+        baked_leaves: tuple[list[Any], list[Any]],
+    ) -> _CompiledSGDStep:
+        """Uncached step with data baked in, for losses that need concrete data.
+
+        Evicts the cached entry that failed to trace; callers then stop using
+        the cache for this fit (the pre-cache behaviour).
+        """
+        logger.debug(
+            "%s._sgd_loss_fn needs concrete data; compiling an uncached "
+            "SGD step with the data baked in.",
+            type(self).__name__,
+        )
+        if step_cache is not None:
+            step_cache.pop(cache_key, None)
+        return _build_sgd_step(
+            lambda: self,
+            optimizer,
+            param_spec,
+            n_timesteps,
+            data_structure,
+            frozen_structure,
+            baked_leaves=baked_leaves,
+        )
+
+    def _fit_lbfgs_prepared(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        max_iter: int,
+        gradient_tolerance: float,
+        bounds: list[tuple[float | None, float | None]] | None = None,
+    ) -> LikelihoodOptimum:
+        """Optimize already prepared data using the shared transforms and cache."""
+        params, param_spec = self._build_param_spec()
+        frozen = {k: params[k] for k, spec in param_spec.items() if not spec.trainable}
+        unc = transform_to_unconstrained(
+            params, param_spec, include_non_trainable=False
+        )
+        if not unc or not _tree_all_finite(unc):
+            raise ValueError("L-BFGS needs finite learnable parameters.")
+        initial, unravel = ravel_pytree(unc)
+        n_time = float(cast(_TimeSeriesModel, self)._n_timesteps)
+        if not math.isfinite(n_time) or n_time <= 0:
+            raise ValueError("_n_timesteps must be positive and finite.")
+        data_leaves, data_structure = _split_leaves((args, kwargs))
+        frozen_leaves, frozen_structure = _split_leaves(frozen)
+        entry, step_cache, cache_key = self._compiled_sgd_step(
+            _DEFAULT_OPTIMIZER, param_spec, n_time, data_structure, frozen_structure
+        )
+
+        def evaluate(x: np.ndarray) -> tuple[float, np.ndarray]:
+            loss, gradient = entry.value_and_grad_step(
+                unravel(jnp.asarray(x)), frozen_leaves, data_leaves
+            )
+            flat_gradient, _ = ravel_pytree(gradient)
+            return float(loss), np.asarray(flat_gradient)
+
+        start = np.asarray(initial)
+        try:
+            loss0, gradient0 = evaluate(start)
+        except _DATA_TRACING_ERRORS:
+            entry = self._baked_sgd_step(
+                step_cache,
+                cache_key,
+                _DEFAULT_OPTIMIZER,
+                param_spec,
+                n_time,
+                data_structure,
+                frozen_structure,
+                (frozen_leaves, data_leaves),
+            )
+            step_cache = None
+            loss0, gradient0 = evaluate(start)
+
+        def value_and_gradient(x: np.ndarray) -> tuple[float, np.ndarray]:
+            # The optimizer's first evaluation is the start, already checked.
+            if np.array_equal(x, start):
+                return loss0, gradient0.copy()
+            return evaluate(x)
+
+        if not np.isfinite(loss0) or not np.isfinite(gradient0).all():
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError(
+                "L-BFGS initial objective/gradient is non-finite."
+            )
+        result = minimize_likelihood(
+            value_and_gradient,
+            start,
+            bounds=bounds,
+            max_iter=max_iter,
+            gradient_tolerance=gradient_tolerance,
+        )
+        if step_cache is not None and not entry.cacheable:
+            step_cache.pop(cache_key, None)
+        if not np.isfinite(result.loss):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError("L-BFGS final objective is non-finite.")
+        final = transform_to_constrained(
+            unravel(jnp.asarray(result.parameters)), param_spec, static_params=frozen
+        )
+        self._store_sgd_params(final)
+        final_ll = float(self._finalize_sgd(*args, **kwargs))
+        if not math.isfinite(final_ll):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError("L-BFGS final inference is non-finite.")
+        history = [-loss * n_time for loss in result.loss_history]
+        self._record_fit_result(
+            history, result.converged, n_iter=None, log_likelihood=final_ll
+        )
+        self.optimizer_result_ = result
+        return result
+
+    def fit_lbfgs(self, *args: Any, **kwargs: Any) -> list[float]:
+        """Fit the same full-sequence objective as SGD using L-BFGS-B.
+
+        ``max_iter`` defaults to 500 and ``gradient_tolerance`` to 1e-7 in
+        per-time-row transformed coordinates. Other arguments go through the
+        same data, parameter and final-inference hooks as ``fit_sgd``. Stores
+        projected-gradient/budget diagnostics in ``optimizer_result_``; a small
+        relative objective change alone is not reported as convergence, and a
+        fit that does not converge emits a ``StateSpaceWarning``.
+        """
+        max_iter = validate_int(kwargs.pop("max_iter", 500), "max_iter", positive=True)
+        tolerance = validate_scalar(
+            kwargs.pop("gradient_tolerance", 1e-7), "gradient_tolerance", positive=True
+        )
+        args, kwargs = self._prepare_sgd_data(*args, **kwargs)
+        result = self._fit_lbfgs_prepared(
+            args, kwargs, max_iter=max_iter, gradient_tolerance=tolerance
+        )
+        warn_if_unconverged(result, f"{type(self).__name__}.fit_lbfgs")
+        return self.log_likelihood_history_
 
     # Declared as ``(*args, **kwargs)`` so subclasses can replace the data
     # arguments with their own signature without an [override] violation.
@@ -837,25 +998,18 @@ class SGDFittableMixin:
                 if step > 0:
                     raise
                 # The loss needs concrete data while tracing (e.g. it validates
-                # its inputs on the host): bake the data in as constants for
-                # this call instead, uncached (the pre-cache behaviour).
-                logger.debug(
-                    "%s._sgd_loss_fn needs concrete data; compiling an uncached "
-                    "SGD step with the data baked in.",
-                    type(self).__name__,
-                )
-                if step_cache is not None:
-                    step_cache.pop(cache_key, None)
-                step_cache = None
-                step_entry = _build_sgd_step(
-                    lambda: self,
+                # its inputs on the host): bake the data in as constants.
+                step_entry = self._baked_sgd_step(
+                    step_cache,
+                    cache_key,
                     optimizer,
                     param_spec,
                     n_timesteps,
                     data_structure,
                     frozen_structure,
-                    baked_leaves=(frozen_dynamic, data_dynamic),
+                    (frozen_dynamic, data_dynamic),
                 )
+                step_cache = None
                 loss, new_unc_params, new_opt_state, step_finite = (
                     step_entry.train_step(
                         unc_params, opt_state, frozen_dynamic, data_dynamic

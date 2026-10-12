@@ -67,7 +67,7 @@ nonlinear sequential recursion with O(T) span and would dominate the wall clock 
 `T ~ 1e6` (measured one-pass cost on this CPU: 0.165 s at `T = 1e4, d = 2, N = 50`, i.e.
 ~17 s at `T = 1e6`), defeating the purpose; Yaghoobi et al. (2021) likewise start the
 parallel IEKS from a nominal trajectory. Both variants converge to the same unique MAP path
-for the Poisson–linear model, which is what the phase-2 comparison test asserts.
+for the Poisson–linear model, which is what the phase-2b comparison test asserts.
 
 ## Pseudo-observation sites
 
@@ -481,10 +481,14 @@ convergence (both then reach the same MAP) — the same caveat the block filter 
 
 **Filter elements** (Särkkä & García-Fernández 2021, filtering elements
 `(A_k, b_k, C_k, η_k, J_k)`; rewritten with `(G_k, g_k)` through the push-through identity
-`Q Hᵀ (H Q Hᵀ + W⁻¹)⁻¹ = (I + Q G)⁻¹ Q Hᵀ W`, so nothing is divided by `w`):
+`Q Hᵀ (H Q Hᵀ + W⁻¹)⁻¹ = (I + Q G)⁻¹ Q Hᵀ W`, so nothing is divided by `w`). The filter
+takes the prior `(m⁻, P⁻)` **of the first observed state**; a predict-first caller (this
+smoother: `x_0 ~ N(m_0, P_0)`, predict before the first update) passes
+`m⁻ = A m_0`, `P⁻ = A P_0 Aᵀ + Q`, while the joint Laplace core (phase 2a, direct first
+prior) passes `(m_0, P_0)` unchanged:
 
 ```
-k = 1:  m⁻ = A m_0,  P⁻ = A P_0 Aᵀ + Q,  P_1 = (I + P⁻ G_1)⁻¹ P⁻,  m_1 = m⁻ + P_1 (g_1 − G_1 m⁻)
+k = 1:  P_1 = (I + P⁻ G_1)⁻¹ P⁻,  m_1 = m⁻ + P_1 (g_1 − G_1 m⁻)
         A_1 = 0,  b_1 = m_1,  C_1 = P_1,  η_1 = 0,  J_1 = 0
 k ≥ 2:  M_k = (I + Q G_k)⁻¹
         A_k = M_k A,   b_k = M_k Q g_k,   C_k = M_k Q,   η_k = Aᵀ M_kᵀ g_k,   J_k = Aᵀ M_kᵀ G_k A
@@ -521,16 +525,18 @@ def _combine_filter_elements(e1: _FilterElement, e2: _FilterElement) -> _FilterE
     return _FilterElement(A, b, C, eta, J)
 
 
-def _parallel_information_filter(init_mean, init_cov, transition_matrix, process_cov,
+def _parallel_information_filter(prior_mean, prior_cov, transition_matrix, process_cov,
                                  info_matrices, info_vectors):
     """Filtered means/covariances of a linear-Gaussian model with information-form
-    observations ``(G_t, g_t)`` by associative scan (O(log T) span)."""
+    observations ``(G_t, g_t)`` by associative scan (O(log T) span).
+
+    ``prior_mean`` / ``prior_cov`` are the prior of the first observed state; a
+    predict-first caller passes ``A m_0`` and ``A P_0 Aᵀ + Q``."""
     A, Q = transition_matrix, process_cov
     d = A.shape[0]
     identity = jnp.eye(d, dtype=A.dtype)
 
-    m_pred = A @ init_mean
-    P_pred = symmetrize(A @ init_cov @ A.T + Q)
+    m_pred, P_pred = prior_mean, prior_cov
     P_1 = symmetrize(jnp.linalg.solve(identity + P_pred @ info_matrices[0], P_pred))
     m_1 = m_pred + P_1 @ (info_vectors[0] - info_matrices[0] @ m_pred)
     first = _FilterElement(jnp.zeros((d, d)), m_1, P_1, jnp.zeros(d), jnp.zeros((d, d)))
@@ -590,6 +596,95 @@ the filtered mean of the pseudo-model is not its smoothed linearisation point.
 **Block path.** `jax.lax.map` over neurons of the single-neuron parallel core (not `vmap`):
 the elements are `(n_time, nb, nb)` per neuron and `vmap` would hold all neurons' elements
 at once (see [#numerical-notes](#numerical-notes)).
+
+## Parallel pass for the joint Laplace core
+
+Phase 2a. The joint core (`laplace_smoothing.poisson_laplace_smoother`) already iterates
+adaptively (`_iterate_mode`, `lax.while_loop` with Armijo damping on gradient-stopped
+inputs) and differentiates through one exact Newton map at the converged mode. Every
+Newton target and the final moments come from one *linear pass*,
+`_linear_sites(mean0, covariance0, transition, noise, design, weight, information)`
+(`laplace_smoothing.py:64-123`): a sequential `lax.scan` information filter that conditions
+the first site directly on `N(mean0, covariance0)` (no predict), then
+`kalman.rts_backward_scan`. The parallel pass replaces only that function, so the
+iteration, line search, implicit derivative, masks, `converged` and the q=0 branch are
+unchanged.
+
+**Sites.** Each site is rank one: `log s_t(x) = u_t (z_t·x) − ½ w_t (z_t·x)²`, i.e.
+`G_t = w_t z_t z_tᵀ`, `g_t = u_t z_t`. A masked row has `w_t = u_t = 0` (zero information).
+
+```python
+def _site_log_normalizer(mean, covariance, z, w, u):
+    """log ∫ N(x; mean, covariance) exp(u z·x − ½ w (z·x)²) dx (rank-one site)."""
+    v, a = z @ covariance @ z, z @ mean
+    return -0.5 * jnp.log1p(w * v) + 0.5 * (2 * u * a - w * a * a + v * u * u) / (1 + w * v)
+
+
+def _linear_sites_parallel(mean0, covariance0, transition, noise, design, weight, information):
+    """Associative-scan :func:`_linear_sites` with identical outputs (O(log T) span)."""
+    G = weight[:, None, None] * design[:, :, None] * design[:, None, :]   # (T, d, d)
+    g = information[:, None] * design                                    # (T, d)
+    filtered_mean, filtered_cov = _parallel_information_filter(
+        mean0, covariance0, transition, noise, G, g        # direct first prior: no predict
+    )
+    predicted_mean = jnp.concatenate((mean0[None], filtered_mean[:-1] @ transition.T))
+    predicted_cov = jnp.concatenate((
+        covariance0[None],
+        symmetrize(jnp.einsum("ij,tjk,lk->til", transition, filtered_cov[:-1], transition) + noise),
+    ))
+    log_z = jax.vmap(_site_log_normalizer)(predicted_mean, predicted_cov, design, weight, information)
+    mean, covariance, cross = parallel_kalman_smoother(filtered_mean, filtered_cov, transition, noise)
+    return LinearSiteResult(mean, covariance, cross, jnp.sum(log_z))
+```
+
+`_site_log_normalizer` is lifted out of `_linear_sites.update` (`laplace_smoothing.py:76-92`;
+the `log_z` expression is `:88-91`) so both passes share one formula. The prototype used the
+rank-one Joseph form for the elements; the generic `(G, g)` filter above is required to
+match it, and the sequential pass, to rtol `1e-10` (validation slice).
+
+**Prior powers.** Both branches also run a sequential `lax.scan` over time that is not a
+linear pass: the dynamic branch's initial path `x_t = A^t m_0`
+(`laplace_smoothing.py:291-296`) and the static branch's loadings `A^t`
+(`:351-359`). The trace of the prototype attributes ~20 % of the remaining GPU kernel time
+at T=3000 to the former. Under `parallel=True` both use
+
+```python
+def _transition_powers(transition, n_time):
+    """A^0 .. A^(n_time-1), shape (n_time, d, d), by associative scan."""
+    stacked = jnp.broadcast_to(transition, (n_time - 1, *transition.shape))
+    powers = jax.lax.associative_scan(lambda earlier, later: later @ earlier, stacked)
+    identity = jnp.eye(transition.shape[0], dtype=transition.dtype)
+    return jnp.concatenate((identity[None], powers))
+```
+
+and `initial = jnp.einsum("tij,j->ti", powers, mean0)`. Under `parallel=False` the scans
+stay (a matrix-vector scan is cheaper than matrix powers on CPU).
+
+**Backend default.** One helper, used by the core and the model:
+
+```python
+def resolve_parallel(parallel: bool | None) -> bool:
+    """``None`` selects the associative-scan pass on accelerators, sequential on CPU."""
+    return jax.default_backend() != "cpu" if parallel is None else bool(parallel)
+```
+
+`poisson_laplace_smoother(..., parallel: bool | None = None)` takes it as a static argument
+and resolves it at trace time; `GraphPlaceFieldModel` stores the user's value and passes the
+*resolved* bool down, so compiled steps are keyed by what actually runs.
+
+**Neuron chunking.** Measured peak device memory for value+grad at T=70,930, rank 20, is
+11.6 GiB per neuron (parallel) vs 3.6 GiB (sequential) (overview.md#prototype-evidence).
+`_vmap_by_noise_structure` (`graph_place_field.py:1454`) gains `batch_size: int | None`;
+when set, each noise group runs `jax.lax.map(lambda args: fn(flag, *args), group_args,
+batch_size=batch_size)` (vmap within chunks, sequential across chunks) instead of
+`jax.vmap`. The model exposes it as `neuron_batch_size` and threads it into
+`_graph_forward_loss`, `_graph_profile_losses` and `_graph_posterior` as a static argument.
+
+**Rematerialisation experiment.** Wrap the two *differentiated* linear passes of the
+dynamic branch — the exact Newton map at the mode and the final Gaussian pass
+(`laplace_smoothing.py:326-333`) — in `jax.checkpoint`. Keep it only if, at T=70,930 and
+N ∈ {1, 4}, peak memory falls by ≥ 2× and value+grad time rises by ≤ 30 %; otherwise
+record the measurement and drop it.
 
 ## Position-decoder sites
 
@@ -667,7 +762,8 @@ linear pass with the transposed system) halves memory and removes the dependence
   in this plan (phase 4 reproduces `temporal_rate_gp`'s floor through its family's
   `fisher_weight`).
 - **Memory of a parallel pass** (elements `A, C, J`: `3 T d²`; `b, η`: `2 T d`; scan
-  intermediates ≈ 2×; float64):
+  intermediates ≈ 2×; float64; measured for the joint core with gradients in
+  overview.md#prototype-evidence):
   `bytes ≈ 8 · T · (3 d² + 2 d) · 3`. Examples: `d = 2, T = 1e6`: 0.4 GB; `d = 8, T = 1e6`:
   5 GB; `d = 36` (one place-field neuron), `T = 1e6`: 95 GB (infeasible → `lax.map` over
   neurons and `T ≲ 2e5` at `d = 36` on a 24 GB device). The sequential pass is

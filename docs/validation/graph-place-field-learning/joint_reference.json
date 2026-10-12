@@ -1,0 +1,227 @@
+{
+  "software": {
+    "python": "3.11.15",
+    "jax": "0.10.2",
+    "numpy": "2.4.6",
+    "scipy": "1.17.1",
+    "neurospatial": "0.8.0"
+  },
+  "protocol": {
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "rank": 3,
+    "n_time": 60,
+    "true_q": 0.03,
+    "known_nuisance": true,
+    "local_newton_iterations": 25,
+    "oracle": "Independent dense whitened innovation posterior/Hessian, SciPy trust-exact"
+  },
+  "records": [
+    {
+      "seed": 0,
+      "q": 0.0,
+      "dense_evidence": -48.54166391883607,
+      "sequential_evidence": -49.001170206382156,
+      "joint_evidence": -48.541663918836065,
+      "sequential_mode_max_sd": 0.2755275794212624,
+      "joint_mode_max_sd": 2.886330287132883e-16,
+      "joint_covariance_max_error": 2.949029909160572e-17,
+      "joint_lag_max_error": 2.949029909160572e-17,
+      "relative_newton_step": 1.1531849348791259e-13
+    },
+    {
+      "seed": 0,
+      "q": 0.0003,
+      "dense_evidence": -48.5295923582813,
+      "sequential_evidence": -48.99291722763748,
+      "joint_evidence": -48.52959235828126,
+      "sequential_mode_max_sd": 0.27533152656862125,
+      "joint_mode_max_sd": 6.178831020814049e-13,
+      "joint_covariance_max_error": 2.7125524049154137e-13,
+      "joint_lag_max_error": 2.546574062733953e-13,
+      "relative_newton_step": 3.8370997262785384e-14
+    },
+    {
+      "seed": 0,
+      "q": 0.003,
+      "dense_evidence": -48.42955527740257,
+      "sequential_evidence": -48.92438677968095,
+      "joint_evidence": -48.42955527740257,
+      "sequential_mode_max_sd": 0.27416565185257397,
+      "joint_mode_max_sd": 5.282325457317218e-13,
+      "joint_covariance_max_error": 2.536026944000014e-13,
+      "joint_lag_max_error": 2.3839263896263674e-13,
+      "relative_newton_step": 1.183315474021588e-13
+    },
+    {
+      "seed": 0,
+      "q": 0.03,
+      "dense_evidence": -47.90073138706655,
+      "sequential_evidence": -48.55413410788812,
+      "joint_evidence": -47.900731386008495,
+      "sequential_mode_max_sd": 0.26636387458941313,
+      "joint_mode_max_sd": 2.3910276734245686e-09,
+      "joint_covariance_max_error": 2.0242463261155308e-10,
+      "joint_lag_max_error": 2.0221002650089304e-10,
+      "relative_newton_step": 4.8577304388278996e-11
+    },
+    {
+      "seed": 0,
+      "q": 0.3,
+      "dense_evidence": -47.87563462644496,
+      "sequential_evidence": -48.80051131845667,
+      "joint_evidence": -47.87563462611408,
+      "sequential_mode_max_sd": 0.15840446829153693,
+      "joint_mode_max_sd": 2.815189868176672e-10,
+      "joint_covariance_max_error": 3.5997782532604106e-10,
+      "joint_lag_max_error": 3.5433522782568616e-10,
+      "relative_newton_step": 4.005495468485864e-12
+    },
+    {
+      "seed": 1,
+      "q": 0.0,
+      "dense_evidence": -56.07476584191226,
+      "sequential_evidence": -56.10243612869899,
+      "joint_evidence": -56.07476584191226,
+      "sequential_mode_max_sd": 0.05566654247233899,
+      "joint_mode_max_sd": 2.982349170992876e-16,
+      "joint_covariance_max_error": 1.1102230246251565e-16,
+      "joint_lag_max_error": 1.1102230246251565e-16,
+      "relative_newton_step": 8.063546409931367e-11
+    },
+    {
+      "seed": 1,
+      "q": 0.0003,
+      "dense_evidence": -56.08611983670255,
+      "sequential_evidence": -56.113643698046985,
+      "joint_evidence": -56.086119836702565,
+      "sequential_mode_max_sd": 0.0558382592954262,
+      "joint_mode_max_sd": 2.1203476710178965e-13,
+      "joint_covariance_max_error": 2.817468480742491e-13,
+      "joint_lag_max_error": 2.6556534749033744e-13,
+      "relative_newton_step": 1.5065433399613248e-11
+    },
+    {
+      "seed": 1,
+      "q": 0.003,
+      "dense_evidence": -56.18476216459417,
+      "sequential_evidence": -56.21110815909979,
+      "joint_evidence": -56.184762164594176,
+      "sequential_mode_max_sd": 0.05772595813107654,
+      "joint_mode_max_sd": 1.7469951964119225e-13,
+      "joint_covariance_max_error": 2.5729418595688003e-13,
+      "joint_lag_max_error": 2.4177881918774347e-13,
+      "relative_newton_step": 2.1029838035108932e-11
+    },
+    {
+      "seed": 1,
+      "q": 0.03,
+      "dense_evidence": -56.943457969343655,
+      "sequential_evidence": -56.967298317750476,
+      "joint_evidence": -56.94345796934367,
+      "sequential_mode_max_sd": 0.08870573174471323,
+      "joint_mode_max_sd": 1.0169946735052783e-13,
+      "joint_covariance_max_error": 1.4210854715202004e-13,
+      "joint_lag_max_error": 1.3367085216486885e-13,
+      "relative_newton_step": 1.2955709203527775e-10
+    },
+    {
+      "seed": 1,
+      "q": 0.3,
+      "dense_evidence": -59.93580149993106,
+      "sequential_evidence": -59.970932705931524,
+      "joint_evidence": -59.93580149987579,
+      "sequential_mode_max_sd": 0.24192408228884676,
+      "joint_mode_max_sd": 5.1893899004289736e-11,
+      "joint_covariance_max_error": 1.7140067143373017e-11,
+      "joint_lag_max_error": 1.6482815112794924e-11,
+      "relative_newton_step": 3.2187090921731094e-15
+    },
+    {
+      "seed": 2,
+      "q": 0.0,
+      "dense_evidence": -41.78983504902534,
+      "sequential_evidence": -41.99277019771244,
+      "joint_evidence": -41.78983504902534,
+      "sequential_mode_max_sd": 0.10100116260716224,
+      "joint_mode_max_sd": 2.4451199548299664e-16,
+      "joint_covariance_max_error": 5.204170427930421e-17,
+      "joint_lag_max_error": 5.204170427930421e-17,
+      "relative_newton_step": 1.0805080996553979e-10
+    },
+    {
+      "seed": 2,
+      "q": 0.0003,
+      "dense_evidence": -41.78443684622141,
+      "sequential_evidence": -41.98768254820216,
+      "joint_evidence": -41.78443684622142,
+      "sequential_mode_max_sd": 0.10037225917656172,
+      "joint_mode_max_sd": 6.663151923669052e-13,
+      "joint_covariance_max_error": 2.6376123507532157e-13,
+      "joint_lag_max_error": 2.479683125500287e-13,
+      "relative_newton_step": 4.4793926666711677e-11
+    },
+    {
+      "seed": 2,
+      "q": 0.003,
+      "dense_evidence": -41.742027047582624,
+      "sequential_evidence": -41.94809547080796,
+      "joint_evidence": -41.742027047582646,
+      "sequential_mode_max_sd": 0.0959900589844519,
+      "joint_mode_max_sd": 5.781979157970955e-13,
+      "joint_covariance_max_error": 2.464140003155535e-13,
+      "joint_lag_max_error": 2.309819002732638e-13,
+      "relative_newton_step": 9.591054126694499e-11
+    },
+    {
+      "seed": 2,
+      "q": 0.03,
+      "dense_evidence": -41.625307460343095,
+      "sequential_evidence": -41.85549726462799,
+      "joint_evidence": -41.625307454212916,
+      "sequential_mode_max_sd": 0.10225168281003805,
+      "joint_mode_max_sd": 1.4029231525608331e-08,
+      "joint_covariance_max_error": 1.5830387001258828e-09,
+      "joint_lag_max_error": 1.5815955212161725e-09,
+      "relative_newton_step": 3.913031272441594e-09
+    },
+    {
+      "seed": 2,
+      "q": 0.3,
+      "dense_evidence": -42.66013798663051,
+      "sequential_evidence": -42.96110820622713,
+      "joint_evidence": -42.66013798663025,
+      "sequential_mode_max_sd": 0.23224263169622733,
+      "joint_mode_max_sd": 2.327077540033991e-13,
+      "joint_covariance_max_error": 4.4275694222051243e-13,
+      "joint_lag_max_error": 4.014566457044566e-13,
+      "relative_newton_step": 4.811889997956435e-14
+    }
+  ],
+  "static_order_counterexample": [
+    {
+      "counts": [
+        8.0,
+        0.0
+      ],
+      "sequential_evidence": -14.57267112284935,
+      "joint_evidence": -14.33131734146248
+    },
+    {
+      "counts": [
+        0.0,
+        8.0
+      ],
+      "sequential_evidence": -12.20911843891618,
+      "joint_evidence": -14.33131734146248
+    }
+  ],
+  "summary": {
+    "max_joint_evidence_error": 6.130179031060834e-09,
+    "max_joint_mode_error_sd": 1.4029231525608331e-08,
+    "max_sequential_evidence_error": 0.9248766920117077
+  }
+}

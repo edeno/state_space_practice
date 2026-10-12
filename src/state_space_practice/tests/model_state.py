@@ -11,7 +11,9 @@ import dataclasses
 from typing import Any
 
 import jax
+import networkx as nx
 import numpy as np
+import scipy.sparse as sp
 
 
 def _snapshot(value: Any) -> Any:
@@ -22,12 +24,24 @@ def _snapshot(value: Any) -> Any:
         return ("prng_key", np.array(jax.random.key_data(value)))
     if isinstance(value, (jax.Array, np.ndarray)):
         return np.array(value)
+    if sp.issparse(value):
+        return (type(value), value.toarray())
+    if isinstance(value, nx.Graph):
+        return (
+            type(value),
+            _snapshot(value.graph),
+            _snapshot(dict(value.nodes(data=True))),
+            _snapshot(nx.to_dict_of_dicts(value)),
+        )
+    if type(value).__module__.startswith("neurospatial.layout"):
+        return (type(value), _snapshot(vars(value)))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return (
             type(value),
             {
                 f.name: _snapshot(getattr(value, f.name))
                 for f in dataclasses.fields(value)
+                if hasattr(value, f.name)
             },
         )
     if isinstance(value, tuple) and hasattr(value, "_fields"):  # NamedTuple

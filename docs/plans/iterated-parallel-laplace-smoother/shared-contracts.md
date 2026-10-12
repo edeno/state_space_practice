@@ -10,6 +10,8 @@ weaken them.
 - [Pseudo-observation site contract](#pseudo-observation-site-contract)
 - [Gauss–Newton core interface](#gauss-newton-core-interface)
 - [Linear-pass interface](#linear-pass-interface)
+- [Parallel information filter interface](#parallel-information-filter-interface)
+- [Joint-core `parallel` keyword](#joint-core-parallel-keyword)
 - [Warning contract](#warning-contract)
 
 ## Public keywords
@@ -21,7 +23,7 @@ and `position_decoder_smoother` (`position_decoder.py`); mirrored as constructor
 ```python
 *,
 n_iterations: int = 1,          # phase 1 (phase 3 for the decoder)
-parallel: bool = False,         # phase 2 (phase 3 for the decoder)
+parallel: bool = False,         # phase 2b (phase 3 for the decoder); see Open Question 7
 convergence_tol: float = 1e-6,  # phase 1
 return_diagnostics: bool = False,  # phase 1
 ```
@@ -206,9 +208,52 @@ def _linearised_smoother_pass(
 ```
 
 `parallel=False` (phase 1): information-form forward `lax.scan` +
-`kalman.rts_backward_scan`. `parallel=True` (phase 2): `kalman._parallel_information_filter`
-+ `kalman.parallel_kalman_smoother` + vectorised evidence terms. Both branches must agree to
-rtol 1e-9 on the same `(problem, path)`; that agreement is a phase-2 test.
+`kalman.rts_backward_scan`. `parallel=True` (phase 2b): `kalman._parallel_information_filter`
+(delivered by phase 2a) + `kalman.parallel_kalman_smoother` + vectorised evidence terms. Both
+branches must agree to rtol 1e-9 on the same `(problem, path)`; that agreement is a
+phase-2b test.
+
+## Parallel information filter interface
+
+Defined in phase 2a; reused unchanged by phase 2b.
+
+```python
+def _parallel_information_filter(
+    prior_mean: Array,         # (d,)    prior of the FIRST observed state
+    prior_cov: Array,          # (d, d)
+    transition_matrix: Array,  # (d, d)
+    process_cov: Array,        # (d, d)  PSD; singular allowed
+    info_matrices: Array,      # (n_time, d, d)  G_t, PSD; zero = no observation
+    info_vectors: Array,       # (n_time, d)     g_t
+) -> tuple[Array, Array]:      # filtered_mean (n_time, d), filtered_cov (n_time, d, d)
+```
+
+Lives in `kalman.py` next to `parallel_kalman_smoother`; jittable, no host checks. Semantics
+(do not weaken): the first site conditions `N(prior_mean, prior_cov)` directly — a
+predict-first caller passes `A m_0`, `A P_0 Aᵀ + Q`. A zero `(G_t, g_t)` is a pure
+prediction step. Matches the sequential information-form recursion to rtol `1e-10`.
+
+## Joint-core `parallel` keyword
+
+Phase 2a, on `laplace_smoothing.poisson_laplace_smoother` (static argument) and as a
+`GraphPlaceFieldModel` constructor argument (stored attribute):
+
+```python
+parallel: bool | None = None
+```
+
+- `None` resolves through `laplace_smoothing.resolve_parallel`: `True` when
+  `jax.default_backend() != "cpu"`, else `False`. Explicit `True` / `False` are honoured on
+  any backend.
+- Both values run the same adaptive iteration and implicit derivative and converge to the
+  same mode; outputs agree to rtol `1e-9` (evidence rtol `1e-10`). Only the linear pass and
+  the prior-power computation change.
+- The model passes the *resolved* bool to every compiled function, so compiled steps are
+  keyed by the path that actually runs.
+
+This keyword is separate from the point-process `parallel` above: there `parallel=True`
+also changes the iteration's start and `n_iterations` semantics, so a backend-dependent
+default would break that smoother's bit-identical default on GPU.
 
 ## Warning contract
 

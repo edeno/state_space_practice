@@ -1,0 +1,22 @@
+{
+ "parallel": false,
+ "n_time": 12000,
+ "n_neurons": 8,
+ "rank": 20,
+ "seed": 0,
+ "backend": "cpu",
+ "device_kind": "cpu",
+ "jax_version": "0.10.2",
+ "host": "breeze.cin.ucsf.edu",
+ "value": {
+  "compile_and_first_s": 18.227035562507808,
+  "min_s": 15.316662746481597,
+  "median_s": 15.635373043827713
+ },
+ "value_and_grad": {
+  "compile_and_first_s": 44.03550490923226,
+  "min_s": 39.71579458285123,
+  "median_s": 40.33642702549696
+ },
+ "peak_bytes_in_use": null
+}

@@ -1,0 +1,1 @@
+{"store_covariances": false, "neuron_batch_size": 2, "n_neurons": 107, "n_time": 70931, "ok": false, "seconds": 3727.979380974546, "error": "JaxRuntimeError: INTERNAL: Failed to complete all kernels launched on stream 0x5644a5d2aad0: CUDA error: Could not synchronize CUDA stream: CUDA_ERROR_MISALIGNED_ADDRESS: misali", "peak_device_gib": 3.681217670440674}

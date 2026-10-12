@@ -59,7 +59,7 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 #
 # Explicit ``@pytest.mark.slow`` keeps working as before.
 
-_FIT_METHODS = frozenset({"fit", "fit_sgd"})
+_FIT_METHODS = frozenset({"fit", "fit_sgd", "fit_em", "fit_mle", "fit_lbfgs"})
 _FIT_FUNCTIONS = frozenset({"run_em"})
 
 # Node-id substrings (``file.py::Class`` or ``file.py::Class::test``) for tests

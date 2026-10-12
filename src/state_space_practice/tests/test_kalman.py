@@ -21,6 +21,7 @@ from state_space_practice.kalman import (
     InitialStatePrior,
     _gain_solve,
     _kalman_smoother_update,
+    _parallel_information_filter,
     _scan_with_boundary,
     joseph_form_update,
     kalman_filter,
@@ -45,6 +46,7 @@ from state_space_practice.tests.conftest import (
     to_jax,
 )
 from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
+from state_space_practice.tests.oracles import random_spd_matrix, random_stable_matrix
 
 # The x_1-prior M-step (initial_state_prior=None) is deprecated; tests of its
 # formulas assert the deprecation warning.
@@ -2964,3 +2966,92 @@ class TestKalmanTraceability:
             out = jax.jit(lambda P: kalman_filter(m0, P, obs, A, Q, H, R)[2])(P0)
             jax.block_until_ready(out)
             jax.effects_barrier()
+
+
+def _information_filter_reference(
+    prior_mean: np.ndarray,
+    prior_cov: np.ndarray,
+    transition: np.ndarray,
+    process_cov: np.ndarray,
+    info_matrices: np.ndarray,
+    info_vectors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sequential information update; the first site conditions the prior directly."""
+    means, covs = [], []
+    mean, cov = prior_mean, prior_cov
+    identity = np.eye(prior_mean.size)
+    for t, (G, g) in enumerate(zip(info_matrices, info_vectors, strict=True)):
+        if t:
+            mean, cov = transition @ mean, transition @ cov @ transition.T + process_cov
+        cov = np.linalg.solve(identity + cov @ G, cov)
+        cov = 0.5 * (cov + cov.T)
+        mean = mean + cov @ (g - G @ mean)
+        means.append(mean)
+        covs.append(cov)
+    return np.asarray(means), np.asarray(covs)
+
+
+def _information_sites(
+    rng: np.random.Generator, n_time: int, d: int, kind: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Information sites (G_t, g_t) of the requested rank; every third row is empty."""
+    if kind == "full":
+        G = np.stack([random_spd_matrix(rng, d, scale=0.5) for _ in range(n_time)])
+    else:
+        z = rng.normal(size=(n_time, d))
+        w = rng.uniform(0.1, 3.0, n_time)
+        G = w[:, None, None] * z[:, :, None] * z[:, None, :]
+    g = rng.normal(size=(n_time, d))
+    empty = np.arange(n_time) % 3 == 2
+    G[empty], g[empty] = 0.0, 0.0
+    return G, g
+
+
+@pytest.mark.parametrize("n_time", [1, 2, 7, 64])
+@pytest.mark.parametrize("kind", ["full", "rank_one"])
+@pytest.mark.parametrize("noise", ["positive_definite", "rank_deficient", "zero"])
+def test_parallel_information_filter_matches_sequential_recursion(n_time, kind, noise):
+    rng = np.random.default_rng(n_time)
+    d = 3
+    A = random_stable_matrix(rng, d)
+    Q = random_spd_matrix(rng, d, scale=0.1)
+    if noise == "rank_deficient":
+        direction = rng.normal(size=d)
+        Q = 0.1 * np.outer(direction, direction)  # singular: rank one
+    elif noise == "zero":
+        Q = np.zeros((d, d))
+    m0, P0 = rng.normal(size=d), random_spd_matrix(rng, d)
+    G, g = _information_sites(rng, n_time, d, kind)
+    expected_mean, expected_cov = _information_filter_reference(m0, P0, A, Q, G, g)
+    mean, cov = _parallel_information_filter(
+        jnp.asarray(m0),
+        jnp.asarray(P0),
+        jnp.asarray(A),
+        jnp.asarray(Q),
+        jnp.asarray(G),
+        jnp.asarray(g),
+    )
+    np.testing.assert_allclose(mean, expected_mean, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(cov, expected_cov, rtol=1e-10, atol=1e-12)
+
+
+def test_parallel_information_filter_zero_information_is_prediction():
+    rng = np.random.default_rng(3)
+    d, n_time = 3, 9
+    A = random_stable_matrix(rng, d)
+    Q = random_spd_matrix(rng, d, scale=0.1)
+    m0, P0 = rng.normal(size=d), random_spd_matrix(rng, d)
+    mean, cov = _parallel_information_filter(
+        jnp.asarray(m0),
+        jnp.asarray(P0),
+        jnp.asarray(A),
+        jnp.asarray(Q),
+        jnp.zeros((n_time, d, d)),
+        jnp.zeros((n_time, d)),
+    )
+    expected_mean, expected_cov = [m0], [P0]
+    for _ in range(n_time - 1):
+        expected_mean.append(A @ expected_mean[-1])
+        expected_cov.append(A @ expected_cov[-1] @ A.T + Q)
+    np.testing.assert_allclose(mean, np.asarray(expected_mean), rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(cov, np.asarray(expected_cov), rtol=1e-12, atol=1e-14)

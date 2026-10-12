@@ -1,14 +1,16 @@
-# Phase 2 — `parallel=True`: every pass through associative scans (parallel information filter + parallel RTS), with baseline capture and comparison
+# Phase 2b — `parallel=True` on the point-process smoother: every pass through associative scans (parallel information filter + parallel RTS), with baseline capture and comparison
+
+Depends on phase 1 (the sequential iterated core) and phase 2a (`kalman._parallel_information_filter`). Before executing, settle overview.md Open Question 6: phase 1 may be rebuilt on the joint Laplace core, which would change this phase's integration points.
 
 [← back to PLAN.md](PLAN.md) · [overview](overview.md) · [designs](designs.md#parallel-in-time-pass)
 
 **Inputs to read first:**
 
-- [src/state_space_practice/kalman.py:1047-1216](../../../src/state_space_practice/kalman.py) — `_SmootherElement` and `parallel_kalman_smoother`: element construction (`:1168-1178`), terminal element and concatenation (`:1180-1192`), the vmapped associative operator (`:1196-1205`), cross-covariances (`:1210-1214`). The new filter follows the same conventions and this smoother is reused verbatim.
-- [src/state_space_practice/kalman.py:270-423](../../../src/state_space_practice/kalman.py) — `_validate_kalman_public_inputs` (constant `H` at `:315`, time-varying `R` at `:330-345`): the validation the public `parallel_kalman_filter` wrapper extends to a time-varying `H`.
-- [src/state_space_practice/kalman.py:426-475, 613-711](../../../src/state_space_practice/kalman.py) — `kalman_measurement_update`, `kalman_filter`: the sequential references the parallel filter is tested against.
+- [src/state_space_practice/kalman.py:1192-1386](../../../src/state_space_practice/kalman.py) — `_SmootherElement`, `parallel_kalman_smoother` (`:1217`) and its jitted impl (`:1315`): reused verbatim. `_parallel_information_filter` (added by phase 2a, after `:1386`) is reused unchanged.
+- [src/state_space_practice/kalman.py:280-450](../../../src/state_space_practice/kalman.py) — `_prepare_kalman_inputs` (constant `H` shape at `:341`, time-varying `R` around `:369`): the validation the public `parallel_kalman_filter` wrapper extends to a time-varying `H`.
+- [src/state_space_practice/kalman.py:452-510, 650-750](../../../src/state_space_practice/kalman.py) — `kalman_measurement_update`, `kalman_filter`: the sequential references the parallel filter is tested against.
 - Phase-1 code: `_linearised_smoother_pass`, `_LinearisationProblem`, `_iterated_laplace_smoother_core`, the block-path wiring, and `stochastic_point_process_smoother`'s new keyword block.
-- [src/state_space_practice/utils.py:114-183](../../../src/state_space_practice/utils.py) — `psd_cholesky` / `psd_logdet` accept batches (needed for the vectorised evidence).
+- [src/state_space_practice/utils.py:152-223](../../../src/state_space_practice/utils.py) — `psd_cholesky` (`:152`) / `psd_logdet` (`:201`) accept batches (needed for the vectorised evidence).
 - [docs/plans/2026-04-11-square-root-filter-investigation.md](../2026-04-11-square-root-filter-investigation.md) — numerics context only: the f32 failure modes of the information-form recursion; the parallel pass inherits the float64 requirement.
 - `scripts/` (exists; `README.md:72` formats it) — home of the benchmark script.
 
@@ -16,6 +18,7 @@
 
 - [Public keywords and return layout](shared-contracts.md#public-keywords) — `parallel`; the nominal-trajectory initialisation; `return_filtered` semantics under `parallel=True`.
 - [Linear-pass interface](shared-contracts.md#linear-pass-interface) — the `parallel=True` branch must match the sequential branch to rtol `1e-9` on the same `(problem, path)`.
+- [Parallel information filter interface](shared-contracts.md#parallel-information-filter-interface) — delivered by phase 2a; do not fork it.
 - [`IteratedSmootherDiagnostics`](shared-contracts.md#iterated-smoother-diagnostics) — `log_posterior` has `n_iterations + 1` entries under `parallel=True`.
 
 **Designs referenced:** [designs.md#iteration-semantics](designs.md#iteration-semantics), [#parallel-in-time-pass](designs.md#parallel-in-time-pass), [#numerical-notes](designs.md#numerical-notes) (memory formula).
@@ -24,7 +27,7 @@
 
 - **Baseline capture (before any code change).** Add `scripts/benchmarks/iterated_smoother_benchmark.py` (argparse: `--mode {sequential,parallel}`, `--n-time`, `--n-state`, `--n-neurons 50`, `--n-iterations 6`, `--seed 0`, `--out <json>`, `--save-outputs <npz>`). It simulates an AR(1) latent (`A = 0.98 I`, `Q = 0.01 I`, `m_0 = 0`, `P_0 = I`) with 50 affine Poisson neurons (`baseline log 20 Hz`, weights `N(0, 0.5²)`, `dt = 2 ms`) via `_affine_log_rate`-style design, runs `stochastic_point_process_smoother(..., n_iterations=6, return_diagnostics=True)` twice (first call compiles), and records per run: wall time of the second call (`time.perf_counter`, `jax.block_until_ready`), peak RSS (`resource.getrusage(RUSAGE_SELF).ru_maxrss`), device peak bytes when `jax.devices()[0].memory_stats()` is available (GPU), `converged`, `n_iterations`, device kind, `jax.__version__`, hostname. Run the grid `T ∈ {1e4, 1e5, 1e6} × n_state ∈ {2, 8}` with `--mode sequential` on CPU (and GPU if `jax.devices()` shows one), save JSON to `docs/plans/iterated-parallel-laplace-smoother/benchmarks/baseline-<device>-<host>.json` and outputs (`smoother_mean`, `marginal_log_likelihood`, `smoother_cov` diagonal) to `.npz` next to it. Smoke-test `T = 1e4` first and extrapolate (measured here: 0.165 s / 0.213 s per one-pass smoother at `T = 1e4`, `d = 2 / 8`, so the 6-pass sequential run at `T = 1e6` is ~2–3 min on CPU; abort the `1e6` point if the `1e5` point exceeds 60 s). Commit the JSON/NPZ files (they are small) before touching source.
 
-- **Information-form parallel filter in `kalman.py`.** Add `_FilterElement`, `_combine_filter_elements`, `_parallel_information_filter(init_mean, init_cov, transition_matrix, process_cov, info_matrices, info_vectors)` exactly as in [designs.md#parallel-in-time-pass](designs.md#parallel-in-time-pass), after `parallel_kalman_smoother`. Validate shapes only (`info_matrices` `(n_time, d, d)`, `info_vectors` `(n_time, d)`), no host-side value checks (it is called from jitted code).
+- **Information-form parallel filter.** Reuse `kalman._parallel_information_filter` from phase 2a unchanged ([interface](shared-contracts.md#parallel-information-filter-interface)). This smoother predicts before its first update, so every call passes `prior_mean = A @ init_mean` and `prior_cov = symmetrize(A @ init_cov @ A.T + Q)`.
 
 - **Public `parallel_kalman_filter` wrapper in `kalman.py`.** Signature
   `parallel_kalman_filter(init_mean, init_cov, obs, transition_matrix, process_cov, measurement_matrix, measurement_cov, validate_inputs=True) -> (filtered_mean, filtered_cov, marginal_log_likelihood)`;
@@ -60,7 +63,6 @@
 | `test_parallel_kalman_filter_matches_sequential_filter` (`tests/test_kalman.py`, random LGSSM from `kalman_model_params` in `conftest.py:369`, constant `H`, `R`) | `filtered_mean`, `filtered_cov`, `marginal_log_likelihood` match `kalman_filter` to rtol `1e-10`; T ∈ {1, 2, 7, 64} (odd lengths and `T=1` exercise the scan edges). |
 | `test_parallel_kalman_filter_time_varying_measurement_matches_step_loop` | With `H_t`, `R_t` varying over time, matches a Python loop of prediction + `kalman_measurement_update` to rtol `1e-10`. |
 | `test_parallel_kalman_filter_rejects_bad_shapes` | `ValueError` for `H` of shape `(n_time - 1, n_obs, d)` and for non-PD `R_t`; `kalman_filter` still rejects a 3-D `H` (default keyword). |
-| `test_information_filter_zero_information_is_pure_prediction` | With `G = g = 0` the filtered moments equal the prior propagation `m_t = A^t m_0`, `P_t = A P_{t-1} Aᵀ + Q` (rtol `1e-12`) — the masked-bin composition rule. |
 | `test_parallel_pass_matches_sequential_pass` (`_linearised_smoother_pass` both branches on the phase-1 `iterated_problem` at its one-pass path) | All `_LinearPassOutput` fields agree to rtol `1e-9` (evidence rtol `1e-10`). |
 | `test_parallel_and_sequential_smoothers_converge_to_same_map` (`n_iterations=15` both) | Means rtol `1e-7`, covariances and cross-covariances rtol `1e-7`, evidence rtol `1e-8`; both `converged`; guard: at `n_iterations=1` the two differ by > 1e-3 (the parallel start is the nominal trajectory). |
 | `test_parallel_block_path_matches_dense` (block problem, `parallel=True`, `n_iterations=8`) | Means rtol `1e-9`, block covariances (`to_dense`) rtol `1e-9`; guard `all(step_sizes == 1)`. |
