@@ -226,6 +226,15 @@ inference remains a separate resource/approximation decision.
 
 ## Synthetic validation and scientific exit gates
 
+Use and extend the [simulation workstream](simulation-and-validation.md) established
+in phase 1. Its generator/observation/truth separation, independent model-mismatch
+scenarios, final evaluation ensemble and metric/replication rules are authoritative.
+Report performance surfaces and unresolved regions across sampling, mechanism strength,
+geometry and resources, not only successful example segmentations. The benchmark
+includes available competing models with comparable tuning budgets; missing ones stay
+explicit. Freeze decisions on validation simulations before final synthetic/biological
+evaluation, and count numerical failures/timeouts in the report.
+
 Use a fixed multi-seed suite with static fields, smooth drift without recurrence,
 abrupt A–B–A returns, changing map occupancy, and a mixed switching-plus-drift case.
 Add behavioral gain changes, tracking gaps, unit dropout and registration errors.

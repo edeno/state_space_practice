@@ -124,6 +124,13 @@ reference; conditional neuron independence does not justify discarding them sile
 
 ## Workload ladder and acceptance evidence
 
+The [shared simulation workstream](simulation-and-validation.md) supplies controlled
+mechanisms, trajectories, masks and evaluator-only truth for this ladder. Its recovery,
+calibration and failure metrics accompany scale measurements. Generate chunks with
+preserved stochastic state and deterministic random-stream indexing; changing batch
+size must not change the synthetic experiment. Avoid a dense truth-rate tensor and
+record simulation cost separately from model inference/fitting.
+
 The following are **proposed benchmarks**, not descriptions of an available dataset.
 Use 20 ms bins as one declared setting and a smaller-bin sensitivity case. Report
 recorded hours separately from calendar span. Spatial nodes G and design dimension B

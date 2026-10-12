@@ -271,6 +271,14 @@ does not by itself establish identifiability.
 
 ## Metrics
 
+The [simulation workstream](simulation-and-validation.md) is the shared evaluation
+design from phase 1 onward. Separate numerical correctness, recovery/calibration and
+robustness outside the fitted family. The controlled examples below are regression
+fixtures; scientific performance requires repeated independent simulations, untouched
+evaluation seeds/regimes, uncertainty on error rates, and explicit failure/ambiguity
+reports. The first harness runs stable-coverage, A–B–A, drift and local-change scenarios
+in complex geometry and grows with the model and the 24 GB/A100 workload ladder.
+
 - **Exactness:** `hmm_forward_backward` and `hmm_filter` match path enumeration to
   `rtol 1e-10` (smoothed, pairwise, filtered, log-likelihood), for constant and stacked
   transitions; pairwise marginalisation identities hold to `1e-12`.
@@ -280,9 +288,11 @@ does not by itself establish identifiability.
 - **EM:** `log_likelihood_history_` non-decreasing (tolerance `1e-8` relative);
   final unpenalised `log_likelihood_` above the one-iteration fit.
 - **Recovery (simulated two-map session, full remap):** Viterbi accuracy ≥ 0.95 after
-  optimal relabelling; per-map rate-map correlation with truth ≥ 0.9; segmentation
-  accuracy non-increasing as `map_separation` shrinks (1.0 → 0.5 → 0.2), with the last at
-  least 0.1 below the first.
+  optimal relabelling and per-map rate-map correlation with truth ≥ 0.9 on the declared
+  high-signal fixture. Across independent replicates, report recovery versus map
+  separation with uncertainty and amplitude-sensitive rate error; do not require
+  monotonic accuracy for every seed. At identical emissions, inference must reduce
+  to the map prior dynamics rather than extracting map evidence from spikes.
 - **Model selection:** BIC minimum and held-out-likelihood maximum both at the true K = 2
   over `{1, 2, 3}`, with the guard `LL(K=2) − LL(K=1) > 2 × (per-map parameter count) × log(n_time)`.
 - **Invariances:** map relabelling, neuron relabelling and an invertible basis change

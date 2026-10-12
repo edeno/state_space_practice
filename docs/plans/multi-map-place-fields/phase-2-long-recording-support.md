@@ -111,6 +111,13 @@ new model accept masked or batched inputs. Its phase 5 is needed separately for 
 
 ## Validation and exit gates
 
+Extend the [shared simulation harness](simulation-and-validation.md) with controlled
+dropout, unit-identity errors/overlap, gaps and independent visits. Generate the
+population/chronic workload in deterministic chunks, retaining compact evaluator-only
+truth. Verify simulator chunk/restart parity separately from inference parity, and
+report generation cost separately from fitting. Large runs supplement the independent
+small-replicate recovery/calibration ensemble rather than replacing it.
+
 | Check | Required evidence |
 | --- | --- |
 | Masked exact oracle | Tiny HMM path enumeration with neuron dropout, a fully missing interior bin, and NaN placeholders matches posteriors and observed-data likelihood to `rtol=1e-10`. Changing masked count values has no effect. |

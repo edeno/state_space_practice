@@ -83,6 +83,11 @@ limitation even when the fitted total rate is well supported.
 
 ## Validation and exit gates
 
+Extend the [shared simulation harness](simulation-and-validation.md) with stable
+directional tuning, unequal direction/route sampling and late first traversals.
+Reuse its truth separation, independent evaluation replicates and uncertainty on
+false-map rates; these controls become inputs to phase 3's learning comparison.
+
 | Check | Required evidence |
 | --- | --- |
 | Algebra and parity | Augmented predictions match the explicit shared-plus-contrast formula; fixed `u=0` reproduces the spatial-only likelihood/posteriors. K=1 matches an independent penalised GLM with the same design/penalty. |

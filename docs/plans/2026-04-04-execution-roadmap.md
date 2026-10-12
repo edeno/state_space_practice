@@ -153,6 +153,12 @@ phase 3 validates local direction, spatial resolution and matched scalable compa
 Record fixed-K capacity separately from Bayesian/hybrid prototype capacity. General
 Laplace parallelism can support drift comparisons but does not replace these HMM/data
 requirements. Day/hour and host/turnaround budgets remain provisional.
+The [simulation workstream](multi-map-place-fields/simulation-and-validation.md)
+starts alongside E7's first inference primitives and grows through every phase.
+It supplies independent numerical references, recovery/calibration ensembles and
+mechanism/sampling/noise failures on complex geometry, then streamed population/chronic
+workloads. Freeze evaluation seeds/regimes and measure false claims, missed effects
+and unresolved cases as well as runtime before interpreting biological results.
 For learning/barrier questions, add the
 [sampling and intervention benchmark](multi-map-place-fields/sampling-and-barriers.md):
 phase 2 supplies exposure/support diagnostics; phase 3 separates shared-support

@@ -46,6 +46,14 @@ pass the [sampling/uncertainty gate](sampling-and-barriers.md#field-uncertainty-
 
 ## Tasks
 
+- **Start the shared simulation/evaluation harness with the model core.** Follow
+  [simulation and validation](simulation-and-validation.md), including its first
+  branching/looping environment and stable-coverage, A–B–A, drift and local-change
+  scenarios. Keep truth separate from fit inputs and save a common report with
+  available comparators and explicit pending ones. Extend this harness as later
+  phases land; do not wait until the final scientific comparison to build it.
+  Numerical oracles and the simple two-map simulator below remain smaller fixtures.
+
 - **Capture the simulator baseline before touching `simulate_data.py`.** Run
   `simulate_2d_moving_place_field(total_time=30.0, dt=0.020, arena_size=80.0, peak_rate=25.0, background_rate=1.0, n_interior_knots=3, rng=np.random.default_rng(42))`
   (the `sim_data` fixture arguments, `tests/test_place_field_model.py:84-95`) and the
@@ -219,14 +227,14 @@ comparisons to phase 3. Profile phase 1 before choosing the large-data interface
 | `::test_smoothed_map_posterior_is_calibrated_at_true_parameters` | 20 simulated sessions (60 s, 6 neurons), `from_parameters(true W, Z, pi).predict_map_posterior`: per decile of `smoothed[:, 1]` with ≥ 200 samples, `\|freq(s_t = 1) - mean posterior\| < 0.05`; power guard: the renormalised cube of the posterior fails the same check |
 | `::test_k1_reduces_to_stationary_glm` (slow) | static single neuron from `simulate_2d_moving_place_field(drift_speed=0.0)`, `n_maps=1`, `penalty=1.0`, `max_newton_iter=15`, `max_iter=3`: `weights_[0, :, 0]` within `rtol=1e-6` of `PlaceFieldModel._fit_stationary_glm(Z, y, prior_precision=1.0)` (set `n_basis_per_neuron` first) and within `1e-4` of scipy L-BFGS-B; `log_likelihood_` equals `poisson.logpmf` sum (`1e-12`); `smoothed_map_prob_` all ones; `switch_probability_` all zeros; `viterbi_path()` all zeros; `n_free_params == n_basis` |
 | `::test_two_map_recovery` (slow, `fitted_two_map`) | Viterbi accuracy after `find_permutation` ≥ 0.95; per-map rate map on a 20×20 grid (`predict_rate_map(evaluate_basis(grid, basis_info))`) vs `gaussian_place_field_rate(grid, centers[:, :, k])` correlation ≥ 0.9 for every neuron with in-arena centre; `transition_matrix_` diagonal within 0.02 of truth; `smoothed_map_prob_.sum(0)` non-increasing (label convention) |
-| `::test_segmentation_degrades_gracefully_as_maps_converge` (slow) | `map_separation ∈ (1.0, 0.5, 0.2)`, same seed: accuracies non-increasing (tolerance 0.02); guards `acc[0] ≥ 0.95` and `acc[-1] ≤ acc[0] - 0.1` |
+| `::test_identical_map_emissions_recover_prior_dynamics` | With identical per-map fields and fixed transitions, spike observations provide no map discrimination: posterior matches the prior-chain reference. Distinct fields give informative posteriors in a separate high-signal fixture. Recovery versus separation is evaluated over independent replicates in the simulation runner, not by requiring monotonic accuracy for one seed. |
 | `::test_em_objective_monotone_and_ll_improves` (slow) | `assert_ll_monotonic(log_likelihood_history_, tol=1e-8 * \|LL\|)`; `converged_` is a bool; `log_likelihood_` of a 30-iteration fit `>` that of a 1-iteration fit from the same `initial_responsibilities`; `len(history) <= max_iter + 1` |
 | `::test_bic_and_held_out_select_true_n_maps` (slow, explicit mark) | `fit_over_n_maps(K ∈ {1,2,3})` on a 70/30 split: `select_n_maps(rows, "bic") == 2` and `select_n_maps(rows, "held_out") == 2`; guard `LL(2) - LL(1) > 2 * n_neurons * n_basis * log(n_train)`; `n_free_params` for K = 2 equals `2 N B + 2 + 1` |
 | `::test_labels_ordered_by_occupancy_and_init_permutation_invariant` (slow) | fit from `gamma0` and from `gamma0[:, ::-1]` → `weights_`, `transition_matrix_`, `smoothed_map_prob_` identical to `1e-8`; `smoothed_map_prob_.sum(0)` descending |
 | `::test_fit_sgd_reaches_em_objective` (slow) | small problem (4 neurons, 60 s): `fit_sgd(num_steps=300)` final `log_likelihood_history_[-1]` within `1e-3` relative of EM's; SGD history improves first→last (`assert_ll_improves`); warm SGD from the EM solution does not decrease the objective by more than `1e-6` relative |
 | `::test_score_matches_training_log_likelihood_and_prefers_true_k` (slow) | `score(Z_train, y_train) == log_likelihood_` (`1e-10`); K = 2 model's `score(Z_test, y_test)` > K = 1 model's by at least `n_neurons * log(n_test)` |
 | `::test_saturation_warning_fires_on_flooded_bin` | inject a `1000`-count bin with `max_firing_rate_hz=100` → `StateSpaceWarning` mentioning the ceiling (mirrors `place_field_model.py:920-981`) |
-| `::test_graph_basis_design_matrix_is_accepted` (skip if `neurospatial` missing) | `graph_design_matrix` output with `~valid` rows dropped fits without error; `predict_rate_map(basis.eigvecs)` shape `(n_bins, N, K)`; a `np.diag(basis.eigvals)` penalty is accepted |
+| `::test_graph_basis_design_matrix_is_accepted` (skip if `neurospatial` missing) | Fit a contiguous all-valid graph interval and check rates/likelihood against an independent known-field reference in physical coordinates. Accept a valid graph penalty on an identified fixture; never compress an interior tracking gap by dropping rows. Complex-geometry recovery belongs in the shared simulation harness as well. |
 | `test_invariances.py::TestMultiMapPlaceFieldInvariances::test_map_relabelling` | LL unchanged (`1e-12`); `smoothed[:, perm]`, `pairwise[:, perm][:, :, perm]`, `filtered[:, perm]` (`1e-10`); guard: permuting weights only changes LL by `> 1e-3` |
 | `...::test_neuron_relabelling` | permuting neurons and `weights_[perm]` leaves LL and posteriors unchanged (`1e-12`) |
 | `...::test_basis_change` | `Z @ M`, `solve(M, weights)` per map: LL and posteriors unchanged (`1e-10`) |
@@ -239,6 +247,7 @@ Mark slow / integration tests explicitly where the fit is inside a helper
 
 ## Fixtures
 
+- [Shared simulation harness](simulation-and-validation.md#first-executable-benchmark-and-progressive-delivery): versioned scenarios, observed-input/truth separation, independent seed roles and common evaluation. The tests below are the small regression layer, not the whole evidence suite.
 - Simulated only; no real data is checked in. `simulate_multi_map_session` (new, [designs G](designs.md#g-two-map-session-simulator)) with fixed `np.random.default_rng` seeds; `simulate_2d_moving_place_field(drift_speed=0.0)` for the K = 1 parity case.
 - `tiny_problem`: hand-built `T=6, K=2, N=2, B=3` arrays for exact-oracle checks (no simulator).
 - `enumerate_hmm_posterior` in `tests/oracles.py` ([designs H](designs.md#h-exact-path-enumeration-oracle-for-tests)).

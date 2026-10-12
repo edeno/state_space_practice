@@ -19,6 +19,13 @@ geometry resolution, out-of-core fitting, exact chunk boundaries and measured re
 budgets explicit deliverables. A graph input and a small single-session demo do not
 alone meet this target. Recording durations in its benchmark ladder are provisional.
 
+**Simulation is a primary development workstream.** Start the
+[simulation and validation harness](simulation-and-validation.md) alongside the first
+inference primitives. Use known mechanisms, sampling/recording failures and generators
+outside the fitted model family to measure recovery, false discoveries, uncertainty
+and compute cost. Each phase extends this shared benchmark; a favorable recovery
+example or a fast large-data run alone does not establish model performance.
+
 The scientific target is whether changing place fields reflect continuous drift,
 returns to previously expressed population maps, or both. Long recordings supply
 repeated visits for estimating shared maps and testing their return on later data.
@@ -61,6 +68,7 @@ For agent invocation, **load only the slice you need**:
 - [overview.md](overview.md) — goals, non-goals, integration points into the existing code, sibling-plan dependencies, metrics, risks, open questions, the deferred drift follow-on
 - [shared-contracts.md](shared-contracts.md) — HMM interface, directional/map semantics, repertoire counts, chronic-recording boundaries/masks and scientific comparison rules
 - [complex-environments-and-scale.md](complex-environments-and-scale.md) — geometry and direction requirements, out-of-core architecture, 24 GB/A100 workload ladder and separate statistical/computational acceptance gates
+- [simulation-and-validation.md](simulation-and-validation.md) — shared generator/evaluation workstream, truth separation, recovery and misspecification scenarios, calibration, frozen evaluation ensembles and performance/failure surfaces
 - [sampling-and-barriers.md](sampling-and-barriers.md) — unvisited versus silent fields, coverage and first-visit prediction, changing geometry, learning/intervention benchmark and uncertainty gates
 - [drift-and-discrete-states.md](drift-and-discrete-states.md) — neuroscience HDP-HMM/hybrid precedents, low-dimensional joint drift/switching prototype and evidence needed to distinguish drift from additional maps
 - [novelty-and-evidence.md](novelty-and-evidence.md) — closest prior work, provisional contribution, local field-change competitors and go/no-go criteria for scientific novelty

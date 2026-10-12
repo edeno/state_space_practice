@@ -70,6 +70,12 @@ Separate three possible contributions:
 
 ## Smallest decisive benchmark
 
+The [simulation workstream](simulation-and-validation.md) owns the common generator,
+truth separation, development/validation/final ensembles and metric definitions.
+It begins with the first model implementation. Use it to demonstrate the capability
+gap and its limits, with independent generators and an explicit unresolved category;
+successful examples from our fitted model alone cannot substantiate the contribution.
+
 Before expanding to a large adaptive library, compare a small fixed-K joint model
 against static maps, continuous drift, the close state-space representation baseline,
 and local field-change alternatives. Use the same spike observations, positions,

@@ -140,6 +140,13 @@ models; retain phase 3's frozen recurrence test as a separate result.
 
 ## Validation and exit gates
 
+Extend the [shared simulation workstream](simulation-and-validation.md) rather than
+introducing a separate favorable count-recovery demo. Distinguish known-parameter
+state calibration, learned-parameter Bayesian calibration and mechanism-specific
+false-discovery/delay measurements. Retain ambiguous attribution and undefined true
+map counts for continuous/local generators; do not score an arbitrary number of
+approximation states as a known biological repertoire.
+
 Cross the phase-3 nulls with: unknown fixed K, a rare old map returning after a long
 absence, a late genuinely distinct map, gradual development of directionality,
 first travel in the opposite direction, and non-overlapping spatial/cell support.

@@ -12,6 +12,7 @@ must not weaken them.
 - [Drift versus discrete states](drift-and-discrete-states.md) — joint prototype, neuroscience precedents and the repertoire interpretation gate
 - [Long-recording inputs and boundaries](#long-recording-inputs-and-boundaries) — phase 2 masks, shared identities and sequence boundaries
 - [Scientific comparison contract](#scientific-comparison-contract) — phase 3 validation and limits on interpretation
+- [Simulation and validation](simulation-and-validation.md) — truth separation, independent generators, evaluation splits, calibration and repeated-simulation evidence shared by all phases
 - [Spatial sampling and intervention contract](#spatial-sampling-and-intervention-contract) — shared support, first visits and learning/barrier timing
 
 ## HMM forward-backward
@@ -154,6 +155,15 @@ The unmasked phase-1 input path remains unchanged. Multi-map-specific requiremen
 
 ## Scientific comparison contract
 
+- Follow the [simulation protocol](simulation-and-validation.md#evaluation-protocol-and-metrics)
+  from phase 1 onward. Separate observed inputs from evaluator-only truth, numerical
+  correctness from statistical recovery, and matched-model calibration from robustness
+  to misspecification. Fitters cannot use planted states or future information except
+  in explicitly labelled oracle runs. Shared-map counts are not ground truth for
+  generators that have no shared discrete map state.
+- Freeze final simulation seeds/regimes and decision rules separately from development
+  and validation. Report independent-replicate uncertainty, false discoveries, missed
+  effects, unresolved cases and failed fits; do not treat correlated bins as replicates.
 - Complex environments and thousand-unit chronic recordings are primary targets;
   follow the [geometry/scale contract](complex-environments-and-scale.md). Compare
   methods at matched physical resolution, direction coding and observation support.
