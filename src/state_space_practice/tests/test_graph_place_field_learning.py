@@ -504,6 +504,47 @@ def test_neuron_chunking_matches_unchunked(learning_env, scalar_data, monkeypatc
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize(
+    ("inference_method", "drift", "blocked_compiles"),
+    [
+        # Blocks of 2 in neuron order would see 4 patterns: (T, F), (F, T),
+        # (T, F) and a short (F,).
+        ("joint", [0.0, 0.03, 0.01, 0.0, 0.02, 0.0, 0.01, 0.04, 0.03], 2),
+        ("joint", [0.01, 0.03, 0.01, 0.02, 0.02, 0.01, 0.01, 0.04, 0.03], 1),
+        ("sequential", [0.0, 0.03, 0.01, 0.0, 0.02, 0.0, 0.01, 0.04, 0.03], 1),
+    ],
+    ids=["joint-mixed", "joint-drifting", "sequential"],
+)
+def test_neuron_blocks_compile_once_per_noise_group(
+    learning_env, scalar_data, inference_method, drift, blocked_compiles
+):
+    """Blocked inference compiles one program per noise group, not one per
+    block shape or static/drifting pattern, and matches the unblocked result."""
+    times, positions, counts = scalar_data
+    spikes = np.stack([counts, counts[::-1], np.ones_like(counts)] * 3, axis=1)
+    model = GraphPlaceFieldModel(
+        learning_env, 0.1, rank=2, inference_method=inference_method
+    )
+    args, _ = model._prepare_sgd_data(times, positions, spikes, warm_start=True)
+    model.drift_scale = jnp.array(drift)
+    results = {}
+    for batch in (None, 2):
+        model.neuron_batch_size = batch
+        gpf._graph_posterior.clear_cache()
+        evidence = model._e_step(*args)
+        results[batch] = (
+            evidence,
+            np.asarray(model.smoother_mean),
+            np.asarray(model.smoother_cov),
+        )
+        expected_compiles = 1 if batch is None else blocked_compiles
+        assert gpf._graph_posterior._cache_size() == expected_compiles
+    assert np.isfinite(results[None][0])
+    for expected, actual in zip(results[None], results[2], strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.slow
 def test_graph_parallel_fit_matches_sequential(learning_env, scalar_data):
     fitted = {}
     for parallel in (False, True):

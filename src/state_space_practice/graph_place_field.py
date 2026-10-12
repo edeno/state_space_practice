@@ -1841,6 +1841,34 @@ def _graph_posterior(
     )
 
 
+def _padded_neuron_blocks(
+    static_neurons: tuple[bool, ...] | None, n_neurons: int, block: int
+) -> list[tuple[NDArray[np.intp], int]]:
+    """Neuron blocks that share one compiled posterior per noise group.
+
+    ``_graph_posterior`` compiles once per block shape and static/drifting
+    pattern. Neurons are grouped by noise structure (one group when
+    ``static_neurons`` is None) and each group is cut into blocks of
+    ``min(block, group size)``; a group's last block is padded by repeating
+    its final neuron, so every block of a group compiles to the same program.
+    Returns each block's neuron indices and its count of unpadded neurons.
+    """
+    mask = np.zeros(n_neurons, dtype=bool)
+    if static_neurons is not None:
+        mask = np.asarray(static_neurons, dtype=bool)
+    blocks = []
+    for group in (np.flatnonzero(~mask), np.flatnonzero(mask)):
+        if not group.size:
+            continue
+        size = min(block, group.size)
+        for start in range(0, group.size, size):
+            index = group[start : start + size]
+            blocks.append(
+                (np.pad(index, (0, size - index.size), mode="edge"), index.size)
+            )
+    return blocks
+
+
 class GraphPlaceFieldModel(SGDFittableMixin):
     """Track a drifting place-field over a graph-Laplacian eigenbasis.
 
@@ -2013,7 +2041,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             With gradients, the parallel pass needs about 12-17 GiB per neuron
             at ``n_time`` = 70,930 and rank 20 (sequential: about 4 GiB),
             scaling with ``n_time * rank**2``. The final inference also runs in
-            blocks of this size and moves each block's results to host memory.
+            blocks of this size and moves each block's results to host memory;
+            static and drifting neurons are blocked separately, each group's
+            last block padded to full size, so it compiles at most two
+            programs (about 3 min each at that size on an A100).
         store_covariances : bool, optional
             Keep the per-time posterior covariances ``smoother_cov``,
             ``smoother_cross_cov`` and ``filtered_cov`` (default). Each is
@@ -2182,23 +2213,35 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         static = self._static_neurons() if self.inference_method == "joint" else None
         n_neurons = int(spikes.shape[0])
         block = self.neuron_batch_size or n_neurons
-        parts = []
-        for start in range(0, n_neurons, block):
-            neurons = slice(start, start + block)
-            result = self._posterior(
+        if block >= n_neurons:
+            inference = self._posterior(
                 Z,
-                spikes[neurons],
+                spikes,
                 valid,
-                self.init_mean[neurons],
-                self.drift_scale[neurons],
-                None if static is None else static[neurons],
+                self.init_mean,
+                self.drift_scale,
+                static,
                 self.store_covariances,
             )
-            # Bounded device memory: finished blocks wait on the host.
-            parts.append(jax.device_get(result) if block < n_neurons else result)
-        inference = parts[0]
-        if len(parts) > 1:
-            inference = jax.tree.map(lambda *xs: np.concatenate(xs), *parts)
+        else:
+            parts, kept = [], []
+            for index, n_real in _padded_neuron_blocks(static, n_neurons, block):
+                result = self._posterior(
+                    Z,
+                    spikes[index],
+                    valid,
+                    self.init_mean[index],
+                    self.drift_scale[index],
+                    None if static is None else tuple(static[i] for i in index),
+                    self.store_covariances,
+                )
+                # Bounded device memory: finished blocks wait on the host.
+                parts.append(
+                    jax.tree.map(lambda x, n=n_real: x[:n], jax.device_get(result))
+                )
+                kept.append(index[:n_real])
+            order = np.argsort(np.concatenate(kept))
+            inference = jax.tree.map(lambda *xs: np.concatenate(xs)[order], *parts)
         self.smoother_mean = inference.mean
         if inference.filtered_mean is not None:
             self.filtered_mean = inference.filtered_mean
