@@ -30,7 +30,9 @@ class ScaleProfile(NamedTuple):
     flat : bool
         Whether all finite losses agree within the objective tolerance.
     n_nonfinite : int
-        Number of evaluations whose loss was non-finite and was skipped.
+        Number of evaluations whose loss was non-finite and was skipped,
+        including intermediate refinement trials, which ``scales`` and
+        ``losses`` omit.
     """
 
     scale: float
@@ -131,6 +133,7 @@ def profile_scale(
                 f"got {supplied.shape}."
             )
         values = supplied.tolist()
+    n_nonfinite_trials = 0
     raw_grid_values = np.asarray(values[1:])
     grid_values = np.where(np.isfinite(raw_grid_values), raw_grid_values, np.inf)
     for i in range(n_grid):
@@ -146,8 +149,10 @@ def profile_scale(
             def refinement_objective(
                 x: float, sampled_loss: float = float(grid_values[i])
             ) -> float:
+                nonlocal n_nonfinite_trials
                 loss = float(objective(float(np.exp(x))))
                 if not np.isfinite(loss):
+                    n_nonfinite_trials += 1
                     return float(np.pi / 2)
                 # A monotone, finite objective keeps unusable trials worse than
                 # the sampled minimum without inf arithmetic inside SciPy.
@@ -175,7 +180,7 @@ def profile_scale(
         losses,
         bool(scales[index] == hi),
         bool(np.ptp(losses[finite]) <= tolerance),
-        int(np.sum(~finite)),
+        int(np.sum(~finite)) + n_nonfinite_trials,
     )
 
 

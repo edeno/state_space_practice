@@ -82,6 +82,9 @@ def test_profile_ignores_unusable_bounded_refinement_trials(unusable):
     assert unusable_trials  # Every initial grid point is finite.
     assert np.log(result.scale) == pytest.approx(1.4, abs=1e-5)
     assert result.loss == pytest.approx(0, abs=1e-10)
+    # Only refinement trials were unusable; they are counted though not stored.
+    assert np.all(np.isfinite(result.losses))
+    assert result.n_nonfinite == len(unusable_trials)
 
 
 def test_profile_refinement_preserves_small_improvements_at_large_loss():
@@ -128,12 +131,18 @@ def test_budget_exhaustion_is_not_likelihood_convergence():
 
 
 def test_profile_counts_unusable_evaluations():
+    unusable_calls = []
+
     def objective(q):
-        return np.nan if q > 1e-3 else (q - 1e-3) ** 2 + 1
+        if q > 1e-3:
+            unusable_calls.append(q)
+            return np.nan
+        return (q - 1e-3) ** 2 + 1
 
     result = profile_scale(objective, bounds=(1e-8, 10.0), n_grid=9)
-    assert result.n_nonfinite > 0
-    assert result.n_nonfinite == int(np.sum(result.scales > 1e-3))
+    # Every unusable call is counted, stored grid points and refinement trials.
+    assert len(unusable_calls) > int(np.sum(result.scales > 1e-3)) > 0
+    assert result.n_nonfinite == len(unusable_calls)
     assert profile_scale(lambda q: q**2 + 1).n_nonfinite == 0
 
 
