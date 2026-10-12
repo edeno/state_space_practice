@@ -34,7 +34,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   bins whose remaining relative log-rate step exceeds 1e-6. `score()` uses the selected evidence
   approximation and restarts from the fitted initial prior. The static estimator
   rejects unpenalized modes that occupied bins cannot identify (for example, a
-  parity fit with an unvisited graph component). The model uses
+  parity fit with an unvisited graph component) or that have no finite MAP (a
+  visited component where the neuron never spikes). The model uses
   the shared fitting/result contracts and requires the `spatial` extra and x64.
   `parallel` (default: on for GPU/TPU, off for CPU) runs the joint smoother's
   linear passes by associative scans, with the same fit: 49-129x faster per

@@ -538,6 +538,35 @@ def test_static_parity_rejects_unvisited_component(isolated_bins_env, multineuro
         )
 
 
+@pytest.mark.parametrize("multineuron", [False, True])
+def test_static_parity_rejects_visited_component_without_spikes(
+    isolated_bins_env, multineuron
+):
+    """A free intercept on a component with no spikes has its optimum at -inf."""
+    basis = build_graph_basis(isolated_bins_env, rank=2)
+    counts, silent_neuron = np.array([2.0, 0.0]), 0
+    if multineuron:
+        counts, silent_neuron = np.column_stack((np.array([4.0, 3.0]), counts)), 1
+
+    with pytest.raises(
+        ValueError, match=rf"Neuron\(s\) \[{silent_neuron}\] have no finite MAP"
+    ):
+        fit_static_graph_glm(
+            counts,
+            np.array([2.0, 3.0]),
+            basis.eigvecs,
+            parity_penalty(basis.eigvals, basis.n_components),
+        )
+
+
+def test_static_glm_unpenalized_intercept_with_silent_bins_is_finite():
+    """Silent bins alone do not unbound an intercept that a spiking bin pins."""
+    weights, _ = fit_static_graph_glm(
+        np.array([1.0, 0.0, 0.0]), np.ones(3), np.ones((3, 1)), np.zeros(1)
+    )
+    np.testing.assert_allclose(weights, [np.log(1 / 3)], rtol=1e-10)
+
+
 def test_static_parity_recovers_rates_when_each_component_is_visited(isolated_bins_env):
     basis = build_graph_basis(isolated_bins_env, rank=2)
     occupancy = np.array([2.0, 3.0])

@@ -876,7 +876,7 @@ def fit_static_graph_glm(
     penalty_diag : ArrayLike, shape (rank,)
         Diagonal penalty ``P0^{-1}`` (from :func:`spectral_precision` or
         :func:`parity_penalty`). Any unpenalized modes must be identified by
-        bins with positive occupancy.
+        bins with positive occupancy and must have a finite optimum.
     max_iter : int, optional
         Maximum Newton iterations, by default 25.
     tol : float, optional
@@ -893,9 +893,11 @@ def fit_static_graph_glm(
     Raises
     ------
     ValueError
-        If occupied design rows do not identify every unpenalized mode. In
+        If occupied design rows do not identify every unpenalized mode, or if a
+        neuron's MAP is not finite because an unpenalized mode can lower its rate
+        in bins without spikes and leave the bins with spikes unchanged. In
         particular, a parity fit requires visiting every graph component whose
-        constant mode is retained.
+        constant mode is retained, and the neuron must spike in each of them.
     """
     counts_np = np.asarray(counts)
     validate_count_array(counts_np, "counts", allow_empty=False)
@@ -970,6 +972,21 @@ def fit_static_graph_glm(
                 "occupancy; visit the missing graph components, reduce the basis, "
                 "or use a positive penalty."
             )
+        observed_counts = counts_2d_np[occ_np > 0]
+        unbounded = [
+            neuron
+            for neuron in range(observed_counts.shape[1])
+            if _has_recession_direction(
+                observed_free_design / column_scale, observed_counts[:, neuron] > 0
+            )
+        ]
+        if unbounded:
+            raise ValueError(
+                f"Neuron(s) {unbounded} have no finite MAP: an unpenalized mode "
+                "can lower the rate in occupied bins without spikes while leaving "
+                "bins with spikes unchanged (for example, a visited graph "
+                "component where the neuron is silent); use a positive penalty."
+            )
 
     dtype = jnp.result_type(Phi_np, occ_np, penalty_np, jnp.float32)
     Phi = jnp.asarray(Phi_np, dtype=dtype)
@@ -1002,6 +1019,35 @@ def fit_static_graph_glm(
     if single:
         return weights[0], cov[0]
     return weights, cov
+
+
+def _has_recession_direction(
+    design: NDArray[np.float64], spiking: NDArray[np.bool_]
+) -> bool:
+    """Whether a coefficient direction lowers some silent bin's log rate,
+    raises none, and leaves every spiking bin's log rate unchanged.
+
+    Along such a direction the unpenalized Poisson negative log-likelihood
+    decreases without reaching a minimum, so the MAP is not finite. ``design``,
+    shape ``(n_occupied_bins, n_free)``, must have full column rank, which keeps
+    the linear program bounded; ``spiking`` marks bins with positive counts.
+    """
+    silent = design[~spiking]
+    if silent.shape[0] == 0:
+        return False
+    n_silent = silent.shape[0]
+    result = scipy.optimize.linprog(
+        silent.sum(axis=0),  # total log-rate change over silent bins
+        A_ub=np.vstack((silent, -silent)),
+        b_ub=np.concatenate((np.zeros(n_silent), np.ones(n_silent))),
+        A_eq=design[spiking] if spiking.any() else None,
+        b_eq=np.zeros(int(spiking.sum())) if spiking.any() else None,
+        bounds=(None, None),
+        method="highs",
+    )
+    # Any such direction rescales to reach -1 in some silent bin, so the
+    # optimum is either 0 or at most -1.
+    return bool(result.fun < -0.5)
 
 
 def static_log_evidence(
