@@ -94,6 +94,18 @@ def test_profile_fit_matches_independent_dense_evidence(
 
 
 @pytest.mark.slow
+def test_fit_accepts_numpy_initial_mean(learning_env, scalar_data):
+    log_likelihoods = []
+    for to_array in (np.asarray, jnp.asarray):
+        model = GraphPlaceFieldModel(learning_env, 0.1, rank=2)
+        model.init_mean = to_array(np.full((1, 2), 0.5))
+        model.fit(*scalar_data, warm_start=False, profile_points=5, profile_rounds=1)
+        log_likelihoods.append(model.log_likelihood_)
+    assert np.isfinite(log_likelihoods[1])
+    assert log_likelihoods[0] == log_likelihoods[1]
+
+
+@pytest.mark.slow
 def test_static_boundary_and_refit_resume(learning_env, scalar_data):
     times, positions, _ = scalar_data
     model = scalar_model(learning_env, 0.3)

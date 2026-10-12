@@ -3230,7 +3230,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         )
         if warm_start:
             self._warm_start(times, trajectory, spikes_arr)
-        elif not state_shape_matches:
+        elif state_shape_matches:
+            self.init_mean = jnp.asarray(self.init_mean)  # may be user-supplied NumPy
+        else:
             self.init_mean = jnp.zeros((self.n_neurons, self.rank))
 
         drift_shape_matches = (
