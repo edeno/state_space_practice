@@ -275,6 +275,34 @@ def test_read_only_outputs(small_grid_env):
         basis.eigvecs[0, 0] = 1.0  # arrays are read-only
 
 
+def test_basis_eigenvector_signs_do_not_depend_on_the_eigensolver(monkeypatch):
+    """eigh's eigenvector signs are arbitrary and differ across LAPACK builds;
+    the basis fixes them so fits and simulations on it reproduce across
+    machines. Fresh envs keep the cached eigensystem out of the comparison."""
+    import scipy.linalg
+
+    pos = np.random.default_rng(7).uniform(0, 20, (400, 2))
+    reference = build_graph_basis(Environment.from_samples(pos, bin_size=5.0))
+
+    eigh = scipy.linalg.eigh
+    flipped_calls = []
+
+    def flipped_eigh(a):
+        w, v = eigh(a)
+        flipped_calls.append(None)
+        return w, v * np.where(np.arange(v.shape[1]) % 2, -1.0, 1.0)
+
+    monkeypatch.setattr(scipy.linalg, "eigh", flipped_eigh)
+    flipped = build_graph_basis(Environment.from_samples(pos, bin_size=5.0))
+
+    assert flipped_calls  # guard: the basis came from the sign-flipped solver
+    np.testing.assert_array_equal(flipped.eigvecs, reference.eigvecs)
+    # Convention: each mode's first non-negligible entry is positive.
+    V = np.asarray(reference.eigvecs)
+    lead = np.argmax(np.abs(V) > 1e-6 * np.abs(V).max(axis=0), axis=0)
+    assert np.all(V[lead, np.arange(V.shape[1])] > 0)
+
+
 def test_basis_cache_invalidates_on_laplacian_change(monkeypatch):
     """A changed Laplacian (e.g. a re-fit env) must rebuild the basis, not reuse
     the stale cached eigensystem. Uses a fresh env so the module-scoped fixtures

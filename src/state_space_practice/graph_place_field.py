@@ -377,7 +377,8 @@ def _full_eigensystem(
 
     Each connected component is decomposed on its own so every eigenvector is localized
     to a single component (zero elsewhere); the null space is then exactly one constant
-    mode per component. Returns all ``n_bins`` modes sorted by ascending eigenvalue.
+    mode per component. Each mode's sign is fixed so its first non-negligible entry
+    is positive. Returns all ``n_bins`` modes sorted by ascending eigenvalue.
     """
     n_bins = laplacian.shape[0]
     laplacian = laplacian.tocsr()
@@ -389,6 +390,10 @@ def _full_eigensystem(
         block = 0.5 * (block + block.T)  # symmetrize away round-off
         w, v = scipy.linalg.eigh(block)
         w = np.clip(w, 0.0, None)
+        # eigh's signs are arbitrary and differ across LAPACK builds; make each
+        # mode's first non-negligible entry positive so the basis reproduces.
+        lead = np.argmax(np.abs(v) > 1e-6 * np.abs(v).max(axis=0), axis=0)
+        v = v * np.sign(v[lead, np.arange(v.shape[1])])
         padded = np.zeros((n_bins, v.shape[1]))
         padded[idx] = v
         val_parts.append(w)
@@ -437,6 +442,8 @@ def build_graph_basis(
     -------
     GraphBasis
         The truncated eigenbasis; arrays are read-only and cached on ``env``.
+        Each eigenvector's first non-negligible entry is positive, so the basis
+        does not depend on the platform's eigensolver sign choice.
     """
     laplacian_convention = _validate_laplacian_convention(laplacian_convention)
     laplacian = build_graph_laplacian(env, laplacian_convention)
