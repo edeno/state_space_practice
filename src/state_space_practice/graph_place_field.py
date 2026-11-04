@@ -76,6 +76,7 @@ from state_space_practice.likelihood_optimization import (
     profile_scale,
     warn_if_unconverged,
 )
+from state_space_practice.multinomial_choice import _armijo_slack
 from state_space_practice.point_process_kalman import (
     _log_line_search_failures,
     _validate_filter_numerics,
@@ -377,7 +378,8 @@ def _full_eigensystem(
 
     Each connected component is decomposed on its own so every eigenvector is localized
     to a single component (zero elsewhere); the null space is then exactly one constant
-    mode per component. Returns all ``n_bins`` modes sorted by ascending eigenvalue.
+    mode per component. Each mode's sign is fixed so its first non-negligible entry
+    is positive. Returns all ``n_bins`` modes sorted by ascending eigenvalue.
     """
     n_bins = laplacian.shape[0]
     laplacian = laplacian.tocsr()
@@ -389,6 +391,10 @@ def _full_eigensystem(
         block = 0.5 * (block + block.T)  # symmetrize away round-off
         w, v = scipy.linalg.eigh(block)
         w = np.clip(w, 0.0, None)
+        # eigh's signs are arbitrary and differ across LAPACK builds; make each
+        # mode's first non-negligible entry positive so the basis reproduces.
+        lead = np.argmax(np.abs(v) > 1e-6 * np.abs(v).max(axis=0), axis=0)
+        v = v * np.sign(v[lead, np.arange(v.shape[1])])
         padded = np.zeros((n_bins, v.shape[1]))
         padded[idx] = v
         val_parts.append(w)
@@ -437,6 +443,8 @@ def build_graph_basis(
     -------
     GraphBasis
         The truncated eigenbasis; arrays are read-only and cached on ``env``.
+        Each eigenvector's first non-negligible entry is positive, so the basis
+        does not depend on the platform's eigensolver sign choice.
     """
     laplacian_convention = _validate_laplacian_convention(laplacian_convention)
     laplacian = build_graph_laplacian(env, laplacian_convention)
@@ -787,6 +795,10 @@ def _fit_static_graph_glm_core(
             grad, hess = _derivatives(w, y)
             delta = psd_solve(hess, grad)
             directional_derivative = grad @ delta
+            # Near tolerance the remaining step can lower the loss by less than
+            # its round-off; without slack, rounding can reject that step on
+            # every iteration and the solve stalls until max_iter.
+            slack = _armijo_slack(dtype) * (1.0 + jnp.abs(current_loss))
             is_descent = (
                 (~converged)
                 & jnp.isfinite(directional_derivative)
@@ -805,7 +817,9 @@ def _fit_static_graph_glm_core(
                     & jnp.isfinite(trial_loss)
                     & (
                         trial_loss
-                        <= current_loss - 1e-4 * step_size * directional_derivative
+                        <= current_loss
+                        - 1e-4 * step_size * directional_derivative
+                        + slack
                     )
                 )
                 accepted_w = jnp.where(sufficient_decrease, trial_w, accepted_w)

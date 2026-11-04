@@ -528,10 +528,16 @@ def test_neuron_chunking_matches_unchunked(learning_env, scalar_data, monkeypatc
     ids=["joint-mixed", "joint-drifting", "sequential"],
 )
 def test_neuron_blocks_compile_once_per_noise_group(
-    learning_env, scalar_data, inference_method, drift, blocked_compiles
+    learning_env, scalar_data, monkeypatch, inference_method, drift, blocked_compiles
 ):
     """Blocked inference compiles one program per noise group, not one per
-    block shape or static/drifting pattern, and matches the unblocked result."""
+    block shape or static/drifting pattern, and matches the unblocked result.
+
+    Compilations are observed as traces (``_graph_posterior`` calls
+    ``_vmap_by_noise_structure`` only while being traced), not as
+    ``_cache_size()`` counts: JAX's jit cache is a global LRU, and after it
+    overflows in a long run the per-function count no longer tracks entries.
+    """
     times, positions, counts = scalar_data
     spikes = np.stack([counts, counts[::-1], np.ones_like(counts)] * 3, axis=1)
     model = GraphPlaceFieldModel(
@@ -539,10 +545,20 @@ def test_neuron_blocks_compile_once_per_noise_group(
     )
     args, _ = model._prepare_sgd_data(times, positions, spikes, warm_start=True)
     model.drift_scale = jnp.array(drift)
+    traces = []
+    vmap_by_noise_structure = gpf._vmap_by_noise_structure
+
+    def counting(one, *a, **k):
+        if one.__qualname__.startswith("_graph_posterior."):
+            traces.append(None)
+        return vmap_by_noise_structure(one, *a, **k)
+
+    monkeypatch.setattr(gpf, "_vmap_by_noise_structure", counting)
     results = {}
     for batch in (None, 2):
         model.neuron_batch_size = batch
         gpf._graph_posterior.clear_cache()
+        traces.clear()
         evidence = model._e_step(*args)
         results[batch] = (
             evidence,
@@ -550,7 +566,7 @@ def test_neuron_blocks_compile_once_per_noise_group(
             np.asarray(model.smoother_cov),
         )
         expected_compiles = 1 if batch is None else blocked_compiles
-        assert gpf._graph_posterior._cache_size() == expected_compiles
+        assert len(traces) == expected_compiles
     assert np.isfinite(results[None][0])
     for expected, actual in zip(results[None], results[2], strict=True):
         np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
