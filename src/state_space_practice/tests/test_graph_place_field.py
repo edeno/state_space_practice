@@ -7,6 +7,8 @@ tripwires for the interface bugs that silently corrupt place fields: row
 misalignment, wrong Laplacian weighting, and off-by-component null modes.
 """
 
+import warnings
+
 import networkx as nx
 import numpy as np
 import pytest
@@ -896,12 +898,15 @@ def test_newton_map_matches_independent_optimizer(small_grid_env):
     np.testing.assert_allclose(np.asarray(w_hat), ref.x, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.slow
-def test_static_field_recovers_wmaze_place_cells(w_maze_env):
-    """Recovered rate map correlates with the true place fields on the W-maze."""
+@pytest.fixture(scope="module")
+def w_maze_session(w_maze_env):
+    """A simulated 6-cell W-maze session binned onto a bandwidth-truncated basis.
+
+    Returns the session, the basis, per-bin counts ``(n_bins, 6)`` and the
+    per-bin occupancy ``(n_bins,)``.
+    """
     from neurospatial.simulation import simulate_session
 
-    from state_space_practice.graph_place_field import build_graph_basis
     from state_space_practice.preprocessing import bin_spike_times
 
     session = simulate_session(
@@ -916,6 +921,36 @@ def test_static_field_recovers_wmaze_place_cells(w_maze_env):
         w_maze_env, counts_tc, session.times, session.positions, basis
     )
     occ = bin_occupancy(w_maze_env, session.times, session.positions, dt)
+    return session, basis, counts_bin, occ
+
+
+@pytest.mark.slow
+def test_static_glm_converges_across_dense_tau2_sweep(w_maze_session):
+    """Every Newton solve of a dense tau2 sweep reaches the gradient tolerance.
+
+    The sparsest cells (5 and 16 spikes) reach iterates whose gradient is just
+    above tolerance while the remaining Newton step lowers the loss by less
+    than its round-off. Without round-off slack in the Armijo test, that step
+    is rejected whenever rounding happens to raise the trial loss, and the
+    solve repeats the rejection until ``max_iter``; which of these solves stick
+    depends on the platform's floating-point arithmetic.
+    """
+    _session, basis, counts_bin, occ = w_maze_session
+    unconverged = []
+    for tau2 in np.logspace(-4, 0, 400):
+        prec = spectral_precision(basis.eigvals, tau2=float(tau2), kappa2=1e-2)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", StateSpaceWarning)
+            fit_static_graph_glm(counts_bin, occ, basis.eigvecs, prec)
+        if caught:
+            unconverged.append(float(tau2))
+    assert not unconverged, f"Newton stalled at tau2 = {unconverged}"
+
+
+@pytest.mark.slow
+def test_static_field_recovers_wmaze_place_cells(w_maze_env, w_maze_session):
+    """Recovered rate map correlates with the true place fields on the W-maze."""
+    session, basis, counts_bin, occ = w_maze_session
     tau2 = select_tau2_by_evidence(counts_bin, occ, basis, kappa2=1e-2)
     prec = spectral_precision(basis.eigvals, tau2=tau2, kappa2=1e-2)
     w_hat, _ = fit_static_graph_glm(counts_bin, occ, basis.eigvecs, prec)

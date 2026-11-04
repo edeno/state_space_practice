@@ -76,6 +76,7 @@ from state_space_practice.likelihood_optimization import (
     profile_scale,
     warn_if_unconverged,
 )
+from state_space_practice.multinomial_choice import _armijo_slack
 from state_space_practice.point_process_kalman import (
     _log_line_search_failures,
     _validate_filter_numerics,
@@ -794,6 +795,10 @@ def _fit_static_graph_glm_core(
             grad, hess = _derivatives(w, y)
             delta = psd_solve(hess, grad)
             directional_derivative = grad @ delta
+            # Near tolerance the remaining step can lower the loss by less than
+            # its round-off; without slack, rounding can reject that step on
+            # every iteration and the solve stalls until max_iter.
+            slack = _armijo_slack(dtype) * (1.0 + jnp.abs(current_loss))
             is_descent = (
                 (~converged)
                 & jnp.isfinite(directional_derivative)
@@ -812,7 +817,9 @@ def _fit_static_graph_glm_core(
                     & jnp.isfinite(trial_loss)
                     & (
                         trial_loss
-                        <= current_loss - 1e-4 * step_size * directional_derivative
+                        <= current_loss
+                        - 1e-4 * step_size * directional_derivative
+                        + slack
                     )
                 )
                 accepted_w = jnp.where(sufficient_decrease, trial_w, accepted_w)
