@@ -2134,7 +2134,13 @@ class TestDecoderRecoverySweep:
     training session and the same held-out 10 s test session is decoded
     with each. More training data gives better rate maps, so the held-out
     median error must shrink; per-seed values are reported on failure.
-    Observed median errors: 7.6-9.2 cm (6 s) vs 4.4-5.9 cm (48 s).
+
+    The assertions are on seed averages because a single seed's error is
+    chaotic: the decoder intermittently loses and regains track, so perturbing
+    the training positions by 1e-10 cm (or a different CPU's rounding) moves a
+    seed's error by several cm. Over such perturbations per-seed errors span
+    6.7-19.5 cm (6 s) and 3.7-8.1 cm (48 s), while the seed means span
+    8.9-12.7 cm and 4.6-5.5 cm.
     """
 
     def test_heldout_error_decreases_with_training_length(self) -> None:
@@ -2160,6 +2166,5 @@ class TestDecoderRecoverySweep:
             f"per-seed held-out median error (cm): 6 s training "
             f"{np.round(short, 2)}, 48 s training {np.round(long, 2)}"
         )
-        assert np.all(long < 8.0), msg
+        assert np.mean(long) < 8.0, msg
         assert np.mean(long) < 0.8 * np.mean(short), msg
-        assert np.all(long < short), msg
